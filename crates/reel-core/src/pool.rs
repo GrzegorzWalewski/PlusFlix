@@ -46,6 +46,8 @@ pub struct PoolStats {
 /// One row of the sources list: a candidate and whether the settings allow it.
 #[derive(Debug, Clone)]
 pub struct SourceRow {
+    /// Unique candidate key (the stream URL) for manual selection.
+    pub key: String,
     pub label: String,
     /// Already attempted by the session.
     pub tried: bool,
@@ -206,12 +208,14 @@ impl SourcePool {
                 let tried = st.tried.contains(&c.key);
                 match evaluate(&c.info, settings, &st.ext_subs) {
                     Ok(rank) => SourceRow {
+                        key: c.key.clone(),
                         label: c.label.clone(),
                         tried,
                         rejected: None,
                         rank: Some(rank),
                     },
                     Err(r) => SourceRow {
+                        key: c.key.clone(),
                         label: c.label.clone(),
                         tried,
                         rejected: Some(r),
@@ -223,6 +227,20 @@ impl SourcePool {
         // Usable (best-ranked first) before hidden.
         rows.sort_by_key(|r| (r.rejected.is_some(), std::cmp::Reverse(r.rank)));
         rows
+    }
+
+    /// A specific candidate by key (manual pick from the sources list),
+    /// regardless of tried state or the profile's filters.
+    pub fn pick_by_key(&self, key: &str, settings: &Settings) -> Option<Pick> {
+        let st = self.lock();
+        let c = st.candidates.iter().find(|c| c.key == key)?;
+        Some(Pick {
+            subtitles: settings
+                .subtitle_language
+                .map(|l| st.ext_subs.for_lang(l))
+                .unwrap_or_default(),
+            candidate: c.clone(),
+        })
     }
 
     pub fn stats(&self, settings: &Settings) -> PoolStats {

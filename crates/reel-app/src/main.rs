@@ -84,6 +84,9 @@ struct App {
     /// Set by the Cancel button while a playback task is running; the task
     /// watches it and tears the player down.
     cancel_playback: Mutex<Option<Arc<AtomicBool>>>,
+    /// Set by the "Next source" button; makes the session fail over to the
+    /// next source at once (reported to it as a player error).
+    skip_playback: Mutex<Option<Arc<AtomicBool>>>,
     posters: Mutex<HashMap<String, Arc<Decoded>>>,
     poster_slots: Semaphore,
     /// Episode ids seen for each series (used for the "all episodes watched" badge).
@@ -903,6 +906,7 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
                         "Ready".to_owned()
                     };
                     SourceRowData {
+                        key: r.key.into(),
                         label: r.label.into(),
                         status: status.into(),
                         ok: r.rejected.is_none(),
@@ -1229,7 +1233,7 @@ fn save_progress(
     app.save();
 }
 
-fn play(app: &Arc<App>, kind: String) {
+fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
     let Some(detail) = lock(&app.detail).clone() else {
         return;
     };
@@ -1302,7 +1306,7 @@ fn play(app: &Arc<App>, kind: String) {
             }
         };
         let msg = tokio::select! {
-            msg = run_playback(&app, &sources, &pid, settings, resume, card) => msg,
+            msg = run_playback(&app, &sources, &pid, settings, resume, card, forced) => msg,
             _ = wait_cancel => Some("Playback cancelled.".to_owned()),
         };
         *lock(&app.cancel_playback) = None;
@@ -1315,6 +1319,37 @@ fn play(app: &Arc<App>, kind: String) {
     });
 }
 
+/// Wraps the real player so the "Next source" button can break the session's
+/// `next_event` wait: the flag turns into a player error, which makes the
+/// session abandon the current source and load the next best one.
+struct Skippable<P> {
+    inner: P,
+    skip: Arc<AtomicBool>,
+}
+
+impl<P: Player> Player for Skippable<P> {
+    async fn load(&mut self, req: LoadRequest) -> reel_core::error::Result<()> {
+        self.inner.load(req).await
+    }
+    async fn next_event(&mut self) -> Option<PlayerEvent> {
+        let wait_skip = async {
+            while !self.skip.load(SeqCst) {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        };
+        tokio::select! {
+            ev = self.inner.next_event() => ev,
+            _ = wait_skip => Some(PlayerEvent::Error("skipped by user".into())),
+        }
+    }
+    async fn notify(&mut self, text: &str) {
+        self.inner.notify(text).await
+    }
+    async fn stop(&mut self) {
+        self.inner.stop().await
+    }
+}
+
 async fn run_playback(
     app: &Arc<App>,
     sources: &Arc<Sources>,
@@ -1322,8 +1357,9 @@ async fn run_playback(
     settings: Settings,
     resume: f64,
     card: ProgressCard,
+    forced: Option<String>,
 ) -> Option<String> {
-    let mut player = match settings.player {
+    let inner = match settings.player {
         PlayerKind::Vlc => match VlcPlayer::spawn(&VlcConfig::default()).await {
             Ok(p) => AnyPlayer::Vlc(p),
             Err(e) => return Some(format!("{e}")),
@@ -1333,6 +1369,9 @@ async fn run_playback(
             Err(e) => return Some(format!("{e} – install mpv and make sure it is on PATH.")),
         },
     };
+    let skip = Arc::new(AtomicBool::new(false));
+    *lock(&app.skip_playback) = Some(skip.clone());
+    let mut player = Skippable { inner, skip };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let last = Arc::new(Mutex::new((resume, None::<f64>)));
 
@@ -1376,11 +1415,15 @@ async fn run_playback(
         &mut player,
         &sources.pool,
         &settings,
-        &SessionConfig::default(),
+        &SessionConfig {
+            first_key: forced,
+            ..Default::default()
+        },
         resume,
         Some(tx),
     )
     .await;
+    *lock(&app.skip_playback) = None;
     player.stop().await;
     let _ = forwarder.await;
     let (_, dur) = *lock(&last);
@@ -1663,11 +1706,23 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     let a = app.clone();
     ui.on_remove_progress(move |id| remove_progress(&a, id.to_string()));
     let a = app.clone();
-    ui.on_play(move |kind| play(&a, kind.to_string()));
+    ui.on_play(move |kind| play(&a, kind.to_string(), None));
+    let a = app.clone();
+    let weak = ui.as_weak();
+    ui.on_play_source(move |key| {
+        let kind = weak.upgrade().map(|ui| ui.get_play_player().to_string());
+        play(&a, kind.unwrap_or_default(), Some(key.to_string()));
+    });
     let a = app.clone();
     ui.on_cancel_playback(move || {
         if let Some(cancel) = lock(&a.cancel_playback).clone() {
             cancel.store(true, SeqCst);
+        }
+    });
+    let a = app.clone();
+    ui.on_next_source(move || {
+        if let Some(skip) = lock(&a.skip_playback).clone() {
+            skip.store(true, SeqCst);
         }
     });
     let a = app.clone();
@@ -1733,6 +1788,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         load_gen: std::sync::atomic::AtomicUsize::new(0),
         playing: AtomicBool::new(false),
         cancel_playback: Mutex::new(None),
+        skip_playback: Mutex::new(None),
         posters: Mutex::new(HashMap::new()),
         poster_slots: Semaphore::new(8),
     });

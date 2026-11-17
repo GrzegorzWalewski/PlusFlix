@@ -26,6 +26,9 @@ pub struct SessionConfig {
     /// An EOF this far before the known duration is treated as a dropped connection.
     pub premature_eof_secs: f64,
     pub max_attempts: usize,
+    /// Manual pick: try this candidate key first (user chose it from the
+    /// sources list), then fall back to the normal best-untried flow.
+    pub first_key: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -37,6 +40,7 @@ impl Default for SessionConfig {
             rewind_secs: 3.0,
             premature_eof_secs: 30.0,
             max_attempts: 40,
+            first_key: None,
         }
     }
 }
@@ -88,31 +92,40 @@ pub async fn run<P: Player>(
     'sources: loop {
         // ---- pick the next source (waiting for the loaders if necessary) ----
         let pick: Pick = {
-            let give_up_at = Instant::now() + cfg.no_source_timeout;
-            loop {
-                if let Some(p) = pool.next_untried(settings) {
-                    break p;
-                }
-                if !pool.is_loading() {
-                    // Nothing left and nobody is going to deliver more.
-                    return if attempts == 0 {
-                        Outcome::NoSources
-                    } else {
-                        Outcome::Exhausted { position }
-                    };
-                }
-                emit(SessionEvent::WaitingForSources);
-                let remaining = give_up_at.saturating_duration_since(Instant::now());
-                if remaining.is_zero() || timeout(remaining, rx.changed()).await.is_err() {
-                    return if attempts == 0 {
-                        Outcome::NoSources
-                    } else {
-                        Outcome::Exhausted { position }
-                    };
+            // A manually chosen source (from the sources list) goes first,
+            // even if the settings would have hidden it.
+            if let Some(p) = cfg
+                .first_key
+                .as_deref()
+                .and_then(|k| pool.pick_by_key(k, settings))
+            {
+                p
+            } else {
+                let give_up_at = Instant::now() + cfg.no_source_timeout;
+                loop {
+                    if let Some(p) = pool.next_untried(settings) {
+                        break p;
+                    }
+                    if !pool.is_loading() {
+                        // Nothing left and nobody is going to deliver more.
+                        return if attempts == 0 {
+                            Outcome::NoSources
+                        } else {
+                            Outcome::Exhausted { position }
+                        };
+                    }
+                    emit(SessionEvent::WaitingForSources);
+                    let remaining = give_up_at.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() || timeout(remaining, rx.changed()).await.is_err() {
+                        return if attempts == 0 {
+                            Outcome::NoSources
+                        } else {
+                            Outcome::Exhausted { position }
+                        };
+                    }
                 }
             }
         };
-
         attempts += 1;
         if attempts > cfg.max_attempts {
             return Outcome::Exhausted { position };

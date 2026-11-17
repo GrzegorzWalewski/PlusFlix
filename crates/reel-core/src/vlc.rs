@@ -154,6 +154,11 @@ impl VlcPlayer {
             "--no-qt-privacy-ask",
             "--no-video-title-show",
             "--play-and-exit",
+            // Never hand playback to an already-running VLC instance: that
+            // would exit our child instantly and lose HTTP control of the
+            // stream (the session would see the player as closed).
+            "--no-one-instance",
+            "--no-one-instance-when-started-from-file",
         ])
         .arg(format!("--http-port={port}"))
         .arg(format!("--http-password={password}"));
@@ -321,7 +326,13 @@ async fn poll_loop(
         }
 
         if let Ok(Some(_)) = child.lock().await.try_wait() {
-            let _ = tx.send(exit_event(last_pos.max(0.0), last_len));
+            // VLC quits when an input fails to open (play-and-exit), which
+            // must not be mistaken for the user closing a healthy player.
+            let _ = tx.send(if started {
+                exit_event(last_pos.max(0.0), last_len)
+            } else {
+                PlayerEvent::Error("VLC exited without starting playback".into())
+            });
             return;
         }
 

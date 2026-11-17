@@ -44,6 +44,7 @@ export struct AddonData {
 }
 
 export struct SourceRowData {
+    key: string,
     label: string,
     status: string,
     ok: bool,
@@ -435,6 +436,8 @@ export component MainWindow inherits Window {
     callback toggle-favorite();
     callback select-episode(string);
     callback play(string); // "mpv" | "vlc" – remembered as the profile's player
+    callback play-source(string); // play a specific source picked from the sources list
+    callback next-source(); // fail over to the next source during playback
     callback cancel-playback();
     callback remove-progress(string);
     callback toggle-watched();
@@ -1130,7 +1133,12 @@ export component MainWindow inherits Window {
                                     vertical-alignment: center;
                                 }
                             }
-                            sra := TouchArea { }
+                            sra := TouchArea {
+                                enabled: !root.playing;
+                                clicked => {
+                                    root.play-source(sr.key);
+                                }
+                            }
                         }
                     }
                     Rectangle { horizontal-stretch: 0; height: 2px; }
@@ -1292,22 +1300,44 @@ export component MainWindow inherits Window {
                 font-size: 15px;
                 horizontal-alignment: center;
             }
-            Rectangle {
-                height: 40px;
-                width: 110px;
-                border-radius: 20px;
-                background: Theme.card;
-                vertical-stretch: 0;
-                cta := TouchArea {
-                    clicked => { root.cancel-playback(); }
+            HorizontalLayout {
+                alignment: center;
+                spacing: 12px;
+                Rectangle {
+                    height: 40px;
+                    width: 110px;
+                    border-radius: 20px;
+                    background: Theme.card;
+                    vertical-stretch: 0;
+                    cta := TouchArea {
+                        clicked => { root.cancel-playback(); }
+                    }
+                    Text {
+                        text: "Cancel";
+                        color: cta.has-hover ? #ffffff : Theme.text;
+                        font-size: 14px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
-                Text {
-                    text: "Cancel";
-                    color: cta.has-hover ? #ffffff : Theme.text;
-                    font-size: 14px;
-                    font-weight: 600;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                Rectangle {
+                    height: 40px;
+                    width: 130px;
+                    border-radius: 20px;
+                    background: Theme.card;
+                    vertical-stretch: 0;
+                    nta := TouchArea {
+                        clicked => { root.next-source(); }
+                    }
+                    Text {
+                        text: "Next source";
+                        color: nta.has-hover ? #ffffff : Theme.text;
+                        font-size: 14px;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
