@@ -1,0 +1,16 @@
+[package]
+name = "reel-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+reel-core = { version = "0.1.0", path = "../reel-core" }
+slint = "1.19.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[build-dependencies]
+slint-build = "1.19.0"
