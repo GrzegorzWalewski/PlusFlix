@@ -1,26 +1,21 @@
-import { Button, LineEdit, ComboBox, CheckBox, ScrollView, ListView } from "std-widgets.slint";
+// Reel – main window. Uses only custom components from components.slint;
+// design values come from theme.slint.
+import { Theme } from "theme.slint";
+import {
+    Item, ProfileIcon, IconLabel, IconButton, Button, TextField, Select,
+    Switch, SegmentedControl, Chip, ProgressBar, PosterCard, CwCard,
+    Avatar, VScroll,
+} from "components.slint";
 
-export struct Item {
-    id: string,
-    kind: string,
-    name: string,
-    year: string,
-    poster: image,
-    has-poster: bool,
-    // For continue-watching cards: the series/movie id to open.
-    title-id: string,
-    // "S02E05  Title" shown under the name on continue-watching cards.
-    episode-label: string,
-    // Watch progress 0..1 (0 = no bar).
-    progress: float,
-    watched: bool,
-    fav: bool,
-    // Continue-watching card (shows episode label + remove button).
-    is-cw: bool,
+export struct NavTab {
+    label: string,
+    page: string,
 }
 
 export struct RowData {
     title: string,
+    // Addon/catalog caption shown next to the row title.
+    subtitle: string,
     items: [Item],
 }
 
@@ -34,6 +29,9 @@ export struct ProfileData {
 export struct EpisodeData {
     id: string,
     label: string,
+    thumb: image,
+    has-thumb: bool,
+    progress: float,
     watched: bool,
 }
 
@@ -50,296 +48,143 @@ export struct SourceRowData {
     ok: bool,
 }
 
-global Theme {
-    out property <color> bg: #0f0f14;
-    out property <color> panel: #1a1a22;
-    out property <color> card: #2a2a35;
-    out property <color> text: #f2f2f5;
-    out property <color> muted: #9a9aa8;
-    out property <color> accent: #e5484d;
-    // UI scaling factor, bound from the window size (reference: 1280x800).
-    in-out property <float> ui-scale: 1.0;
-}
-
-// Renders one of the bundled profile icons (file names under icons/).
-component IconImage inherits Image {
-    in property <string> name;
-    source: name == "cat" ? @image-url("icons/cat.svg")
-        : name == "dog" ? @image-url("icons/dog.svg")
-        : name == "rabbit" ? @image-url("icons/rabbit.svg")
-        : name == "bird" ? @image-url("icons/bird.svg")
-        : name == "fish" ? @image-url("icons/fish.svg")
-        : name == "turtle" ? @image-url("icons/turtle.svg")
-        : name == "smile" ? @image-url("icons/smile.svg")
-        : name == "ghost" ? @image-url("icons/ghost.svg")
-        : name == "bot" ? @image-url("icons/bot.svg")
-        : name == "star" ? @image-url("icons/star.svg")
-        : name == "rocket" ? @image-url("icons/rocket.svg")
-        : name == "music" ? @image-url("icons/music.svg")
-        : name == "gamepad" ? @image-url("icons/gamepad.svg")
-        : name == "coffee" ? @image-url("icons/coffee.svg")
-        : name == "plane" ? @image-url("icons/plane.svg")
-        : name == "car" ? @image-url("icons/car.svg")
-        : name == "bike" ? @image-url("icons/bike.svg")
-        : name == "camera" ? @image-url("icons/camera.svg")
-        : name == "flower" ? @image-url("icons/flower.svg")
-        : name == "flame" ? @image-url("icons/flame.svg")
-        : @image-url("icons/star.svg");
-    colorize: white;
-    image-fit: contain;
-}
-
-// Compact icon (+ optional text) button with hover tooltip and accessibility.
-// Sized in Theme.ui-scale so it keeps its proportion on large displays, and
-// stretch-fixed so parent layouts center it instead of squashing it.
-component IconButton inherits Rectangle {
-    in property <image> icon;
-    in property <string> label;
-    in property <bool> active;
-    in property <bool> danger;
-    in property <string> tooltip;
-    callback clicked();
-    property <bool> show-tip: false;
-    height: 40px * Theme.ui-scale;
-    vertical-stretch: 0;
-    width: root.label == "" ? (40px * Theme.ui-scale) : (ic.width + lt.preferred-width + 28px * Theme.ui-scale);
-    border-radius: 20px * Theme.ui-scale;
-    background: root.active ? Theme.accent
-        : root.danger ? (ta.has-hover ? #b32626 : #3a1e1e)
-        : ta.has-hover ? Theme.card : transparent;
-    accessible-role: button;
-    accessible-label: root.tooltip != "" ? root.tooltip : root.label;
-    HorizontalLayout {
-        padding-left: 12px * Theme.ui-scale;
-        padding-right: 12px * Theme.ui-scale;
-        spacing: 8px * Theme.ui-scale;
-        alignment: center;
-        ic := Image {
-            source: root.icon;
-            width: 22px * Theme.ui-scale;
-            height: 22px * Theme.ui-scale;
-            vertical-stretch: 0;
-            colorize: white;
-            image-fit: contain;
-        }
-        lt := Text {
-            text: root.label;
-            color: white;
-            font-size: 14px * Theme.ui-scale;
-            visible: root.label != "";
-            vertical-alignment: center;
-        }
-    }
-    ta := TouchArea {
-        clicked => {
-            root.show-tip = false;
-            root.clicked();
-        }
-        changed has-hover => {
-            if !ta.has-hover {
-                root.show-tip = false;
-            }
-        }
-    }
-    Timer {
-        interval: 500ms;
-        running: ta.has-hover && root.tooltip != "";
-        triggered => {
-            root.show-tip = true;
-        }
-    }
-    if root.show-tip && root.tooltip != "": Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: -self.height - 6px * Theme.ui-scale;
-        width: tip-t.preferred-width + 20px * Theme.ui-scale;
-        height: tip-t.preferred-height + 12px * Theme.ui-scale;
-        border-radius: 6px * Theme.ui-scale;
-        background: #33333d;
-        tip-t := Text {
-            text: root.tooltip;
-            color: Theme.text;
-            font-size: 12px * Theme.ui-scale;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-        }
-    }
-}
-
-component Poster inherits Rectangle {
-    in property <Item> item;
-    callback clicked();
-    callback remove(string);
-    width: 150px;
-    height: 274px;
-    background: transparent;
-
-    VerticalLayout {
-        spacing: 6px;
-        Rectangle {
-            height: 225px;
-            border-radius: 8px;
-            background: Theme.card;
-            clip: true;
-            if root.item.has-poster: Image {
-                source: root.item.poster;
-                width: parent.width;
-                height: parent.height;
-                image-fit: cover;
-            }
-            if !root.item.has-poster: Text {
-                text: root.item.name;
-                color: Theme.muted;
-                wrap: word-wrap;
-                font-size: 13px;
-                width: parent.width - 16px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-            Rectangle {
-                border-width: ta.has-hover ? 3px : 0px;
-                border-color: Theme.accent;
-                border-radius: 8px;
-            }
-            // watch progress bar
-            if root.item.progress > 0: Rectangle {
-                y: parent.height - 5px;
-                height: 4px;
-                width: parent.width * clamp(root.item.progress, 0.0, 1.0);
-                background: Theme.accent;
-            }
-            // watched check badge
-            if root.item.watched: Rectangle {
-                width: 26px;
-                height: 26px;
-                x: parent.width - self.width - 8px;
-                y: 8px;
-                border-radius: self.width / 2;
-                background: #000000b0;
-                Image {
-                    source: @image-url("icons/check.svg");
-                    width: 14px;
-                    height: 14px;
-                    colorize: #4cd964;
-                    image-fit: contain;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                }
-            }
-            // favorite heart badge
-            if root.item.fav: Rectangle {
-                width: 26px;
-                height: 26px;
-                x: 8px;
-                y: 8px;
-                border-radius: self.width / 2;
-                background: #000000b0;
-                Image {
-                    source: @image-url("icons/heart.svg");
-                    width: 14px;
-                    height: 14px;
-                    colorize: Theme.accent;
-                    image-fit: contain;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                }
-            }
-            // remove button on continue-watching cards
-            if root.item.is-cw && ta.has-hover: Rectangle {
-                width: 26px;
-                height: 26px;
-                x: parent.width - self.width - 8px;
-                y: parent.height - self.height - 8px;
-                border-radius: self.width / 2;
-                background: #000000b0;
-                Image {
-                    source: @image-url("icons/x.svg");
-                    width: 14px;
-                    height: 14px;
-                    colorize: white;
-                    image-fit: contain;
-                    x: (parent.width - self.width) / 2;
-                    y: (parent.height - self.height) / 2;
-                }
-                rta := TouchArea {
-                    clicked => {
-                        root.remove(root.item.id);
-                    }
-                }
-            }
-        }
-        Text {
-            text: root.item.name;
-            overflow: elide;
-            font-size: 12px;
-            color: Theme.text;
-        }
-        if root.item.is-cw && root.item.episode-label != "": Text {
-            text: root.item.episode-label;
-            overflow: elide;
-            font-size: 11px;
-            color: Theme.muted;
-        }
-    }
-    ta := TouchArea {
-        clicked => {
-            root.clicked();
-        }
-    }
-}
-
-component CatalogRow inherits VerticalLayout {
+// One horizontal catalog row with header, edge fades and scroll chevrons.
+component CatalogRow inherits Rectangle {
     in property <RowData> data;
     callback open(string, string);
     callback remove(string);
-    spacing: 8px;
-    Text {
+    property <bool> row-hover: ra.has-hover;
+    property <length> gap: Theme.sp-4;
+    property <int> cols: clamp(floor((self.width + gap) / (150px * Theme.scale + gap)), 4, 12);
+    property <length> card-w: (self.width - (cols - 1) * gap) / cols;
+    property <bool> is-cw: root.data.items.length > 0 && root.data.items[0].is-cw;
+    property <length> header-h: Theme.sp-1 + Theme.fs-heading + Theme.sp-1;
+    property <length> cards-h: is-cw
+        ? (card-w * 9 / 16 + Theme.sp-1 + 30px * Theme.scale)
+        : (card-w * 1.5 + Theme.sp-1 + 36px * Theme.scale);
+    height: header-h + cards-h;
+    ra := TouchArea { }
+    title-w := Text {
+        y: Theme.sp-1;
+        height: self.preferred-height;
         text: root.data.title;
-        font-size: 18px;
-        font-weight: 700;
+        font-size: Theme.fs-heading;
+        font-weight: 600;
+        font-family: Theme.font;
         color: Theme.text;
     }
-    Flickable {
-        height: 272px;
-        content-width: root.data.items.length * 160px;
-        for item[i] in root.data.items: Poster {
-            x: i * 160px;
-            item: item;
+    if root.data.subtitle != "": Text {
+        x: title-w.preferred-width + Theme.sp-3;
+        y: Theme.sp-1 + 5px * Theme.scale;
+        height: self.preferred-height;
+        text: root.data.subtitle;
+        color: Theme.muted;
+        font-size: Theme.fs-caption;
+        font-family: Theme.font;
+    }
+    if row-hover && -row-scroll.content-x > 1px: Rectangle {
+        x: 0;
+        width: Theme.hit;
+        height: cards-h;
+        y: header-h;
+        background: @linear-gradient(90deg, Theme.bg, Colors.transparent);
+        IconButton {
+            x: Theme.sp-1;
+            y: (parent.height - self.height) / 2;
+            icon: @image-url("icons/chevron-left.svg");
+            tooltip: "Scroll left";
             clicked => {
-                root.open(item.title-id == "" ? item.id : item.title-id, item.kind);
+                row-scroll.content-x = min(0px, row-scroll.content-x + parent.width);
             }
-            remove(id) => {
-                root.remove(id);
+        }
+    }
+    if row-hover: Rectangle {
+        x: parent.width - Theme.hit;
+        width: Theme.hit;
+        height: cards-h;
+        y: header-h;
+        background: @linear-gradient(270deg, Theme.bg, Colors.transparent);
+        IconButton {
+            x: parent.width - self.width - Theme.sp-1;
+            y: (parent.height - self.height) / 2;
+            icon: @image-url("icons/chevron-right.svg");
+            tooltip: "Scroll right";
+            clicked => {
+                row-scroll.content-x = max(row-scroll.width - row-scroll.content-width, row-scroll.content-x - parent.width);
+            }
+        }
+    }
+    row-scroll := Flickable {
+        y: header-h;
+        height: cards-h;
+        content-width: root.data.items.length * (card-w + gap);
+        for item[i] in root.data.items: Rectangle {
+            x: i * (card-w + gap);
+            width: card-w;
+            height: parent.height;
+            if item.is-cw: CwCard {
+                item: item;
+                clicked => {
+                    root.open(item.title-id == "" ? item.id : item.title-id, item.kind);
+                }
+                remove(id) => {
+                    root.remove(id);
+                }
+            }
+            if !item.is-cw: PosterCard {
+                item: item;
+                clicked => {
+                    root.open(item.title-id == "" ? item.id : item.title-id, item.kind);
+                }
             }
         }
     }
 }
 
-component NavButton inherits Rectangle {
+// Grouped settings card with a heading and rows.
+component SettingsCard inherits Rectangle {
+    in property <string> title;
+    background: Theme.surface;
+    border-radius: Theme.r-md;
+    border-width: 1px;
+    border-color: Theme.border;
+    vertical-stretch: 0;
+    card := VerticalLayout {
+        padding: Theme.sp-6;
+        spacing: Theme.sp-4;
+        Text {
+            text: root.title;
+            font-size: Theme.fs-heading;
+            font-weight: 600;
+            font-family: Theme.font;
+            color: Theme.text;
+        }
+        @children
+    }
+}
+
+// One settings row: label + helper on the left, control(s) on the right.
+component SettingsRow inherits HorizontalLayout {
     in property <string> label;
-    in property <bool> active;
-    callback clicked();
-    height: 36px;
-    width: t.preferred-width + 28px;
-    border-radius: 18px;
-    background: root.active ? Theme.accent : (ta.has-hover ? Theme.card : transparent);
-    t := Text {
-        text: root.label;
-        color: Theme.text;
-        font-size: 14px;
-        font-weight: root.active ? 700 : 400;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    ta := TouchArea {
-        clicked => {
-            root.clicked();
+    in property <string> helper;
+    VerticalLayout {
+        alignment: start;
+        spacing: 2px;
+        width: 280px * Theme.scale;
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: Theme.fs-body;
+            font-family: Theme.font;
+        }
+        if root.helper != "": Text {
+            text: root.helper;
+            color: Theme.muted;
+            font-size: Theme.fs-caption;
+            font-family: Theme.font;
         }
     }
-}
-
-component FieldLabel inherits Text {
-    color: Theme.muted;
-    font-size: 13px;
+    Rectangle { horizontal-stretch: 1; }
 }
 
 export component MainWindow inherits Window {
@@ -349,24 +194,33 @@ export component MainWindow inherits Window {
     preferred-width: 1280px;
     preferred-height: 800px;
     background: Theme.bg;
+    default-font-family: "Inter";
 
     // UI scale derived from the window size (reference: 1280x800).
     property <float> win-scale: clamp(min(self.width / 1280px, self.height / 800px), 0.8, 2.5);
     changed win-scale => {
-        Theme.ui-scale = self.win-scale;
+        Theme.scale = self.win-scale;
     }
     init => {
-        Theme.ui-scale = self.win-scale;
+        Theme.scale = self.win-scale;
     }
 
     // ---- app state ----
     in-out property <string> screen: "login"; // login | profiles | main
-    in-out property <string> page: "home"; // home | movies | series | favorites | settings
+    in-out property <string> page: "home"; // home | movies | series | favorites | search | settings
+    property <[NavTab]> nav-tabs: [
+        { label: "Home", page: "home" },
+        { label: "Movies", page: "movies" },
+        { label: "Series", page: "series" },
+        { label: "Favorites", page: "favorites" },
+    ];
     in property <[RowData]> rows;
     in property <[Item]> favorites;
     in property <[ProfileData]> profiles;
     in property <bool> can-add-profile;
     in property <string> profile-name;
+    in property <string> profile-icon;
+    in property <color> profile-color;
     in property <string> status;
     in property <bool> busy;
     in property <[Item]> search-results;
@@ -376,17 +230,24 @@ export component MainWindow inherits Window {
     in-out property <bool> detail-open;
     in property <string> detail-id;
     in property <string> detail-title;
-    in property <string> detail-info;
+    in property <bool> detail-long-title; // true = use the smaller title size
+    in property <string> detail-info; // year · runtime (text part of the meta row)
+    in property <[string]> detail-genres; // rendered as chips
     in property <string> detail-desc;
     in property <image> detail-poster;
     in property <bool> detail-has-poster;
     in property <bool> detail-is-series;
     in property <bool> detail-fav;
+    in property <[string]> season-names;
+    in-out property <int> season-idx;
     in property <[EpisodeData]> episodes;
     in property <string> selected-episode;
     in property <string> sources-summary;
+    // "loading" | "ready" | "none" | "hidden"
+    in property <string> sources-state;
     in property <[SourceRowData]> source-rows;
     in-out property <bool> sources-open;
+    property <float> spinner-angle: 0;
 
     // ---- playback ----
     in property <bool> playing;
@@ -412,9 +273,8 @@ export component MainWindow inherits Window {
     // ---- settings page ----
     in property <[string]> lang-names;
     in property <[string]> quality-names;
-    in property <[string]> subreq-names;
     in-out property <int> audio-idx;
-    in-out property <bool> audio-must;
+    in-out property <int> audio-mode-idx; // 0 = prefer, 1 = must
     in-out property <int> sub-idx;
     in-out property <int> subreq-idx;
     in-out property <int> minq-idx;
@@ -422,6 +282,9 @@ export component MainWindow inherits Window {
     in property <[AddonData]> addons;
     in property <bool> refreshing-addons;
     in-out property <int> player-idx;
+    // Settings auto-save guard: true while the values are being filled in.
+    in-out property <bool> settings-loading: true;
+    property <[string]> subreq-cards: [ "Required", "If audio differs", "Not required" ];
 
     callback login(string, string);
     callback logout();
@@ -430,11 +293,13 @@ export component MainWindow inherits Window {
     callback save-profile(string, string, string, string); // id, name, icon, color
     callback delete-profile(string);
     callback switch-profile();
+    callback manage-profiles-menu();
     callback navigate(string);
     callback open-item(string, string);
     callback close-detail();
     callback toggle-favorite();
     callback select-episode(string);
+    callback season-changed(int);
     callback play(string); // "mpv" | "vlc" – remembered as the profile's player
     callback play-source(string); // play a specific source picked from the sources list
     callback next-source(); // fail over to the next source during playback
@@ -445,6 +310,29 @@ export component MainWindow inherits Window {
     callback refresh-addons();
     callback search(string);
 
+    // Auto-save: any control change after the initial fill saves once, and
+    // the Rust side shows the "Saved" toast.
+    function settings-changed() {
+        if (!root.settings-loading) {
+            root.save-settings();
+        }
+    }
+    changed audio-idx => { root.settings-changed(); }
+    changed audio-mode-idx => { root.settings-changed(); }
+    changed sub-idx => { root.settings-changed(); }
+    changed subreq-idx => { root.settings-changed(); }
+    changed minq-idx => { root.settings-changed(); }
+    changed max-size => { root.settings-changed(); }
+    changed player-idx => { root.settings-changed(); }
+
+    Timer {
+        interval: 60ms;
+        running: root.sources-state == "loading" && root.detail-open;
+        triggered => {
+            root.spinner-angle = mod(root.spinner-angle + 24, 360);
+        }
+    }
+
     // ================= login =================
     if root.screen == "login": Rectangle {
         VerticalLayout {
@@ -452,102 +340,124 @@ export component MainWindow inherits Window {
             HorizontalLayout {
                 alignment: center;
                 Rectangle {
-                    width: 420px;
-                    height: 380px;
-                border-radius: 14px;
-                background: Theme.panel;
-                VerticalLayout {
-                    padding: 28px;
-                    spacing: 12px;
-                    alignment: start;
-                    Text {
-                        text: "Reel";
-                        font-size: 32px;
-                        font-weight: 800;
-                        color: Theme.accent;
-                    }
-                    FieldLabel { text: "Sign in with your Stremio account"; }
-                    email := LineEdit { placeholder-text: "E-mail"; }
-                    pass := LineEdit {
-                        placeholder-text: "Password";
-                        input-type: password;
-                        accepted => {
-                            root.login(email.text, pass.text);
+                    width: 420px * Theme.scale;
+                    height: 380px * Theme.scale;
+                    border-radius: Theme.r-md;
+                    background: Theme.surface;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    VerticalLayout {
+                        padding: Theme.sp-8;
+                        spacing: Theme.sp-3;
+                        alignment: start;
+                        Text {
+                            text: "Reel";
+                            font-size: Theme.fs-display;
+                            font-weight: 800;
+                            color: Theme.accent;
+                        }
+                        Text {
+                            text: "Sign in with your Stremio account";
+                            color: Theme.muted;
+                            font-size: Theme.fs-caption;
+                        }
+                        email := TextField {
+                            placeholder-text: "E-mail";
+                        }
+                        pass := TextField {
+                            placeholder-text: "Password";
+                            password: true;
+                            accepted(text) => {
+                                root.login(email.text, pass.text);
+                            }
+                        }
+                        Button {
+                            text: root.busy ? "Signing in…" : "Sign in";
+                            primary: true;
+                            disabled: root.busy;
+                            height: Theme.play-h;
+                            clicked => {
+                                root.login(email.text, pass.text);
+                            }
+                        }
+                        Text {
+                            text: root.status;
+                            color: Theme.accent;
+                            wrap: word-wrap;
+                            font-size: Theme.fs-caption;
                         }
                     }
-                    Button {
-                        text: root.busy ? "Signing in…" : "Sign in";
-                        enabled: !root.busy;
-                        primary: true;
-                        clicked => {
-                            root.login(email.text, pass.text);
-                        }
-                    }
-                    Text {
-                        text: root.status;
-                        color: Theme.accent;
-                        wrap: word-wrap;
-                        font-size: 13px;
-                    }
-                }
                 }
             }
         }
     }
 
     // ================= profile picker =================
-    if root.screen == "profiles": Rectangle {
+    if root.screen == "profiles": pw := Rectangle {
+        // tile size scales with the window: clamp(120px, 12vw, 200px)
+        property <length> tile: clamp(120px * Theme.scale, self.width * 0.12, 200px * Theme.scale);
         VerticalLayout {
             alignment: center;
-            spacing: 32px;
+            spacing: Theme.sp-8;
             Text {
                 text: root.manage-profiles ? "Manage profiles" : "Who's watching?";
-                font-size: 34px;
-                font-weight: 700;
+                font-size: Theme.fs-display;
+                font-weight: 800;
                 color: Theme.text;
                 horizontal-alignment: center;
             }
             HorizontalLayout {
                 alignment: center;
-                spacing: 28px;
+                spacing: Theme.sp-8;
                 for p in root.profiles: VerticalLayout {
-                    width: 150px;
-                    spacing: 10px;
-                    tile := Rectangle {
-                        width: tile-ta.has-hover ? 142px : 132px;
-                        height: tile.width;
-                        border-radius: 14px;
-                        background: p.color;
-                        border-width: (tile-ta.has-hover || root.manage-profiles) ? 4px : 0px;
-                        border-color: white;
-                        animate width, height { duration: 120ms; easing: ease-out; }
-                        IconImage {
-                            name: p.icon;
-                            width: parent.width * 0.48;
-                            height: self.width;
+                    width: pw.tile;
+                    spacing: Theme.sp-3;
+                    property <bool> hov: pt.has-hover;
+                    Rectangle {
+                        height: pw.tile;
+                        clip: false;
+                        Rectangle {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
-                        }
-                        if root.manage-profiles: Rectangle {
-                            width: 38px;
-                            height: 38px;
-                            x: parent.width - self.width - 8px;
-                            y: parent.height - self.height - 8px;
-                            border-radius: self.width / 2;
-                            background: #000000aa;
-                            border-width: 2px;
-                            border-color: white;
-                            Image {
-                                source: @image-url("icons/pencil.svg");
-                                width: 18px;
-                                height: 18px;
-                                colorize: white;
-                                image-fit: contain;
+                            width: parent.width * (pt.has-hover || root.manage-profiles ? 1.0 : 0.92);
+                            height: self.width;
+                            border-radius: Theme.r-md;
+                            background: p.color;
+                            animate x, y, width, height { duration: Theme.t-fast; easing: ease-out; }
+                            ProfileIcon {
+                                name: p.icon;
+                                width: parent.width * 0.48;
+                                height: self.width;
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
                             }
+                            if root.manage-profiles: Rectangle {
+                                width: 36px * Theme.scale;
+                                height: 36px * Theme.scale;
+                                x: parent.width - self.width - Theme.sp-1;
+                                y: parent.height - self.height - Theme.sp-1;
+                                border-radius: Theme.r-pill;
+                                background: #000000AA;
+                                Image {
+                                    source: @image-url("icons/pencil.svg");
+                                    width: Theme.sp-4;
+                                    height: Theme.sp-4;
+                                    colorize: white;
+                                    image-fit: contain;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                }
+                            }
                         }
-                        tile-ta := TouchArea {
+                        if pt.has-hover || root.manage-profiles: Rectangle {
+                            width: parent.width;
+                            height: parent.height;
+                            border-width: 3px;
+                            border-color: white;
+                            border-radius: Theme.r-md;
+                            background: transparent;
+                        }
+                        pt := TouchArea {
                             clicked => {
                                 if root.manage-profiles {
                                     root.confirm-del = false;
@@ -560,36 +470,52 @@ export component MainWindow inherits Window {
                         accessible-role: button;
                         accessible-label: root.manage-profiles ? "Edit profile " + p.name : "Switch to profile " + p.name;
                     }
-                    name-t := Text {
+                    Text {
+                        width: parent.width;
+                        height: self.preferred-height;
                         text: p.name;
-                        color: tile-ta.has-hover ? white : Theme.muted;
-                        font-size: 16px;
+                        color: hov ? white : Theme.muted;
+                        font-size: Theme.fs-body;
                         horizontal-alignment: center;
                         overflow: elide;
-                        width: parent.width;
                     }
                 }
                 if root.can-add-profile && !root.manage-profiles: VerticalLayout {
-                    width: 150px;
-                    spacing: 10px;
-                    plus-tile := Rectangle {
-                        width: plus-ta.has-hover ? 142px : 132px;
-                        height: self.width;
-                        border-radius: 14px;
-                        background: Theme.card;
-                        border-width: 3px;
-                        border-color: plus-ta.has-hover ? white : Theme.muted;
-                        animate width, height { duration: 120ms; easing: ease-out; }
-                        Image {
-                            source: @image-url("icons/plus.svg");
-                            width: parent.width * 0.4;
-                            height: self.width;
-                            colorize: plus-ta.has-hover ? white : Theme.muted;
-                            image-fit: contain;
+                    width: pw.tile;
+                    spacing: Theme.sp-3;
+                    property <bool> hov: at.has-hover;
+                    Rectangle {
+                        height: pw.tile;
+                        clip: false;
+                        Rectangle {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
+                            width: parent.width * (at.has-hover ? 1.0 : 0.92);
+                            height: self.width;
+                            border-radius: Theme.r-md;
+                            background: Theme.surface-2;
+                            border-width: 1.5px;
+                            border-color: hov ? white : Theme.border-strong;
+                            animate x, y, width, height, border-color { duration: Theme.t-fast; easing: ease-out; }
+                            Image {
+                                source: @image-url("icons/plus.svg");
+                                width: parent.width * 0.4;
+                                height: self.width;
+                                colorize: hov ? white : Theme.muted;
+                                image-fit: contain;
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                            }
                         }
-                        plus-ta := TouchArea {
+                        if at.has-hover: Rectangle {
+                            width: parent.width;
+                            height: parent.height;
+                            border-width: 3px;
+                            border-color: white;
+                            border-radius: Theme.r-md;
+                            background: transparent;
+                        }
+                        at := TouchArea {
                             clicked => {
                                 root.confirm-del = false;
                                 root.open-profile-edit("");
@@ -599,44 +525,53 @@ export component MainWindow inherits Window {
                         accessible-label: "Add profile";
                     }
                     Text {
+                        width: parent.width;
+                        height: self.preferred-height;
                         text: "Add profile";
                         color: Theme.muted;
-                        font-size: 16px;
+                        font-size: Theme.fs-body;
                         horizontal-alignment: center;
                     }
                 }
             }
             HorizontalLayout {
                 alignment: center;
-                spacing: 12px;
-                IconButton {
+                Button {
+                    outline: !root.manage-profiles;
+                    primary: root.manage-profiles;
                     icon: root.manage-profiles ? @image-url("icons/check.svg") : @image-url("icons/pencil.svg");
-                    label: root.manage-profiles ? "Done" : "Manage profiles";
-                    active: root.manage-profiles;
+                    has-icon: true;
+                    text: root.manage-profiles ? "Done" : "Manage profiles";
                     tooltip: "Edit or delete profiles";
                     clicked => {
                         root.manage-profiles = !root.manage-profiles;
-                    }
-                }
-                IconButton {
-                    icon: @image-url("icons/log-out.svg");
-                    label: "Log out";
-                    tooltip: "Log out of Stremio";
-                    clicked => {
-                        root.logout();
                     }
                 }
             }
             Text {
                 text: root.status;
                 color: Theme.muted;
+                font-size: Theme.fs-caption;
                 horizontal-alignment: center;
+            }
+        }
+        // Log out: small ghost button in the bottom-right corner
+        Button {
+            x: parent.width - self.width - Theme.page-margin;
+            y: parent.height - self.height - Theme.page-margin;
+            ghost: true;
+            icon: @image-url("icons/log-out.svg");
+            has-icon: true;
+            text: "Log out";
+            tooltip: "Log out of Stremio";
+            clicked => {
+                root.logout();
             }
         }
 
         // ---- edit overlay ----
         if root.edit-open: Rectangle {
-            background: #000000cc;
+            background: Theme.overlay;
             focus-scope := FocusScope {
                 width: parent.width;
                 height: parent.height;
@@ -652,20 +587,22 @@ export component MainWindow inherits Window {
                 }
             }
             Rectangle {
-                width: min(parent.width - 60px, 560px);
-                height: min(parent.height - 60px, 560px);
-                border-radius: 14px;
-                background: Theme.panel;
+                width: min(parent.width - Theme.sp-12, 560px * Theme.scale);
+                height: min(parent.height - Theme.sp-12, 560px * Theme.scale);
+                border-radius: Theme.r-md;
+                background: Theme.surface;
+                border-width: 1px;
+                border-color: Theme.border;
                 TouchArea { } // swallow clicks so the backdrop doesn't close
                 VerticalLayout {
-                    padding: 28px;
-                    spacing: 14px;
+                    padding: Theme.sp-8;
+                    spacing: Theme.sp-3;
                     HorizontalLayout {
-                        spacing: 10px;
+                        spacing: Theme.sp-2;
                         Text {
                             text: root.edit-id == "" ? "Add profile" : "Edit profile";
-                            font-size: 22px;
-                            font-weight: 700;
+                            font-size: Theme.fs-title;
+                            font-weight: 800;
                             color: Theme.text;
                             vertical-alignment: center;
                         }
@@ -678,26 +615,34 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    FieldLabel { text: "Name"; }
-                    LineEdit {
+                    Text {
+                        text: "Name";
+                        color: Theme.muted;
+                        font-size: Theme.fs-caption;
+                    }
+                    TextField {
                         text <=> root.edit-name;
                         placeholder-text: "Profile name";
                     }
-                    FieldLabel { text: "Icon"; }
+                    Text {
+                        text: "Icon";
+                        color: Theme.muted;
+                        font-size: Theme.fs-caption;
+                    }
                     Flickable {
-                        height: 132px;
-                        content-width: 5 * 64px;
-                        content-height: ceil(root.icon-choices.length / 5) * 64px;
+                        height: ceil(root.icon-choices.length / 5) * 64px * Theme.scale;
+                        content-width: 5 * 64px * Theme.scale;
+                        content-height: ceil(root.icon-choices.length / 5) * 64px * Theme.scale;
                         for ic[i] in root.icon-choices: Rectangle {
-                            width: 56px;
-                            height: 56px;
-                            x: mod(i, 5) * 64px;
-                            y: floor(i / 5) * 64px;
-                            border-radius: 10px;
-                            background: root.edit-icon == ic ? Theme.accent : Theme.card;
+                            width: 56px * Theme.scale;
+                            height: 56px * Theme.scale;
+                            x: mod(i, 5) * 64px * Theme.scale;
+                            y: floor(i / 5) * 64px * Theme.scale;
+                            border-radius: Theme.r-sm;
+                            background: root.edit-icon == ic ? Theme.accent : Theme.surface-2;
                             border-width: root.edit-icon == ic ? 3px : 0px;
                             border-color: white;
-                            IconImage {
+                            ProfileIcon {
                                 name: ic;
                                 width: parent.width * 0.55;
                                 height: self.width;
@@ -711,14 +656,18 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    FieldLabel { text: "Colour"; }
+                    Text {
+                        text: "Colour";
+                        color: Theme.muted;
+                        font-size: Theme.fs-caption;
+                    }
                     HorizontalLayout {
-                        spacing: 8px;
+                        spacing: Theme.sp-2;
                         alignment: start;
                         for c[i] in root.color-choices: Rectangle {
-                            width: 30px;
-                            height: 30px;
-                            border-radius: self.width / 2;
+                            width: 30px * Theme.scale;
+                            height: 30px * Theme.scale;
+                            border-radius: Theme.r-pill;
                             background: root.color-values[i];
                             border-width: root.edit-color == c ? 3px : 0px;
                             border-color: white;
@@ -729,9 +678,9 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    Rectangle { horizontal-stretch: 0; height: 4px; }
+                    Rectangle { height: Theme.sp-1; }
                     HorizontalLayout {
-                        spacing: 10px;
+                        spacing: Theme.sp-2;
                         alignment: start;
                         Button {
                             text: "Save";
@@ -742,6 +691,7 @@ export component MainWindow inherits Window {
                         }
                         if root.edit-id != "" && !root.confirm-del: Button {
                             text: "Delete";
+                            danger: true;
                             clicked => {
                                 root.confirm-del = true;
                             }
@@ -753,6 +703,7 @@ export component MainWindow inherits Window {
                         }
                         if root.edit-id != "" && root.confirm-del: Button {
                             text: "Yes, delete";
+                            danger: true;
                             clicked => {
                                 root.confirm-del = false;
                                 root.edit-open = false;
@@ -772,237 +723,468 @@ export component MainWindow inherits Window {
     }
 
     // ================= main =================
-    if root.screen == "main": VerticalLayout {
-        padding: 18px;
-        spacing: 14px;
-
-        HorizontalLayout {
-            spacing: 6px;
-            height: 40px;
-            Text {
-                text: "Reel";
-                color: Theme.accent;
-                font-size: 24px;
-                font-weight: 800;
-                vertical-alignment: center;
-            }
-            Rectangle { width: 16px; }
-            NavButton { label: "Home"; active: root.page == "home"; clicked => { root.navigate("home"); } }
-            NavButton { label: "Movies"; active: root.page == "movies"; clicked => { root.navigate("movies"); } }
-            NavButton { label: "Series"; active: root.page == "series"; clicked => { root.navigate("series"); } }
-            NavButton { label: "Favorites"; active: root.page == "favorites"; clicked => { root.navigate("favorites"); } }
-            search-box := LineEdit {
-                width: 200px;
-                placeholder-text: "Search…";
-                enabled: !root.searching;
-                accepted => {
-                    root.search(self.text);
+    if root.screen == "main": Rectangle {
+        // ---- catalog pages ----
+        if root.page == "home" || root.page == "movies" || root.page == "series": Rectangle {
+            flick := Flickable {
+                x: 0;
+                width: parent.width - Theme.sp-2;
+                height: parent.height;
+                content-height: page-content.preferred-height;
+                page-content := VerticalLayout {
+                    x: 0;
+                    width: flick.width;
+                    height: max(self.preferred-height, flick.height);
+                    padding-left: Theme.page-margin;
+                    padding-right: Theme.page-margin;
+                    padding-top: Theme.topbar + Theme.sp-2;
+                    padding-bottom: Theme.sp-6;
+                    spacing: Theme.sp-8;
+                    if root.busy && root.rows.length == 0: Text {
+                        text: "Loading…";
+                        color: Theme.muted;
+                        font-size: Theme.fs-body;
+                    }
+                    if !root.busy && root.rows.length == 0: Text {
+                        text: "Nothing to show. Check that your Stremio account has catalog addons (e.g. Cinemeta).";
+                        color: Theme.muted;
+                        wrap: word-wrap;
+                    }
+                    for row in root.rows: CatalogRow {
+                        data: row;
+                        open(id, kind) => {
+                            root.open-item(id, kind);
+                        }
+                        remove(id) => {
+                            root.remove-progress(id);
+                        }
+                    }
                 }
             }
-            Rectangle { horizontal-stretch: 1; }
-            NavButton { label: "Settings"; active: root.page == "settings"; clicked => { root.navigate("settings"); } }
-            NavButton { label: root.profile-name + " ⇄"; active: false; clicked => { root.switch-profile(); } }
+            VScroll {
+                content-height: page-content.preferred-height;
+                viewport-height: parent.height;
+                x: parent.width - self.width - 2px * Theme.scale;
+                height: parent.height;
+                content-y <=> flick.content-y;
+            }
         }
 
-        if root.page == "home" || root.page == "movies" || root.page == "series": ScrollView {
-            VerticalLayout {
-                spacing: 18px;
-                if root.busy && root.rows.length == 0: Text {
-                    text: "Loading…";
+        // ---- favorites / search grid ----
+        if root.page == "favorites" || root.page == "search": grid-page := Rectangle {
+            property <[Item]> grid-items: root.page == "favorites" ? root.favorites : root.search-results;
+            property <int> cols: max(4, floor((self.width - 2 * Theme.page-margin + Theme.sp-4) / (160px * Theme.scale + Theme.sp-4)));
+            property <length> cell-w: (self.width - 2 * Theme.page-margin - (cols - 1) * Theme.sp-4) / cols;
+            property <length> cell-h: cell-w * 1.5 + Theme.sp-1 + 36px * Theme.scale;
+            grid-flick := Flickable {
+                x: 0;
+                width: parent.width - Theme.sp-2;
+                height: parent.height;
+                content-height: Theme.topbar + Theme.sp-2 + ceil(grid-page.grid-items.length / grid-page.cols) * grid-page.cell-h + Theme.sp-4;
+                if root.page == "search" && root.searching && root.search-results.length == 0: Text {
+                    x: Theme.page-margin;
+                    y: Theme.topbar + Theme.sp-2;
+                    text: "Searching…";
                     color: Theme.muted;
-                    font-size: 16px;
+                    font-size: Theme.fs-body;
                 }
-                if !root.busy && root.rows.length == 0: Text {
-                    text: "Nothing to show. Check that your Stremio account has catalog addons (e.g. Cinemeta).";
+                if root.page == "search" && !root.searching && root.search-results.length == 0: Text {
+                    x: Theme.page-margin;
+                    y: Theme.topbar + Theme.sp-2;
+                    width: parent.width - Theme.page-margin - Theme.sp-4;
+                    text: "No results. Your addons may not support search, or the query matched nothing.";
                     color: Theme.muted;
                     wrap: word-wrap;
                 }
-                for row in root.rows: CatalogRow {
-                    data: row;
-                    open(id, kind) => {
-                        root.open-item(id, kind);
-                    }
-                    remove(id) => {
-                        root.remove-progress(id);
-                    }
-                }
-            }
-        }
-
-        if root.page == "favorites": ScrollView {
-            property <int> cols: max(1, floor(self.visible-width / 160px));
-            content-height: max(1, ceil(root.favorites.length / cols)) * 272px;
-            if root.favorites.length == 0: Text {
-                text: "No favorites yet. Open a title and press ☆ to add it to this profile's favorites.";
-                color: Theme.muted;
-                wrap: word-wrap;
-            }
-            for item[i] in root.favorites: Poster {
-                x: mod(i, parent.cols) * 160px;
-                y: floor(i / parent.cols) * 272px;
-                item: item;
-                clicked => {
-                    root.open-item(item.id, item.kind);
-                }
-            }
-        }
-
-        if root.page == "search": ScrollView {
-            property <int> cols: max(1, floor(self.visible-width / 160px));
-            content-height: max(1, ceil(root.search-results.length / cols)) * 272px;
-            if root.searching && root.search-results.length == 0: Text {
-                text: "Searching…";
-                color: Theme.muted;
-                font-size: 16px;
-            }
-            if !root.searching && root.search-results.length == 0: Text {
-                text: "No results. Your addons may not support search, or the query matched nothing.";
-                color: Theme.muted;
-                wrap: word-wrap;
-            }
-            for item[i] in root.search-results: Poster {
-                x: mod(i, parent.cols) * 160px;
-                y: floor(i / parent.cols) * 272px;
-                item: item;
-                clicked => {
-                    root.open-item(item.id, item.kind);
-                }
-            }
-        }
-
-        if root.page == "settings": ScrollView {
-            VerticalLayout {
-                spacing: 10px;
-                alignment: start;
-                Text {
-                    text: "Playback settings for " + root.profile-name;
-                    font-size: 20px;
-                    font-weight: 700;
-                    color: Theme.text;
-                }
-                FieldLabel { text: "Audio language"; }
-                HorizontalLayout {
-                    spacing: 16px;
-                    ComboBox {
-                        model: root.lang-names;
-                        current-index <=> root.audio-idx;
-                    }
-                    CheckBox {
-                        text: "Must have (otherwise only preferred)";
-                        checked <=> root.audio-must;
-                    }
-                }
-                FieldLabel { text: "Subtitles language"; }
-                ComboBox {
-                    model: root.lang-names;
-                    current-index <=> root.sub-idx;
-                }
-                FieldLabel { text: "Subtitles requirement"; }
-                ComboBox {
-                    model: root.subreq-names;
-                    current-index <=> root.subreq-idx;
-                }
-                FieldLabel { text: "Minimum quality"; }
-                ComboBox {
-                    model: root.quality-names;
-                    current-index <=> root.minq-idx;
-                }
-                FieldLabel { text: "Player"; }
-                ComboBox {
-                    width: 160px;
-                    model: root.player-names;
-                    current-index <=> root.player-idx;
-                }
-                FieldLabel { text: "Maximum file size in GB (empty = no limit)"; }
-                LineEdit {
-                    width: 160px;
-                    text <=> root.max-size;
-                    placeholder-text: "e.g. 12";
-                }
-                HorizontalLayout {
-                    alignment: start;
-                    spacing: 10px;
-                    Button {
-                        text: "Save";
-                        primary: true;
-                        clicked => {
-                            root.save-settings();
-                        }
-                    }
-                }
-                Text {
-                    text: "Subtitle requirement only applies when a subtitles language is chosen.";
+                if root.page == "favorites" && root.favorites.length == 0: Text {
+                    x: Theme.page-margin;
+                    y: Theme.topbar + Theme.sp-2;
+                    width: parent.width - Theme.page-margin - Theme.sp-4;
+                    text: "No favorites yet. Open a title and press the heart to add it to this profile's favorites.";
                     color: Theme.muted;
-                    font-size: 12px;
+                    wrap: word-wrap;
                 }
-                HorizontalLayout {
-                    spacing: 10px;
-                    alignment: start;
+                for item[i] in grid-page.grid-items: PosterCard {
+                    width: grid-page.cell-w;
+                    height: grid-page.cell-h;
+                    x: Theme.page-margin + mod(i, grid-page.cols) * (grid-page.cell-w + Theme.sp-4);
+                    y: Theme.topbar + Theme.sp-2 + floor(i / grid-page.cols) * (grid-page.cell-h + Theme.sp-4);
+                    item: item;
+                    clicked => {
+                        root.open-item(item.title-id == "" ? item.id : item.title-id, item.kind);
+                    }
+                }
+            }
+            VScroll {
+                x: parent.width - self.width - 2px * Theme.scale;
+                height: parent.height;
+                content-height: Theme.topbar + Theme.sp-2 + ceil(grid-page.grid-items.length / grid-page.cols) * grid-page.cell-h + Theme.sp-4;
+                viewport-height: parent.height;
+                content-y <=> grid-flick.content-y;
+            }
+        }
+
+        // ---- settings ----
+        if root.page == "settings": Rectangle {
+            settings-flick := Flickable {
+                x: 0;
+                width: parent.width - Theme.sp-2;
+                height: parent.height;
+                content-height: settings-col.preferred-height;
+                settings-col := VerticalLayout {
+                    x: max((settings-flick.width - 720px * Theme.scale) / 2, Theme.page-margin);
+                    width: min(settings-flick.width - 2 * Theme.page-margin, 720px * Theme.scale);
+                    height: max(self.preferred-height, settings-flick.height);
+                    padding-top: Theme.topbar + Theme.sp-4;
+                    padding-bottom: Theme.sp-12;
+                    spacing: Theme.sp-4;
                     Text {
-                        text: "Addons (" + root.addons.length + ")";
-                        font-size: 20px;
-                        font-weight: 700;
+                        text: "Playback settings for " + root.profile-name;
+                        font-size: Theme.fs-title;
+                        font-weight: 800;
                         color: Theme.text;
-                        vertical-alignment: center;
                     }
-                    Button {
-                        text: root.refreshing-addons ? "Refreshing…" : "Refresh";
-                        enabled: !root.refreshing-addons;
-                        clicked => {
-                            root.refresh-addons();
+                    SettingsCard {
+                        title: "Audio";
+                        VerticalLayout {
+                            spacing: Theme.sp-4;
+                            SettingsRow {
+                                label: "Preferred audio language";
+                                helper: "Sources matching it rank first.";
+                                Select {
+                                    model: root.lang-names;
+                                    current-index <=> root.audio-idx;
+                                    width: 240px * Theme.scale;
+                                }
+                            }
+                            SettingsRow {
+                                label: "Requirement";
+                                helper: "Must only allows sources with that audio.";
+                                SegmentedControl {
+                                    model: [ "Prefer", "Must" ];
+                                    current-index <=> root.audio-mode-idx;
+                                    compact: true;
+                                }
+                            }
                         }
                     }
-                }
-                Text {
-                    text: "Installed in your Stremio account. Only addons that provide direct HTTP(S) streams can play.";
-                    color: Theme.muted;
-                    font-size: 12px;
-                }
-                ListView {
-                    height: 220px;
-                    for a in root.addons: Rectangle {
-                        height: 44px;
-                        border-radius: 6px;
-                        background: ata.has-hover ? Theme.card : Theme.panel;
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 12px;
-                            spacing: 12px;
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 2px;
-                                Text {
-                                    text: a.name;
-                                    color: Theme.text;
-                                    font-size: 14px;
-                                    font-weight: 600;
-                                    overflow: elide;
+                    SettingsCard {
+                        title: "Subtitles";
+                        VerticalLayout {
+                            spacing: Theme.sp-4;
+                            SettingsRow {
+                                label: "Subtitle language";
+                                helper: "";
+                                Select {
+                                    model: root.lang-names;
+                                    current-index <=> root.sub-idx;
+                                    width: 240px * Theme.scale;
                                 }
+                            }
+                            SettingsRow {
+                                label: "Requirement";
+                                helper: "Only applies when a language is chosen.";
+                                VerticalLayout {
+                                    spacing: Theme.sp-2;
+                                    width: 300px * Theme.scale;
+                                    for sr[i] in root.subreq-cards: Rectangle {
+                                        height: 32px * Theme.scale;
+                                        border-radius: Theme.r-sm;
+                                        background: root.subreq-idx == i ? Theme.surface-2 : Theme.surface;
+                                        border-width: 1px;
+                                        border-color: root.subreq-idx == i ? Theme.accent : Theme.border;
+                                        animate background, border-color { duration: Theme.t-fast; easing: ease-out; }
+                                        HorizontalLayout {
+                                            padding-left: Theme.sp-3;
+                                            padding-right: Theme.sp-3;
+                                            spacing: Theme.sp-2;
+                                            Rectangle {
+                                                width: 16px * Theme.scale;
+                                                height: 16px * Theme.scale;
+                                                y: (parent.height - self.height) / 2;
+                                                border-radius: Theme.r-pill;
+                                                background: transparent;
+                                                border-width: root.subreq-idx == i ? 5px : 1.5px;
+                                                border-color: root.subreq-idx == i ? Theme.accent : Theme.border-strong;
+                                            }
+                                            Text {
+                                                text: sr;
+                                                color: root.subreq-idx == i ? white : Theme.text;
+                                                font-size: Theme.fs-caption + 1px * Theme.scale;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        TouchArea {
+                                            clicked => {
+                                                root.subreq-idx = i;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SettingsCard {
+                        title: "Quality & size";
+                        VerticalLayout {
+                            spacing: Theme.sp-4;
+                            SettingsRow {
+                                label: "Minimum quality";
+                                helper: "Sources below it are hidden.";
+                                Select {
+                                    model: root.quality-names;
+                                    current-index <=> root.minq-idx;
+                                    width: 240px * Theme.scale;
+                                }
+                            }
+                            SettingsRow {
+                                label: "Maximum file size (GB)";
+                                helper: "Empty = no limit.";
+                                TextField {
+                                    width: 140px * Theme.scale;
+                                    text <=> root.max-size;
+                                    placeholder-text: "e.g. 12";
+                                }
+                            }
+                        }
+                    }
+                    SettingsCard {
+                        title: "Player";
+                        VerticalLayout {
+                            spacing: Theme.sp-4;
+                            SettingsRow {
+                                label: "Preferred player";
+                                helper: "Used by the Play button.";
+                                SegmentedControl {
+                                    model: root.player-names;
+                                    current-index <=> root.player-idx;
+                                }
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: Theme.sp-3;
+                        alignment: start;
+                        Text {
+                            text: "Addons (" + root.addons.length + ")";
+                            font-size: Theme.fs-heading;
+                            font-weight: 600;
+                            color: Theme.text;
+                            vertical-alignment: center;
+                        }
+                        Button {
+                            text: root.refreshing-addons ? "Refreshing…" : "Refresh";
+                            icon: @image-url("icons/rotate-cw.svg");
+                            has-icon: true;
+                            disabled: root.refreshing-addons;
+                            clicked => {
+                                root.refresh-addons();
+                            }
+                        }
+                    }
+                    Text {
+                        text: "Installed in your Stremio account. Only addons that provide direct HTTP(S) streams can play.";
+                        color: Theme.muted;
+                        font-size: Theme.fs-caption;
+                    }
+                    Flickable {
+                        height: 220px * Theme.scale;
+                        content-height: root.addons.length * 44px * Theme.scale;
+                        for a[i] in root.addons: Rectangle {
+                            y: i * 44px * Theme.scale;
+                            width: parent.width;
+                            height: 44px * Theme.scale;
+                            border-radius: Theme.r-sm;
+                            background: ata.has-hover ? Theme.hover-bg : Theme.surface;
+                            HorizontalLayout {
+                                padding-left: Theme.sp-3;
+                                padding-right: Theme.sp-3;
+                                spacing: Theme.sp-3;
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 2px;
+                                    Text {
+                                        text: a.name;
+                                        color: Theme.text;
+                                        font-size: Theme.fs-body;
+                                        font-weight: 600;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: a.kinds;
+                                        color: Theme.muted;
+                                        font-size: Theme.fs-caption;
+                                        overflow: elide;
+                                    }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
                                 Text {
-                                    text: a.kinds;
+                                    text: a.version;
                                     color: Theme.muted;
-                                    font-size: 12px;
-                                    overflow: elide;
+                                    font-size: Theme.fs-caption;
+                                    vertical-alignment: center;
                                 }
                             }
-                            Rectangle { horizontal-stretch: 1; }
-                            Text {
-                                text: a.version;
-                                color: Theme.muted;
-                                font-size: 12px;
-                                vertical-alignment: center;
-                            }
+                            ata := TouchArea { }
                         }
-                        ata := TouchArea { }
                     }
                 }
             }
+            VScroll {
+                x: parent.width - self.width - 2px * Theme.scale;
+                height: parent.height;
+                content-height: settings-col.preferred-height;
+                viewport-height: parent.height;
+                content-y <=> settings-flick.content-y;
+            }
         }
-    }
+        // ---- top bar ----
+        Rectangle {
+            x: 0;
+            y: 0;
+            height: Theme.topbar;
+            background: @linear-gradient(180deg, Theme.surface, Colors.transparent);
+            HorizontalLayout {
+                padding-left: Theme.page-margin;
+                padding-right: Theme.page-margin;
+                spacing: Theme.sp-6;
+                Text {
+                    text: "Reel";
+                    color: Theme.accent;
+                    font-size: Theme.fs-heading + Theme.sp-2;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                }
+                Rectangle { width: Theme.sp-4; }
+                for tab in root.nav-tabs: Rectangle {
+                    property <bool> act: root.page == tab.page;
+                    height: Theme.topbar;
+                    width: nt.preferred-width + Theme.sp-6;
+                    nt := Text {
+                        y: (parent.height - self.height) / 2 - 2px * Theme.scale;
+                        height: self.preferred-height;
+                        text: tab.label;
+                        color: act ? white : Theme.muted;
+                        font-size: Theme.fs-body;
+                        font-weight: act ? 600 : 400;
+                        horizontal-alignment: center;
+                        animate color { duration: Theme.t-fast; easing: ease-out; }
+                    }
+                    if act: Rectangle {
+                        y: parent.height - 2px;
+                        width: parent.width;
+                        height: 2px;
+                        background: Theme.accent;
+                    }
+                    TouchArea {
+                        clicked => {
+                            root.navigate(tab.page);
+                        }
+                    }
+                    accessible-role: button;
+                    accessible-label: tab.label;
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            search-box := TextField {
+                y: (parent.height - self.height) / 2;
+                x: bar-gear.x - Theme.sp-6 - self.width;
+                icon: @image-url("icons/search.svg");
+                placeholder-text: "Search…";
+                disabled: root.searching;
+                width: search-box.focused || search-box.text != "" ? 260px * Theme.scale : 180px * Theme.scale;
+                animate width { duration: Theme.t-med; easing: ease-out; }
+                accepted(text) => {
+                    root.search(text);
+                }
+            }
+            bar-gear := IconButton {
+                y: (parent.height - self.height) / 2;
+                x: bar-avatar.x - Theme.sp-6 - self.width;
+                icon: @image-url("icons/settings.svg");
+                tooltip: "Settings";
+                clicked => {
+                    root.navigate("settings");
+                }
+            }
+            bar-avatar := Rectangle {
+                width: Theme.hit;
+                height: Theme.hit;
+                x: parent.width - Theme.page-margin - Theme.hit;
+                y: (parent.height - Theme.hit) / 2;
+                Avatar {
+                    width: Theme.sp-8;
+                    height: Theme.sp-8;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    icon: root.profile-icon;
+                    tint: root.profile-color;
+                }
+                TouchArea {
+                    clicked => {
+                        avatar-menu.show();
+                    }
+                }
+                    avatar-menu := PopupWindow {
+                        x: -136px * Theme.scale;
+                        y: Theme.hit + 4px * Theme.scale;
+                        Rectangle {
+                            width: 180px * Theme.scale;
+                            height: 3 * 40px * Theme.scale + 8px * Theme.scale;
+                            border-radius: Theme.r-sm;
+                            background: Theme.surface-2;
+                            border-width: 1px;
+                            border-color: Theme.border-strong;
+                            drop-shadow-blur: 12px;
+                            drop-shadow-color: #000000A0;
+                            VerticalLayout {
+                                padding: 4px * Theme.scale;
+                                spacing: 2px * Theme.scale;
+                                for mi in [
+                                    { label: "Switch profile", icon: @image-url("icons/users.svg"), act: "switch" },
+                                    { label: "Manage profiles", icon: @image-url("icons/pencil.svg"), act: "manage" },
+                                    { label: "Log out", icon: @image-url("icons/log-out.svg"), act: "logout" },
+                                ]: Rectangle {
+                                    height: 40px * Theme.scale;
+                                    border-radius: 6px * Theme.scale;
+                                    background: ma.has-hover ? Theme.hover-bg : transparent;
+                                    animate background { duration: Theme.t-fast; easing: ease-out; }
+                                    HorizontalLayout {
+                                        padding-left: Theme.sp-3;
+                                        IconLabel {
+                                            y: (parent.height - self.height) / 2;
+                                            icon-size: 16px * Theme.scale;
+                                            icon: mi.icon;
+                                            text: mi.label;
+                                            text-size: Theme.fs-caption;
+                                            tint: Theme.text;
+                                        }
+                                    }
+                                    ma := TouchArea {
+                                        clicked => {
+                                            avatar-menu.close();
+                                            if (mi.act == "switch") {
+                                                root.switch-profile();
+                                            }
+                                            if (mi.act == "manage") {
+                                                root.manage-profiles-menu();
+                                            }
+                                            if (mi.act == "logout") {
+                                                root.logout();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                }
+            }
 
     // ================= detail overlay =================
     if root.detail-open && root.screen == "main": Rectangle {
-        background: #000000cc;
+        background: Theme.overlay;
         TouchArea {
             clicked => {
                 root.close-detail();
@@ -1023,19 +1205,24 @@ export component MainWindow inherits Window {
             }
         }
         Rectangle {
-            width: min(parent.width * 0.88, 900px * Theme.ui-scale);
-            height: min(parent.height * 0.88, 620px * Theme.ui-scale);
-            border-radius: 14px;
-            background: Theme.panel;
+            width: min(parent.width * 0.88, 1400px * Theme.scale);
+            height: min(parent.height * 0.88, 900px * Theme.scale);
+            border-radius: Theme.r-md;
+            background: Theme.surface;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 40px;
+            drop-shadow-color: #000000C0;
             TouchArea { } // swallow clicks so the backdrop doesn't close the card
-            HorizontalLayout {
-                padding: 28px * Theme.ui-scale;
-                spacing: 28px * Theme.ui-scale;
-                Rectangle {
-                    width: 210px * Theme.ui-scale;
-                    height: 315px * Theme.ui-scale;
-                    border-radius: 10px;
-                    background: Theme.card;
+            // absolute positioning: HorizontalLayout child distribution is unreliable here
+            // left column: poster, top-aligned, ~30% width
+            card-poster := Rectangle {
+                    x: Theme.sp-8;
+                    y: Theme.sp-8;
+                    width: min(parent.width * 0.3, 340px * Theme.scale);
+                    height: self.width * 1.5;
+                    border-radius: Theme.r-sm;
+                    background: Theme.surface-2;
                     clip: true;
                     if root.detail-has-poster: Image {
                         source: root.detail-poster;
@@ -1044,216 +1231,148 @@ export component MainWindow inherits Window {
                         image-fit: cover;
                     }
                 }
+            // right column: fixed top-aligned flow; extra space stays empty
+            card-col := Rectangle {
+                x: Theme.sp-8 + card-poster.width + Theme.sp-8;
+                y: Theme.sp-8;
+                width: parent.width - self.x - Theme.sp-8;
+                height: parent.height - 2 * Theme.sp-8;
+                clip: true;
                 VerticalLayout {
-                    spacing: 12px * Theme.ui-scale;
+                    width: parent.width;
+                    height: parent.height;
+                    alignment: start;
+                    spacing: 0px;
                     Text {
                         text: root.detail-title;
-                        font-size: 28px * Theme.ui-scale;
+                        font-size: root.detail-long-title ? Theme.fs-title : Theme.fs-display;
                         font-weight: 800;
                         color: Theme.text;
                         wrap: word-wrap;
+                        width: parent.width;
+                        height: self.preferred-height;
                     }
-                    Text {
-                        text: root.detail-info;
-                        font-size: 16px * Theme.ui-scale;
-                        color: Theme.muted;
+                    Rectangle { height: Theme.sp-2; }
+                    HorizontalLayout {
+                        spacing: Theme.sp-2;
+                        alignment: start;
+                        height: 24px * Theme.scale;
+                        if root.detail-info != "": Text {
+                            text: root.detail-info;
+                            color: Theme.muted;
+                            font-size: Theme.fs-body;
+                            vertical-alignment: center;
+                            height: parent.height;
+                        }
+                        for g in root.detail-genres: Chip {
+                            text: g;
+                        }
                     }
-                    // scrollable description
+                    Rectangle { height: Theme.sp-3; }
+                    // description, ~5 lines then scroll
                     Flickable {
-                        max-height: 140px * Theme.ui-scale;
+                        width: parent.width;
+                        vertical-stretch: 0;
+                        height: min(desc.preferred-height, 5 * 27px * Theme.scale);
                         content-height: desc.preferred-height;
                         desc := Text {
                             text: root.detail-desc;
-                            font-size: 18px * Theme.ui-scale;
+                            font-size: 18px * Theme.scale;
                             color: Theme.text;
                             wrap: word-wrap;
                             width: parent.width;
                         }
                     }
-                    if root.detail-is-series: ListView {
-                        height: 190px * Theme.ui-scale;
-                        for ep in root.episodes: Rectangle {
-                            height: 38px;
-                            border-radius: 8px;
-                            background: ep.id == root.selected-episode ? Theme.accent : (eta.has-hover ? Theme.card : transparent);
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 10px;
-                                Text {
-                                    text: ep.label;
-                                    color: Theme.text;
-                                    font-size: 16px * Theme.ui-scale;
-                                    overflow: elide;
-                                    vertical-alignment: center;
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                if ep.watched: Image {
-                                    source: @image-url("icons/check.svg");
-                                    width: 16px;
-                                    height: 16px;
-                                    colorize: white;
-                                    image-fit: contain;
-                                }
+                    Rectangle { height: Theme.sp-6; }
+                    // Play row: ONLY the play split button
+                    Rectangle {
+                        height: Theme.play-h;
+                        play-row := Rectangle {
+                            x: 0;
+                            height: parent.height;
+                            width: pl.width + chev.width + Theme.sp-6;
+                            border-radius: Theme.r-pill;
+                            background: root.playing ? Theme.surface-2 : (ptt.has-hover ? #E8E8ED : white);
+                            animate background { duration: Theme.t-fast; easing: ease-out; }
+                            clip: true;
+                            accessible-role: button;
+                            accessible-label: root.can-resume ? "Resume playback" : "Play";
+                            pl := IconLabel {
+                                x: Theme.sp-6;
+                                y: (parent.height - self.height) / 2;
+                                icon-size: Theme.sp-6;
+                                icon: @image-url("icons/play.svg");
+                                text: root.can-resume ? "Resume" : "Play";
+                                text-size: Theme.fs-heading;
+                                weight: 600;
+                                tint: Theme.on-play;
                             }
-                            eta := TouchArea {
+                            Rectangle {
+                                x: parent.width - chev.width - 1px;
+                                y: Theme.sp-3;
+                                width: 1px;
+                                height: parent.height - 2 * Theme.sp-3;
+                                background: Theme.border;
+                            }
+                            chev := IconButton {
+                                x: parent.width - self.width;
+                                y: (parent.height - self.height) / 2;
+                                tint: Theme.on-play;
+                                flat: true;
+                                icon: @image-url("icons/chevron-down.svg");
+                                tooltip: "Choose player";
                                 clicked => {
-                                    root.select-episode(ep.id);
+                                    root.player-menu-open = !root.player-menu-open;
                                 }
                             }
-                        }
-                    }
-                    Text {
-                        text: root.sources-summary;
-                        font-size: 14px * Theme.ui-scale;
-                        color: Theme.muted;
-                    }
-                    if root.sources-open: ListView {
-                        height: 160px * Theme.ui-scale;
-                        for sr in root.source-rows: Rectangle {
-                            height: 28px;
-                            border-radius: 6px;
-                            background: sra.has-hover ? Theme.card : transparent;
-                            HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                spacing: 10px;
-                                Text {
-                                    text: sr.label;
-                                    color: Theme.text;
-                                    font-size: 12px;
-                                    overflow: elide;
-                                    vertical-alignment: center;
-                                }
-                                Rectangle { horizontal-stretch: 1; }
-                                Text {
-                                    text: sr.status;
-                                    color: sr.ok ? Theme.muted : Theme.accent;
-                                    font-size: 12px;
-                                    vertical-alignment: center;
-                                }
-                            }
-                            sra := TouchArea {
+                            // click anywhere on the label side of the button
+                            ptt := TouchArea {
+                                width: parent.width - chev.width;
                                 enabled: !root.playing;
                                 clicked => {
-                                    root.play-source(sr.key);
-                                }
-                            }
-                        }
-                    }
-                    Rectangle { horizontal-stretch: 0; height: 2px; }
-                    // play row: big play button + player picker + icon actions
-                    Rectangle {
-                        height: 52px * Theme.ui-scale;
-                        HorizontalLayout {
-                            spacing: 10px * Theme.ui-scale;
-                            alignment: start;
-                            Rectangle {
-                                width: play-l.preferred-width + play-ic.width + 48px * Theme.ui-scale;
-                                height: parent.height;
-                                border-radius: 8px;
-                                background: root.playing ? Theme.card : (pt-ta.has-hover ? #d8d8dd : white);
-                                accessible-role: button;
-                                accessible-label: root.can-resume ? "Resume playback" : "Play";
-                                HorizontalLayout {
-                                    padding-left: 24px * Theme.ui-scale;
-                                    padding-right: 24px * Theme.ui-scale;
-                                    spacing: 10px * Theme.ui-scale;
-                                    alignment: center;
-                                    play-ic := Image {
-                                        source: @image-url("icons/play.svg");
-                                        width: 22px * Theme.ui-scale;
-                                        height: 22px * Theme.ui-scale;
-                                        colorize: #101014;
-                                        image-fit: contain;
-                                    }
-                                    play-l := Text {
-                                        text: root.can-resume ? "Resume" : "Play";
-                                        color: #101014;
-                                        font-size: 20px * Theme.ui-scale;
-                                        font-weight: 700;
-                                        vertical-alignment: center;
-                                    }
-                                }
-                                pt-ta := TouchArea {
-                                    enabled: !root.playing;
-                                    clicked => {
-                                        root.player-menu-open = false;
-                                        root.play(root.play-player);
-                                    }
-                                }
-                            }
-                            Rectangle {
-                                width: parent.height;
-                                height: parent.height;
-                                IconButton {
-                                    y: (parent.height - self.height) / 2;
-                                    icon: @image-url("icons/chevron-down.svg");
-                                    tooltip: "Choose player";
-                                    clicked => {
-                                        root.player-menu-open = !root.player-menu-open;
-                                    }
-                                }
-                            }
-                            Rectangle { horizontal-stretch: 1; }
-                            IconButton {
-                                icon: root.detail-fav ? @image-url("icons/heart.svg") : @image-url("icons/heart-off.svg");
-                                active: root.detail-fav;
-                                tooltip: root.detail-fav ? "Remove from favorites" : "Add to favorites";
-                                clicked => {
-                                    root.toggle-favorite();
-                                }
-                            }
-                            IconButton {
-                                icon: @image-url("icons/check.svg");
-                                active: root.detail-watched;
-                                tooltip: root.detail-watched ? "Mark as unwatched" : "Mark as watched";
-                                clicked => {
-                                    root.toggle-watched();
-                                }
-                            }
-                            IconButton {
-                                icon: @image-url("icons/rotate-cw.svg");
-                                tooltip: "Show source list";
-                                clicked => {
-                                    root.sources-open = !root.sources-open;
+                                    root.player-menu-open = false;
+                                    root.play(root.play-player);
                                 }
                             }
                         }
                         // player picker menu
                         if root.player-menu-open: Rectangle {
                             x: 0px;
-                            y: -self.height - 6px;
-                            width: 170px;
-                            height: 2 * 40px + 12px;
-                            border-radius: 8px;
-                            background: #26262e;
+                            y: -self.height - 6px * Theme.scale;
+                            width: 180px * Theme.scale;
+                            height: root.player-names.length * 40px * Theme.scale + 12px * Theme.scale;
+                            border-radius: Theme.r-sm;
+                            background: Theme.surface-2;
                             border-width: 1px;
-                            border-color: Theme.card;
+                            border-color: Theme.border-strong;
+                            drop-shadow-blur: 12px;
+                            drop-shadow-color: #000000A0;
                             VerticalLayout {
-                                padding: 6px;
-                                spacing: 2px;
+                                padding: 6px * Theme.scale;
+                                spacing: 2px * Theme.scale;
                                 for pk[i] in root.player-names: Rectangle {
-                                    height: 36px;
-                                    border-radius: 6px;
-                                    background: pka.has-hover ? Theme.card : transparent;
+                                    height: 40px * Theme.scale;
+                                    border-radius: 6px * Theme.scale;
+                                    background: pka.has-hover ? Theme.hover-bg : transparent;
+                                    animate background { duration: Theme.t-fast; easing: ease-out; }
                                     HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        spacing: 8px;
+                                        padding-left: Theme.sp-3;
+                                        padding-right: Theme.sp-3;
+                                        spacing: Theme.sp-2;
                                         Text {
                                             text: pk;
                                             color: Theme.text;
-                                            font-size: 14px;
+                                            font-size: Theme.fs-body;
                                             vertical-alignment: center;
                                         }
                                         Rectangle { horizontal-stretch: 1; }
                                         if root.play-player == (i == 0 ? "mpv" : "vlc"): Image {
                                             source: @image-url("icons/check.svg");
-                                            width: 15px;
-                                            height: 15px;
+                                            width: 15px * Theme.scale;
+                                            height: 15px * Theme.scale;
                                             colorize: Theme.accent;
                                             image-fit: contain;
+                                            vertical-stretch: 0;
                                         }
                                     }
                                     pka := TouchArea {
@@ -1266,12 +1385,195 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+                    Rectangle { height: Theme.sp-3; }
+                    // sources status chip
+                    Rectangle {
+                        height: 24px * Theme.scale;
+                        width: chip-t.preferred-width + 2 * Theme.sp-3
+                            + (root.sources-state == "loading" ? Theme.icon + Theme.sp-2 : 0px);
+                        border-radius: Theme.r-pill;
+                        background: Theme.surface-2;
+                        border-width: 1px;
+                        border-color: root.sources-state == "none" || root.sources-state == "hidden" ? Theme.warning : Theme.border;
+                        HorizontalLayout {
+                            padding-left: Theme.sp-3;
+                            padding-right: Theme.sp-3;
+                            spacing: Theme.sp-2;
+                            if root.sources-state == "loading": Image {
+                                source: @image-url("icons/rotate-cw.svg");
+                                width: 16px * Theme.scale;
+                                height: 16px * Theme.scale;
+                                colorize: Theme.muted;
+                                image-fit: contain;
+                                vertical-stretch: 0;
+                                transform-rotation: root.spinner-angle * 1deg;
+                            }
+                            chip-t := Text {
+                                text: root.sources-summary;
+                                color: root.sources-state == "none" || root.sources-state == "hidden" ? Theme.warning : Theme.text;
+                                font-size: Theme.fs-caption;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    // series: season selector + episode list
+                    if root.detail-is-series: Rectangle { height: Theme.sp-4; }
+                    if root.detail-is-series: Select {
+                        model: root.season-names;
+                        current-index <=> root.season-idx;
+                        width: 220px * Theme.scale;
+                    }
+                    if root.detail-is-series && root.episodes.length > 0 && !root.sources-open: Rectangle { height: Theme.sp-3; }
+                    if root.detail-is-series && root.episodes.length > 0 && !root.sources-open: Rectangle {
+                        height: min(root.episodes.length * 64px * Theme.scale, 200px * Theme.scale);
+                        Flickable {
+                            width: parent.width;
+                            height: parent.height;
+                            content-height: root.episodes.length * 64px * Theme.scale;
+                        for ep[i] in root.episodes: Rectangle {
+                            y: i * 64px * Theme.scale;
+                            width: parent.width;
+                            height: 64px * Theme.scale;
+                            border-radius: Theme.r-sm;
+                            background: ep.id == root.selected-episode ? Theme.surface-2 : (eta.has-hover ? Theme.hover-bg : transparent);
+                            if ep.id == root.selected-episode: Rectangle {
+                                x: 0;
+                                width: 3px;
+                                height: parent.height;
+                                border-radius: 2px;
+                                background: Theme.accent;
+                            }
+                            HorizontalLayout {
+                                padding-left: Theme.sp-2;
+                                padding-right: Theme.sp-3;
+                                spacing: Theme.sp-3;
+                                Rectangle {
+                                    width: 97px * Theme.scale;
+                                    height: 54px * Theme.scale;
+                                    vertical-stretch: 0;
+                                    border-radius: 6px * Theme.scale;
+                                    background: Theme.surface-2;
+                                    clip: true;
+                                    if ep.has-thumb: Image {
+                                        source: ep.thumb;
+                                        width: parent.width;
+                                        height: parent.height;
+                                        image-fit: cover;
+                                    }
+                                    // per-episode progress at the bottom of the thumb
+                                    if ep.progress > 0: Rectangle {
+                                        y: parent.height - 3px * Theme.scale;
+                                        width: parent.width * clamp(ep.progress, 0.0, 1.0);
+                                        height: 3px * Theme.scale;
+                                        background: Theme.accent;
+                                    }
+                                }
+                                Text {
+                                    text: ep.label;
+                                    color: Theme.text;
+                                    font-size: Theme.fs-body;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                if ep.progress > 0 && ep.progress < 1: ProgressBar {
+                                    width: 60px * Theme.scale;
+                                    progress: ep.progress;
+                                    vertical-stretch: 0;
+                                }
+                                if ep.watched: Image {
+                                    source: @image-url("icons/circle-check.svg");
+                                    width: Theme.icon;
+                                    height: Theme.icon;
+                                    colorize: Theme.success;
+                                    image-fit: contain;
+                                    vertical-stretch: 0;
+                                }
+                            }
+                            eta := TouchArea {
+                                clicked => {
+                                    root.select-episode(ep.id);
+                                }
+                            }
+                        }
+                        }
+                    }
+                    Rectangle { height: Theme.sp-3; }
+                    // icon-button row
+                    HorizontalLayout {
+                        spacing: Theme.sp-3;
+                        alignment: start;
+                        IconButton {
+                            icon: root.detail-fav ? @image-url("icons/heart.svg") : @image-url("icons/heart-off.svg");
+                            active: root.detail-fav;
+                            tooltip: root.detail-fav ? "Remove from favorites" : "Add to favorites";
+                            clicked => {
+                                root.toggle-favorite();
+                            }
+                        }
+                        IconButton {
+                            icon: @image-url("icons/circle-check.svg");
+                            tint: root.detail-watched ? Theme.success : Theme.muted;
+                            tooltip: root.detail-watched ? "Mark as unwatched" : "Mark as watched";
+                            clicked => {
+                                root.toggle-watched();
+                            }
+                        }
+                        IconButton {
+                            icon: @image-url("icons/rotate-cw.svg");
+                            tooltip: "Show source list";
+                            clicked => {
+                                root.sources-open = !root.sources-open;
+                            }
+                        }
+                    }
+                    if root.sources-open && root.source-rows.length > 0: Rectangle { height: Theme.sp-3; }
+                    if root.sources-open && root.source-rows.length > 0: Rectangle {
+                        height: min(root.source-rows.length * 28px * Theme.scale, 160px * Theme.scale);
+                        Flickable {
+                            width: parent.width;
+                            height: parent.height;
+                        content-height: root.source-rows.length * 28px * Theme.scale;
+                        for sr[i] in root.source-rows: Rectangle {
+                            y: i * 28px * Theme.scale;
+                            width: parent.width;
+                            height: 28px * Theme.scale;
+                            border-radius: 6px * Theme.scale;
+                            background: sra.has-hover ? Theme.hover-bg : transparent;
+                            HorizontalLayout {
+                                padding-left: Theme.sp-2;
+                                padding-right: Theme.sp-2;
+                                spacing: Theme.sp-2;
+                                Text {
+                                    text: sr.label;
+                                    color: Theme.text;
+                                    font-size: Theme.fs-caption;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text {
+                                    text: sr.status;
+                                    color: sr.ok ? Theme.muted : Theme.accent;
+                                    font-size: Theme.fs-caption;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            sra := TouchArea {
+                                enabled: !root.playing;
+                                clicked => {
+                                    root.play-source(sr.key);
+                                }
+                            }
+                        }
+                        }
+                    }
                 }
             }
             // close button, top-right of the card
             IconButton {
-                x: parent.width - self.width - 14px;
-                y: 14px;
+                x: parent.width - self.width - Theme.sp-3;
+                y: Theme.sp-3;
                 icon: @image-url("icons/x.svg");
                 tooltip: "Close";
                 clicked => {
@@ -1283,60 +1585,41 @@ export component MainWindow inherits Window {
 
     // ================= playing banner =================
     if root.playing: Rectangle {
-        background: #000000e6;
+        background: #000000E6;
         VerticalLayout {
             alignment: center;
-            spacing: 10px;
+            spacing: Theme.sp-2;
             Text {
                 text: "Playing in " + (root.play-player == "vlc" ? "VLC" : "mpv");
                 color: Theme.text;
-                font-size: 26px;
-                font-weight: 700;
+                font-size: Theme.fs-title;
+                font-weight: 600;
                 horizontal-alignment: center;
             }
             Text {
                 text: root.play-status;
                 color: Theme.muted;
-                font-size: 15px;
+                font-size: Theme.fs-body;
                 horizontal-alignment: center;
             }
+            Rectangle { height: Theme.sp-1; }
             HorizontalLayout {
                 alignment: center;
-                spacing: 12px;
-                Rectangle {
-                    height: 40px;
-                    width: 110px;
-                    border-radius: 20px;
-                    background: Theme.card;
-                    vertical-stretch: 0;
-                    cta := TouchArea {
-                        clicked => { root.cancel-playback(); }
-                    }
-                    Text {
-                        text: "Cancel";
-                        color: cta.has-hover ? #ffffff : Theme.text;
-                        font-size: 14px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                spacing: Theme.sp-3;
+                Button {
+                    text: "Cancel";
+                    icon: @image-url("icons/x.svg");
+                    has-icon: true;
+                    clicked => {
+                        root.cancel-playback();
                     }
                 }
-                Rectangle {
-                    height: 40px;
-                    width: 130px;
-                    border-radius: 20px;
-                    background: Theme.card;
-                    vertical-stretch: 0;
-                    nta := TouchArea {
-                        clicked => { root.next-source(); }
-                    }
-                    Text {
-                        text: "Next source";
-                        color: nta.has-hover ? #ffffff : Theme.text;
-                        font-size: 14px;
-                        font-weight: 600;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                Button {
+                    text: "Next source";
+                    icon: @image-url("icons/chevron-right.svg");
+                    has-icon: true;
+                    clicked => {
+                        root.next-source();
                     }
                 }
             }
@@ -1345,16 +1628,20 @@ export component MainWindow inherits Window {
 
     // ================= toast =================
     if root.status != "" && root.screen == "main": Rectangle {
-        y: parent.height - 64px;
+        y: parent.height - self.height - Theme.sp-4;
         x: (parent.width - self.width) / 2;
-        width: min(parent.width - 40px, t.preferred-width + 40px);
-        height: 40px;
-        border-radius: 20px;
-        background: Theme.card;
+        width: min(parent.width - Theme.sp-8, t.preferred-width + Theme.sp-6);
+        height: Theme.hit;
+        border-radius: Theme.r-pill;
+        background: Theme.surface-2;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #000000A0;
         t := Text {
             text: root.status;
             color: Theme.text;
-            font-size: 14px;
+            font-size: Theme.fs-body;
             horizontal-alignment: center;
             vertical-alignment: center;
         }

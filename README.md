@@ -55,6 +55,11 @@ licensed under the ISC license. Most are from the current Lucide release; `smile
 `music.svg`, `trash-2.svg` and `gamepad.svg` come from Lucide v0.263.1 (they were
 renamed upstream since).
 
+## Fonts
+
+The bundled [Inter](https://rsms.me/inter/) font files in `crates/reel-app/ui/fonts/`
+are licensed under the SIL Open Font License 1.1; see `LICENSE.txt` in that directory.
+
 ## Known limitations / not yet verified
 
 - **Not run against a real Stremio account or real addons.** The login / `addonCollectionGet`

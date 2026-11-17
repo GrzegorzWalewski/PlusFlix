@@ -1,0 +1,62 @@
+// Reel design tokens. All components and screens must use these values –
+// no magic numbers anywhere else. Every length is multiplied by `scale`,
+// which tracks the window size (reference: 1280x800).
+import "fonts/Inter-Regular.ttf";
+import "fonts/Inter-SemiBold.ttf";
+import "fonts/Inter-Bold.ttf";
+import "fonts/Inter-ExtraBold.ttf";
+
+export global Theme {
+    // ---- scale ----
+    in-out property <float> scale: 1.0;
+
+    // ---- colors ----
+    out property <color> bg: #0F0F14;
+    out property <color> surface: #17171F;
+    out property <color> surface-2: #20202B;
+    out property <color> border: #FFFFFF14;        // white @ 8%
+    out property <color> border-strong: #FFFFFF2E; // white @ 18%
+    out property <color> text: #F5F5F7;
+    out property <color> muted: #A1A1AF;
+    out property <color> accent: #E5484D;
+    out property <color> success: #46D369;
+    out property <color> warning: #F0B429;
+    out property <color> on-play: #101014;         // text on the white play button
+    out property <color> overlay: #000000D9;       // popup backdrop
+    out property <color> track: #FFFFFF40;         // progress track, white @ 25%
+    out property <color> hover-bg: #FFFFFF14;
+    out property <color> hover-bg-strong: #FFFFFF29;
+
+    // ---- spacing (base unit 4px) ----
+    out property <length> sp-1: 4px * scale;
+    out property <length> sp-2: 8px * scale;
+    out property <length> sp-3: 12px * scale;
+    out property <length> sp-4: 16px * scale;
+    out property <length> sp-6: 24px * scale;
+    out property <length> sp-8: 32px * scale;
+    out property <length> sp-12: 48px * scale;
+    out property <length> page-margin: 48px * scale;
+
+    // ---- radii ----
+    out property <length> r-sm: 8px * scale;   // cards, buttons, inputs
+    out property <length> r-md: 12px * scale;  // panels, popups
+    out property <length> r-pill: 999px;       // pills, circles
+
+    // ---- type scale ----
+    out property <string> font: "Inter";
+    out property <length> fs-display: 40px * scale;
+    out property <length> fs-title: 28px * scale;
+    out property <length> fs-heading: 20px * scale;
+    out property <length> fs-body: 16px * scale;
+    out property <length> fs-caption: 13px * scale;
+
+    // ---- motion ----
+    out property <duration> t-fast: 120ms;
+    out property <duration> t-med: 160ms;
+
+    // ---- fixed sizes ----
+    out property <length> hit: 44px * scale;    // minimum hit target
+    out property <length> icon: 20px * scale;   // glyph size inside hit targets
+    out property <length> topbar: 64px * scale;
+    out property <length> play-h: 56px * scale; // big play button
+}

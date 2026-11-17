@@ -1,0 +1,825 @@
+// Reel UI components. Everything interactive lives here so hover, focus,
+// motion and metrics stay consistent. No std-widgets are used anywhere.
+import { Theme } from "theme.slint";
+
+// Plain data shared with Rust (see main.rs `ItemData`).
+export struct Item {
+    id: string,
+    kind: string,
+    name: string,
+    year: string,
+    poster: image,
+    has-poster: bool,
+    // For continue-watching cards: the series/movie id to open.
+    title-id: string,
+    // "S02E05  Title" shown under the name on continue-watching cards.
+    episode-label: string,
+    // Watch progress 0..1 (0 = no bar).
+    progress: float,
+    watched: bool,
+    fav: bool,
+    // Continue-watching card (landscape, episode label, remove button).
+    is-cw: bool,
+}
+
+// Renders one of the bundled profile icons (file names under icons/).
+export component ProfileIcon inherits Image {
+    in property <string> name;
+    source: name == "cat" ? @image-url("icons/cat.svg")
+        : name == "dog" ? @image-url("icons/dog.svg")
+        : name == "rabbit" ? @image-url("icons/rabbit.svg")
+        : name == "bird" ? @image-url("icons/bird.svg")
+        : name == "fish" ? @image-url("icons/fish.svg")
+        : name == "turtle" ? @image-url("icons/turtle.svg")
+        : name == "smile" ? @image-url("icons/smile.svg")
+        : name == "ghost" ? @image-url("icons/ghost.svg")
+        : name == "bot" ? @image-url("icons/bot.svg")
+        : name == "star" ? @image-url("icons/star.svg")
+        : name == "rocket" ? @image-url("icons/rocket.svg")
+        : name == "music" ? @image-url("icons/music.svg")
+        : name == "gamepad" ? @image-url("icons/gamepad.svg")
+        : name == "coffee" ? @image-url("icons/coffee.svg")
+        : name == "plane" ? @image-url("icons/plane.svg")
+        : name == "car" ? @image-url("icons/car.svg")
+        : name == "bike" ? @image-url("icons/bike.svg")
+        : name == "camera" ? @image-url("icons/camera.svg")
+        : name == "flower" ? @image-url("icons/flower.svg")
+        : name == "flame" ? @image-url("icons/flame.svg")
+        : @image-url("icons/star.svg");
+    colorize: white;
+    image-fit: contain;
+}
+
+// Icon + text on one vertical center line. Both children get a fixed height
+// and are positioned at (height - h) / 2, so they can never drift apart.
+export component IconLabel inherits Rectangle {
+    in property <image> icon;
+    in property <bool> has-icon: true;
+    in property <string> text;
+    in property <length> icon-size: Theme.icon;
+    in property <length> gap: Theme.sp-2;
+    in property <length> text-size: Theme.fs-body;
+    in property <color> tint: Theme.text;
+    in property <int> weight: 600;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: root.has-icon ? max(root.icon-size, t.preferred-height) : t.preferred-height;
+    width: (root.has-icon ? root.icon-size + root.gap : 0px) + t.preferred-width;
+    out property <length> text-width: t.preferred-width;
+    Image {
+        x: 0;
+        y: (parent.height - root.icon-size) / 2;
+        width: root.icon-size;
+        height: root.icon-size;
+        source: root.icon;
+        visible: root.has-icon && root.icon.width > 0;
+        colorize: root.tint;
+        image-fit: contain;
+    }
+    t := Text {
+        x: root.has-icon ? root.icon-size + root.gap : 0px;
+        height: self.preferred-height;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        color: root.tint;
+        font-size: root.text-size;
+        font-weight: root.weight;
+        vertical-alignment: center;
+    }
+}
+
+// 44px circular icon button with tooltip, hover, active state and a
+// keyboard-focus ring. Optional small text label next to the icon.
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> active;
+    in property <bool> danger;
+    in property <bool> flat;         // transparent until hover
+    in property <color> tint: white; // icon/text colour
+    in property <string> tooltip;
+    callback clicked();
+    property <bool> hov: ta.has-hover;
+    property <bool> show-tip: false;
+    height: Theme.hit;
+    vertical-stretch: 0;
+    width: root.label == "" ? Theme.hit : (Theme.sp-3 + il.icon-size + Theme.sp-2 + il.text-width + Theme.sp-3);
+    border-radius: Theme.r-pill;
+    background: root.active ? Theme.accent
+        : root.danger ? (hov ? #B32626 : Theme.surface-2)
+        : root.flat ? (hov ? Theme.hover-bg : transparent)
+        : hov ? Theme.hover-bg-strong : Theme.hover-bg;
+    animate background { duration: Theme.t-fast; easing: ease-out; }
+    accessible-role: button;
+    accessible-label: root.tooltip != "" ? root.tooltip : root.label;
+    il := IconLabel {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        icon-size: Theme.icon;
+        icon: root.icon;
+        text: root.label;
+        text-size: Theme.fs-caption + 1px * Theme.scale;
+        tint: root.tint;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.show-tip = false;
+            root.clicked();
+        }
+        changed has-hover => {
+            if !ta.has-hover {
+                root.show-tip = false;
+            }
+        }
+    }
+    fs := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    if fs.has-focus: Rectangle {
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: Theme.r-pill;
+        background: transparent;
+    }
+    Timer {
+        interval: 500ms;
+        running: hov && root.tooltip != "";
+        triggered => {
+            root.show-tip = true;
+        }
+    }
+    if root.show-tip && root.tooltip != "": Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: -self.height - 6px * Theme.scale;
+        width: tip-t.preferred-width + Theme.sp-6;
+        height: tip-t.preferred-height + Theme.sp-3;
+        border-radius: 6px * Theme.scale;
+        background: Theme.surface-2;
+        border-width: 1px;
+        border-color: Theme.border;
+        tip-t := Text {
+            text: root.tooltip;
+            color: Theme.text;
+            font-size: Theme.fs-caption;
+            font-family: Theme.font;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Text button. Variants: primary (accent), secondary (surface-2 + border,
+// the default) and ghost (transparent).
+export component Button inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> has-icon: false; // text-only unless set
+    in property <bool> primary;
+    in property <bool> ghost;
+    in property <bool> danger;
+    in property <bool> disabled;
+    in property <string> tooltip;
+    in property <bool> outline; // outlined pill (profile picker "Manage")
+    callback clicked();
+    property <bool> hov: ta.has-hover && !root.disabled;
+    property <bool> show-tip: false;
+    height: Theme.hit;
+    vertical-stretch: 0;
+    width: 2 * Theme.sp-6 + (root.has-icon ? ib.icon-size + Theme.sp-2 : 0px) + ib.text-width;
+    border-radius: Theme.r-pill;
+    border-width: root.outline ? 1px : 0px;
+    border-color: root.outline ? Theme.border-strong : transparent;
+    background: root.disabled ? Theme.surface
+        : root.primary ? (hov ? #F26B70 : Theme.accent)
+        : root.danger ? (hov ? #B32626 : Theme.surface-2)
+        : root.ghost || root.outline ? (hov ? Theme.hover-bg : transparent)
+        : (hov ? Theme.hover-bg-strong : Theme.surface-2);
+    animate background { duration: Theme.t-fast; easing: ease-out; }
+    accessible-role: button;
+    accessible-label: root.tooltip != "" ? root.tooltip : root.text;
+    ib := IconLabel {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        icon-size: Theme.icon;
+        gap: Theme.sp-2;
+        has-icon: root.has-icon;
+        icon: root.icon;
+        text: root.text;
+        text-size: Theme.fs-caption + 1px * Theme.scale;
+        tint: root.disabled ? Theme.muted : (root.primary ? white : (root.danger ? white : Theme.text));
+    }
+    ta := TouchArea {
+        enabled: !root.disabled;
+        clicked => {
+            root.show-tip = false;
+            fs.focus();
+            root.clicked();
+        }
+        changed has-hover => {
+            if !ta.has-hover {
+                root.show-tip = false;
+            }
+        }
+    }
+    fs := FocusScope {
+        width: 0px;
+        height: 0px;
+        key-pressed(e) => {
+            if (e.text == Key.Return || e.text == " ") {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    if fs.has-focus: Rectangle {
+        border-width: 2px;
+        border-color: Theme.accent;
+        border-radius: Theme.r-pill;
+        background: transparent;
+    }
+    Timer {
+        interval: 500ms;
+        running: hov && root.tooltip != "";
+        triggered => {
+            root.show-tip = true;
+        }
+    }
+    if root.show-tip && root.tooltip != "": Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: -self.height - 6px * Theme.scale;
+        width: tip-t.preferred-width + Theme.sp-6;
+        height: tip-t.preferred-height + Theme.sp-3;
+        border-radius: 6px * Theme.scale;
+        background: Theme.surface-2;
+        border-width: 1px;
+        border-color: Theme.border;
+        tip-t := Text {
+            text: root.tooltip;
+            color: Theme.text;
+            font-size: Theme.fs-caption;
+            font-family: Theme.font;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Rounded text input with a leading icon. Plain styling wrapper around
+// TextInput so every field looks the same.
+export component TextField inherits Rectangle {
+    in property <image> icon;
+    in property <string> placeholder-text;
+    in-out property <string> text <=> ti.text;
+    in property <bool> password;
+    in property <bool> disabled;
+    in property <bool> autofocus;
+    callback accepted(string); // Enter pressed
+    callback edited();         // text changed by typing
+    out property <bool> focused: ti.has-focus;
+    height: Theme.hit;
+    vertical-stretch: 0;
+    border-radius: Theme.r-sm;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: focused ? Theme.accent : (ta.has-hover ? Theme.border-strong : Theme.border);
+    animate border-color { duration: Theme.t-fast; easing: ease-out; }
+    accessible-role: text-input;
+    HorizontalLayout {
+        padding-left: Theme.sp-3;
+        padding-right: Theme.sp-3;
+        spacing: Theme.sp-2;
+        alignment: center;
+        Image {
+            width: Theme.icon;
+            height: Theme.icon;
+            visible: root.icon.width > 0;
+            source: root.icon;
+            colorize: Theme.muted;
+            image-fit: contain;
+            vertical-stretch: 0;
+        }
+        ti := TextInput {
+            accessible-role: none;
+            enabled: !root.disabled;
+            input-type: root.password ? InputType.password : InputType.text;
+            font-size: Theme.fs-caption + 2px * Theme.scale;
+            font-family: Theme.font;
+            color: Theme.text;
+            selection-background-color: Theme.accent;
+            vertical-alignment: center;
+            accepted() => {
+                root.accepted(self.text);
+            }
+            edited => {
+                root.edited();
+            }
+        }
+    }
+    if ti.text == "" && !ti.has-focus: Text {
+        x: Theme.sp-3 + (root.icon.width > 0 ? Theme.icon + Theme.sp-2 : 0px);
+        y: (parent.height - self.height) / 2;
+        text: root.placeholder-text;
+        color: Theme.muted;
+        font-size: Theme.fs-caption + 2px * Theme.scale;
+        font-family: Theme.font;
+    }
+    ta := TouchArea {
+        clicked => {
+            if (!root.disabled) {
+                ti.focus();
+            }
+        }
+    }
+    init => {
+        if root.autofocus {
+            ti.focus();
+        }
+    }
+}
+
+// Dropdown select. The list opens in a PopupWindow so it floats above
+// everything and closes on outside click.
+export component Select inherits Rectangle {
+    in property <[string]> model;
+    in-out property <int> current-index;
+    in property <length> list-height: 320px * Theme.scale;
+    height: Theme.hit;
+    vertical-stretch: 0;
+    border-radius: Theme.r-sm;
+    background: Theme.surface;
+    border-width: 1px;
+    property <bool> popup-open: false;
+    border-color: ta.has-hover || popup-open ? Theme.border-strong : Theme.border;
+    animate border-color { duration: Theme.t-fast; easing: ease-out; }
+    accessible-role: button;
+    HorizontalLayout {
+        padding-left: Theme.sp-3;
+        padding-right: Theme.sp-2;
+        spacing: Theme.sp-2;
+        Text {
+            text: root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : "";
+            color: Theme.text;
+            font-size: Theme.fs-caption + 2px * Theme.scale;
+            font-family: Theme.font;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Image {
+            width: 16px * Theme.scale;
+            height: 16px * Theme.scale;
+            source: @image-url("icons/chevron-down.svg");
+            colorize: Theme.muted;
+            image-fit: contain;
+            vertical-stretch: 0;
+        }
+    }
+    ta := TouchArea {
+        clicked => {
+            popup-open = true;
+            popup.show();
+        }
+    }
+    popup := PopupWindow {
+        preferred-width: max(220px * Theme.scale, parent.width);
+        preferred-height: min(root.list-height + 8px * Theme.scale, root.model.length * 36px * Theme.scale + 8px * Theme.scale);
+        Rectangle {
+            border-radius: Theme.r-sm;
+            background: Theme.surface-2;
+            border-width: 1px;
+            border-color: Theme.border-strong;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #000000A0;
+            clip: true;
+            Flickable {
+                content-height: root.model.length * 36px * Theme.scale;
+                for s[i] in root.model: Rectangle {
+                    height: 36px * Theme.scale;
+                    y: i * 36px * Theme.scale;
+                    background: i == root.current-index ? Theme.hover-bg-strong : (sa.has-hover ? Theme.hover-bg : transparent);
+                    animate background { duration: Theme.t-fast; easing: ease-out; }
+                    HorizontalLayout {
+                        padding-left: Theme.sp-3;
+                        padding-right: Theme.sp-3;
+                        Text {
+                            text: s;
+                            color: i == root.current-index ? white : Theme.text;
+                            font-size: Theme.fs-caption + 2px * Theme.scale;
+                            font-family: Theme.font;
+                            overflow: elide;
+                            vertical-alignment: center;
+                        }
+                    }
+                    sa := TouchArea {
+                        clicked => {
+                            root.current-index = i;
+                            popup.close();
+                            popup-open = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Small on/off toggle.
+export component Switch inherits Rectangle {
+    in-out property <bool> checked;
+    in property <string> tooltip;
+    callback toggled(bool);
+    width: 44px * Theme.scale;
+    height: 24px * Theme.scale;
+    border-radius: Theme.r-pill;
+    background: checked ? Theme.accent : Theme.surface-2;
+    border-width: 1px;
+    border-color: Theme.border-strong;
+    animate background { duration: Theme.t-fast; easing: ease-out; }
+    accessible-role: checkbox;
+    accessible-label: root.tooltip;
+    Rectangle {
+        width: 18px * Theme.scale;
+        height: 18px * Theme.scale;
+        x: root.checked ? parent.width - self.width - 3px * Theme.scale : 3px * Theme.scale;
+        y: (parent.height - self.height) / 2;
+        border-radius: Theme.r-pill;
+        background: white;
+        animate x { duration: Theme.t-fast; easing: ease-out; }
+    }
+    TouchArea {
+        clicked => {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+}
+
+// Segmented control (pill highlight over a track).
+export component SegmentedControl inherits Rectangle {
+    in property <[string]> model;
+    in-out property <int> current-index;
+    in property <bool> compact;
+    height: root.compact ? 32px * Theme.scale : Theme.hit;
+    vertical-stretch: 0;
+    border-radius: Theme.r-pill;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding: 3px * Theme.scale;
+        spacing: 2px * Theme.scale;
+        for s[i] in root.model: Rectangle {
+            border-radius: Theme.r-pill;
+            background: i == root.current-index ? Theme.surface-2 : (sa.has-hover ? Theme.hover-bg : transparent);
+            animate background { duration: Theme.t-fast; easing: ease-out; }
+            HorizontalLayout {
+                padding-left: Theme.sp-3;
+                padding-right: Theme.sp-3;
+                alignment: center;
+                Text {
+                    text: s;
+                    color: i == root.current-index ? white : Theme.muted;
+                    font-size: Theme.fs-caption;
+                    font-family: Theme.font;
+                    font-weight: i == root.current-index ? 600 : 400;
+                    vertical-alignment: center;
+                }
+            }
+            sa := TouchArea {
+                clicked => {
+                    root.current-index = i;
+                }
+            }
+        }
+    }
+}
+
+// Small rounded label (genres etc.).
+export component Chip inherits Rectangle {
+    in property <string> text;
+    height: 24px * Theme.scale;
+    width: self.preferred-width;
+    preferred-width: label.preferred-width + 2 * Theme.sp-3;
+    border-radius: Theme.r-pill;
+    background: Theme.surface-2;
+    border-width: 1px;
+    border-color: Theme.border;
+    vertical-stretch: 0;
+    label := Text {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        color: Theme.muted;
+        font-size: Theme.fs-caption;
+        font-family: Theme.font;
+    }
+}
+
+// Thin progress track with accent fill.
+export component ProgressBar inherits Rectangle {
+    in property <float> progress; // 0..1
+    height: 4px * Theme.scale;
+    border-radius: Theme.r-pill;
+    background: Theme.track;
+    clip: true;
+    Rectangle {
+        width: parent.width * clamp(root.progress, 0.0, 1.0);
+        height: parent.height;
+        border-radius: Theme.r-pill;
+        background: Theme.accent;
+        animate width { duration: Theme.t-med; easing: ease-out; }
+    }
+}
+
+// 24px circular badge on a translucent dark disc.
+component Badge inherits Rectangle {
+    in property <image> icon;
+    in property <color> tint;
+    width: 24px * Theme.scale;
+    height: 24px * Theme.scale;
+    border-radius: Theme.r-pill;
+    background: #000000B0;
+    Image {
+        width: 13px * Theme.scale;
+        height: 13px * Theme.scale;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: root.icon;
+        colorize: root.tint;
+        image-fit: contain;
+    }
+}
+
+// 2:3 poster card with hover scale + play overlay, favourite / watched
+// badges and a max-2-line title. Width comes from the parent layout; height
+// follows the 2:3 ratio plus the title block.
+export component PosterCard inherits Rectangle {
+    in property <Item> item;
+    callback clicked();
+    property <bool> hov: ta.has-hover;
+    property <float> s: hov ? 1.05 : 1.0;
+    property <length> poster-h: self.width * 1.5;
+    height: poster-h + Theme.sp-1 + 36px * Theme.scale;
+    clip: false;
+    // scaled poster box, grows from the center of its fixed slot
+    card := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height - 36px * Theme.scale) / 2;
+        width: parent.width * s;
+        height: poster-h * s;
+        clip: true;
+        border-radius: Theme.r-sm;
+        background: Theme.surface-2;
+        animate x, y, width, height { duration: Theme.t-med; easing: ease-out; }
+        drop-shadow-blur: hov ? 18px : 0px;
+        drop-shadow-color: #00000080;
+        animate drop-shadow-blur { duration: Theme.t-med; easing: ease-out; }
+        if root.item.has-poster: Image {
+            source: root.item.poster;
+            width: parent.width;
+            height: parent.height;
+            image-fit: cover;
+        }
+        if !root.item.has-poster: Text {
+            width: parent.width - Theme.sp-4;
+            text: root.item.name;
+            color: Theme.muted;
+            wrap: word-wrap;
+            font-size: Theme.fs-caption;
+            font-family: Theme.font;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        // hover scrim + play
+        Rectangle {
+            background: hov ? #00000070 : transparent;
+            animate background { duration: Theme.t-fast; easing: ease-out; }
+            Rectangle {
+                width: Theme.hit;
+                height: Theme.hit;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                border-radius: Theme.r-pill;
+                background: white;
+                opacity: hov ? 1.0 : 0.0;
+                animate opacity { duration: Theme.t-fast; easing: ease-out; }
+                Image {
+                    width: Theme.icon;
+                    height: Theme.icon;
+                    x: (parent.width - self.width) / 2 + 1px;
+                    y: (parent.height - self.height) / 2;
+                    source: @image-url("icons/play.svg");
+                    colorize: Theme.on-play;
+                    image-fit: contain;
+                }
+            }
+        }
+        if root.item.watched: Badge {
+            x: Theme.sp-2;
+            y: Theme.sp-2;
+            icon: @image-url("icons/circle-check.svg");
+            tint: Theme.success;
+        }
+        if root.item.fav: Badge {
+            x: parent.width - self.width - Theme.sp-2;
+            y: Theme.sp-2;
+            icon: @image-url("icons/heart.svg");
+            tint: Theme.accent;
+        }
+    }
+    Text {
+        x: 0;
+        y: parent.height - 36px * Theme.scale;
+        width: parent.width;
+        height: 36px * Theme.scale;
+        text: root.item.name;
+        color: Theme.muted;
+        font-size: Theme.fs-caption;
+        font-family: Theme.font;
+        wrap: word-wrap;
+        overflow: elide;
+        vertical-alignment: top;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// 16:9 continue-watching card: art on a dark panel (poster centered until a
+// backdrop feed exists), full-width progress track, caption, remove on hover.
+export component CwCard inherits Rectangle {
+    in property <Item> item;
+    callback clicked();
+    callback remove(string);
+    property <bool> hov: ta.has-hover;
+    property <float> s: hov ? 1.05 : 1.0;
+    property <length> art-h: self.width * 9 / 16;
+    height: art-h + Theme.sp-1 + 30px * Theme.scale;
+    clip: false;
+    card := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height - 30px * Theme.scale) / 2;
+        width: parent.width * s;
+        height: art-h * s;
+        clip: true;
+        border-radius: Theme.r-sm;
+        background: Theme.surface-2;
+        animate x, y, width, height { duration: Theme.t-med; easing: ease-out; }
+        drop-shadow-blur: hov ? 18px : 0px;
+        drop-shadow-color: #00000080;
+        animate drop-shadow-blur { duration: Theme.t-med; easing: ease-out; }
+        if root.item.has-poster: Rectangle {
+            // poster centered on the panel, slightly dimmed
+            Image {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: min(parent.width * 0.55, parent.height * 2 / 3);
+                height: self.width * 1.5;
+                source: root.item.poster;
+                image-fit: contain;
+                opacity: 0.85;
+            }
+        }
+        if !root.item.has-poster: Text {
+            width: parent.width - Theme.sp-4;
+            text: root.item.name;
+            color: Theme.muted;
+            wrap: word-wrap;
+            font-size: Theme.fs-caption;
+            font-family: Theme.font;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            y: parent.height - 4px * Theme.scale;
+            x: 0;
+            width: parent.width;
+            height: 4px * Theme.scale;
+            ProgressBar {
+                width: parent.width;
+                progress: root.item.progress;
+            }
+        }
+        if root.item.watched: Badge {
+            x: Theme.sp-2;
+            y: Theme.sp-2;
+            icon: @image-url("icons/circle-check.svg");
+            tint: Theme.success;
+        }
+        if root.item.fav: Badge {
+            x: parent.width - self.width - Theme.sp-2;
+            y: Theme.sp-2;
+            icon: @image-url("icons/heart.svg");
+            tint: Theme.accent;
+        }
+        // remove button on hover
+        Rectangle {
+            width: Theme.hit;
+            height: Theme.hit;
+            x: parent.width - self.width - Theme.sp-1;
+            y: parent.height - self.height - Theme.sp-1;
+            border-radius: Theme.r-pill;
+            background: #000000B0;
+            opacity: hov ? 1.0 : 0.0;
+            animate opacity { duration: Theme.t-fast; easing: ease-out; }
+            Image {
+                width: Theme.icon;
+                height: Theme.icon;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                source: @image-url("icons/x.svg");
+                colorize: white;
+                image-fit: contain;
+            }
+            rta := TouchArea {
+                clicked => {
+                    root.remove(root.item.id);
+                }
+            }
+        }
+    }
+    t := Text {
+        x: 0;
+        y: parent.height - 30px * Theme.scale;
+        width: parent.width;
+        height: 30px * Theme.scale;
+        text: root.item.episode-label == "" ? root.item.name : root.item.episode-label;
+        color: Theme.muted;
+        font-size: Theme.fs-caption;
+        font-family: Theme.font;
+        overflow: elide;
+        vertical-alignment: top;
+    }
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Round avatar with a profile icon and colour.
+export component Avatar inherits Rectangle {
+    in property <string> icon;
+    in property <color> tint;
+    in property <length> size: 32px * Theme.scale;
+    width: root.size;
+    height: root.size;
+    border-radius: Theme.r-pill;
+    background: root.tint;
+    clip: true;
+    ProfileIcon {
+        name: root.icon;
+        width: parent.width * 0.58;
+        height: self.width;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+    }
+}
+
+// Thin vertical scrollbar to pair with a Flickable. `content-y` maps
+// straight to the Flickable's content-y (negative when scrolled down).
+// Position and height are set by the caller (x: right edge, height: full).
+export component VScroll inherits Rectangle {
+    in property <length> content-height;
+    in property <length> viewport-height;
+    in-out property <length> content-y;
+    width: 6px * Theme.scale;
+    background: transparent;
+    property <length> max-scroll: max(0px, root.content-height - root.viewport-height);
+    property <length> thumb-h: max(32px * Theme.scale, root.content-height > 0 ? root.viewport-height / root.content-height * root.viewport-height : root.viewport-height);
+    visible: root.max-scroll > 1px;
+    thumb := Rectangle {
+        width: parent.width;
+        height: root.thumb-h;
+        y: root.max-scroll > 0px
+            ? clamp((-root.content-y) / root.max-scroll, 0.0, 1.0) * (root.viewport-height - root.thumb-h)
+            : 0px;
+        border-radius: Theme.r-pill;
+        background: bar.has-hover || bar.pressed ? Theme.border-strong : Theme.border;
+        animate background { duration: Theme.t-fast; easing: ease-out; }
+        bar := TouchArea {
+            property <length> grab: 0;
+            changed pressed => {
+                grab = self.mouse-y - thumb.y;
+            }
+            moved => {
+                if (self.pressed && root.max-scroll > 0px) {
+                    root.content-y = -clamp(
+                        (self.mouse-y - grab) / max(1px, root.viewport-height - root.thumb-h),
+                        0.0, 1.0) * root.max-scroll;
+                }
+            }
+        }
+    }
+}

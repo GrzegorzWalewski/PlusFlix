@@ -23,7 +23,7 @@ use slint::{
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
@@ -31,6 +31,61 @@ use tokio::sync::Semaphore;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ---------------------------------------------------------------- dark title bar
+
+/// Apply a dark title bar to the main window (Windows only). Best-effort: the
+/// window is created by winit when `run()` is called, so a background thread
+/// polls for it and sets `DWMWA_USE_IMMERSIVE_DARK_MODE` once it exists.
+#[cfg(target_family = "windows")]
+fn enable_dark_title_bar() {
+    use std::os::raw::c_void;
+
+    extern "system" {
+        fn EnumWindows(
+            cb: Option<unsafe extern "system" fn(isize, isize) -> i32>,
+            lp: isize,
+        ) -> i32;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetWindowTextLengthW(hwnd: isize) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const c_void, size: u32) -> i32;
+    }
+
+    static TARGET_PID: AtomicU32 = AtomicU32::new(0);
+    static FOUND_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    unsafe extern "system" fn enum_cb(hwnd: isize, _lp: isize) -> i32 {
+        let mut wpid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut wpid);
+        if wpid == TARGET_PID.load(Relaxed)
+            && IsWindowVisible(hwnd) != 0
+            && GetWindowTextLengthW(hwnd) > 0
+        {
+            FOUND_HWND.store(hwnd, Relaxed);
+            return 0;
+        }
+        1
+    }
+
+    TARGET_PID.store(std::process::id(), Relaxed);
+    std::thread::spawn(|| {
+        for _ in 0..100 {
+            unsafe {
+                EnumWindows(Some(enum_cb), 0);
+            }
+            let hwnd = FOUND_HWND.load(Relaxed);
+            if hwnd != 0 {
+                let on: i32 = 1; // DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                unsafe {
+                    DwmSetWindowAttribute(hwnd, 20, &on as *const i32 as *const c_void, 4);
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
 }
 
 // ---------------------------------------------------------------- shared state
@@ -91,9 +146,10 @@ struct App {
     poster_slots: Semaphore,
     /// Episode ids seen for each series (used for the "all episodes watched" badge).
     known_episodes: Mutex<HashMap<String, Vec<String>>>,
-    /// Last rendered home/movies/series rows, so the account sync can patch
-    /// the Continue Watching row without re-fetching catalogs.
-    rows_cache: Mutex<Vec<(String, Vec<ItemData>)>>,
+    /// Last rendered home/movies/series rows as (title, addon subtitle, items),
+    /// so the account sync can patch the Continue Watching row without
+    /// re-fetching catalogs.
+    rows_cache: Mutex<Vec<(String, String, Vec<ItemData>)>>,
     /// Bumped on every page load; background catalog tasks only patch the UI
     /// while their generation is current.
     load_gen: std::sync::atomic::AtomicUsize,
@@ -203,13 +259,14 @@ fn items_model(items: &[ItemData]) -> ModelRc<Item> {
 /// on every catalog completion, which would otherwise wipe posters patched
 /// into the previous model by `apply_poster`.
 fn rows_with_posters(
-    snapshot: &[(String, Vec<ItemData>)],
+    snapshot: &[(String, String, Vec<ItemData>)],
     posters: &HashMap<String, Arc<Decoded>>,
 ) -> Vec<RowData> {
     snapshot
         .iter()
-        .map(|(title, items)| RowData {
+        .map(|(title, subtitle, items)| RowData {
             title: title.clone().into(),
+            subtitle: subtitle.clone().into(),
             items: ModelRc::new(VecModel::from(
                 items
                     .iter()
@@ -391,6 +448,18 @@ impl App {
             });
         }
     }
+
+    /// Same as `fetch_posters` but patches episode thumbnails in the detail popup.
+    fn fetch_episode_thumbs(self: &Arc<Self>, wanted: Vec<(String, String)>) {
+        for (id, url) in wanted {
+            let app = self.clone();
+            self.rt.spawn(async move {
+                if let Some(dec) = app.poster(&url).await {
+                    app.ui(move |ui| patch_episode_thumb(ui, &id, &dec));
+                }
+            });
+        }
+    }
 }
 
 fn patch_items(items: &ModelRc<Item>, id: &str, img: &Image) {
@@ -508,17 +577,19 @@ fn show_profiles(app: &Arc<App>) {
 }
 
 fn select_profile(app: &Arc<App>, id: String) {
-    let name = {
+    let (name, icon, color) = {
         let mut st = lock(&app.store);
         let Ok(p) = st.profile(&id) else { return };
-        let name = p.name.clone();
+        let vals = (p.name.clone(), p.icon.clone(), p.color.clone());
         st.last_profile = Some(id.clone());
-        name
+        vals
     };
     app.save();
     *lock(&app.profile) = Some(id);
     app.ui(move |ui| {
         ui.set_profile_name(name.into());
+        ui.set_profile_icon(icon.into());
+        ui.set_profile_color(hex_color(&color));
         ui.set_screen("main".into());
     });
     load_page(app, "home");
@@ -606,17 +677,23 @@ fn sync_account_cw(app: &Arc<App>) {
         }
         let mut data = lock(&app.rows_cache).clone();
         match data.first_mut() {
-            Some(row) if row.0 == "Continue watching" => row.1 = cw_items,
-            _ => data.insert(0, ("Continue watching".to_owned(), cw_items)),
+            Some(row) if row.0 == "Continue watching" => row.2 = cw_items,
+            _ => data.insert(0, ("Continue watching".to_owned(), String::new(), cw_items)),
         }
-        let wanted = poster_wanted(&data);
+        let wanted = poster_wanted(
+            &data
+                .iter()
+                .map(|(t, _, items)| (t.clone(), items.clone()))
+                .collect::<Vec<_>>(),
+        );
         *lock(&app.rows_cache) = data.clone();
         app.ui(move |ui| {
             if ui.get_page().as_str() == "home" {
                 let model: Vec<RowData> = data
                     .iter()
-                    .map(|(title, items)| RowData {
+                    .map(|(title, subtitle, items)| RowData {
                         title: title.clone().into(),
+                        subtitle: subtitle.clone().into(),
                         items: items_model(items),
                     })
                     .collect();
@@ -677,6 +754,8 @@ const SUBREQ: [SubtitleRequirement; 3] = [
 ];
 
 fn fill_settings(ui: &MainWindow, s: &Settings) {
+    // The UI auto-saves on every control change; suppress that while filling.
+    ui.set_settings_loading(true);
     ui.set_lang_names(ModelRc::new(VecModel::from(lang_names())));
     ui.set_quality_names(ModelRc::new(VecModel::from(
         Quality::CHOICES
@@ -684,13 +763,11 @@ fn fill_settings(ui: &MainWindow, s: &Settings) {
             .map(|q| slint::SharedString::from(q.label()))
             .collect::<Vec<_>>(),
     )));
-    ui.set_subreq_names(ModelRc::new(VecModel::from(vec![
-        slint::SharedString::from("Required"),
-        "Required only if the audio isn't my language".into(),
-        "Not required".into(),
-    ])));
     ui.set_audio_idx(lang_index(s.audio_language));
-    ui.set_audio_must(s.language_mode == LanguageMode::Must);
+    ui.set_audio_mode_idx(match s.language_mode {
+        LanguageMode::Must => 1,
+        LanguageMode::Prefer => 0,
+    });
     ui.set_sub_idx(lang_index(s.subtitle_language));
     ui.set_subreq_idx(
         SUBREQ
@@ -714,6 +791,7 @@ fn fill_settings(ui: &MainWindow, s: &Settings) {
         PlayerKind::Mpv => 0,
         PlayerKind::Vlc => 1,
     });
+    ui.set_settings_loading(false);
 }
 
 fn load_page(app: &Arc<App>, page: &str) {
@@ -744,9 +822,9 @@ fn load_page(app: &Arc<App>, page: &str) {
                     .load_gen
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                     + 1;
-                let mut data: Vec<(String, Vec<ItemData>)> = Vec::new();
+                let mut data: Vec<(String, String, Vec<ItemData>)> = Vec::new();
                 if page == "home" && !cw_items.is_empty() {
-                    data.push(("Continue watching".to_owned(), cw_items));
+                    data.push(("Continue watching".to_owned(), String::new(), cw_items));
                 }
                 *lock(&app.rows_cache) = data.clone();
                 // Render Continue Watching immediately; catalogs stream in.
@@ -761,7 +839,7 @@ fn load_page(app: &Arc<App>, page: &str) {
                         }
                     });
                 }
-                if let Some((_, cw)) = data.first() {
+                if let Some((_, _, cw)) = data.first() {
                     let wanted = poster_wanted(&[(String::new(), cw.clone())]);
                     app.fetch_posters(wanted);
                 }
@@ -786,7 +864,22 @@ fn load_page(app: &Arc<App>, page: &str) {
                                 let wanted = poster_wanted(&[(String::new(), items.clone())]);
                                 let snapshot = {
                                     let mut cache = lock(&app.rows_cache);
-                                    cache.push((job.title.clone(), items.clone()));
+                                    // Unique row title: on a duplicate catalog name
+                                    // (same addon exposing one per type), append the type.
+                                    let base = job.title.clone();
+                                    let title = if cache.iter().any(|(t, _, _)| *t == base) {
+                                        let kinded = format!("{base} ({})", job.kind);
+                                        let n =
+                                            cache.iter().filter(|(t, _, _)| *t == kinded).count();
+                                        if n == 0 {
+                                            kinded
+                                        } else {
+                                            format!("{kinded} {}", n + 1)
+                                        }
+                                    } else {
+                                        base
+                                    };
+                                    cache.push((title, job.addon_name.clone(), items.clone()));
                                     cache.clone()
                                 };
                                 let app2 = app.clone();
@@ -872,6 +965,116 @@ fn summary(stats: &PoolStats) -> String {
     s
 }
 
+/// Seasons of a series as (season number, display name), specials (0) last.
+fn seasons_of(meta: &Meta) -> Vec<(u32, String)> {
+    let mut seasons: Vec<u32> = Vec::new();
+    for v in &meta.videos {
+        if let Some(s) = v.season {
+            if !seasons.contains(&s) {
+                seasons.push(s);
+            }
+        }
+    }
+    seasons.sort_by_key(|s| (*s == 0, *s));
+    seasons
+        .into_iter()
+        .map(|s| {
+            let name = if s == 0 {
+                "Specials".to_owned()
+            } else {
+                format!("Season {s}")
+            };
+            (s, name)
+        })
+        .collect()
+}
+
+/// Episode rows (id, "n. Title" label, thumbnail url) of one season.
+fn episodes_of(meta: &Meta, season: u32) -> Vec<(String, String, Option<String>)> {
+    let mut eps: Vec<_> = meta
+        .videos
+        .iter()
+        .filter(|v| v.season == Some(season) && v.episode.is_some())
+        .collect();
+    eps.sort_by_key(|v| v.episode);
+    eps.iter()
+        .map(|v| {
+            let label = format!(
+                "{}. {}",
+                v.episode.unwrap_or(0),
+                v.title.clone().unwrap_or_default()
+            );
+            (
+                v.id.clone(),
+                label.trim_end().to_owned(),
+                v.thumbnail.clone(),
+            )
+        })
+        .collect()
+}
+
+/// Watched set and progress fractions for one season's episodes. Reads the
+/// store once; never call store-locking helpers while holding the lock.
+fn episode_flags(
+    app: &Arc<App>,
+    rows: &[(String, String, Option<String>)],
+) -> (std::collections::HashSet<String>, HashMap<String, f32>) {
+    let ids: Vec<&str> = rows.iter().map(|(id, _, _)| id.as_str()).collect();
+    let pid = app.profile_id();
+    let st = lock(&app.store);
+    match pid.and_then(|p| st.profile(&p).ok()) {
+        Some(p) => {
+            let watched = ids
+                .iter()
+                .filter(|i| p.is_watched(i))
+                .map(|i| (*i).to_owned())
+                .collect();
+            let progress = ids
+                .iter()
+                .filter_map(|i| {
+                    p.progress.get(*i).and_then(|pr| {
+                        pr.duration_secs
+                            .filter(|d| *d > 0.0)
+                            .map(|d| ((*i).to_owned(), (pr.position_secs / d) as f32))
+                    })
+                })
+                .collect::<HashMap<_, _>>();
+            (watched, progress)
+        }
+        None => Default::default(),
+    }
+}
+
+fn episode_model(
+    rows: &[(String, String, Option<String>)],
+    watched: &std::collections::HashSet<String>,
+    progress: &HashMap<String, f32>,
+) -> Vec<EpisodeData> {
+    rows.iter()
+        .map(|(id, label, _)| EpisodeData {
+            id: id.into(),
+            label: label.into(),
+            thumb: Image::default(),
+            has_thumb: false,
+            progress: progress.get(id).copied().unwrap_or(0.0),
+            watched: watched.contains(id),
+        })
+        .collect()
+}
+
+fn patch_episode_thumb(ui: &MainWindow, id: &str, dec: &Decoded) {
+    let eps = ui.get_episodes();
+    for i in 0..eps.row_count() {
+        if let Some(mut e) = eps.row_data(i) {
+            if e.id.as_str() == id {
+                e.thumb = dec.to_image();
+                e.has_thumb = true;
+                eps.set_row_data(i, e);
+            }
+        }
+    }
+}
+
 /// Starts (or restarts) background source loading for `video_id`. Must run inside the tokio runtime.
 fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
     let pool = SourcePool::new();
@@ -914,8 +1117,17 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
                 })
                 .collect();
             let text = summary(&stats);
+            let state = if stats.pending_tasks > 0 {
+                "loading"
+            } else if stats.usable > 0 {
+                "ready"
+            } else {
+                "none"
+            };
+            let state = state.to_owned();
             a.ui(move |ui| {
                 ui.set_sources_summary(text.into());
+                ui.set_sources_state(state.into());
                 ui.set_source_rows(ModelRc::new(VecModel::from(rows)));
             });
             tokio::time::sleep(Duration::from_millis(800)).await;
@@ -948,29 +1160,15 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
 
         // Episodes (series only), ordered with specials (season 0) last.
         let is_series = kind == "series" && !meta.videos.is_empty();
-        let mut episodes: Vec<_> = meta
+        let mut all_eps: Vec<_> = meta
             .videos
             .iter()
             .filter(|v| v.season.is_some() && v.episode.is_some())
             .collect();
-        episodes.sort_by_key(|v| (v.season == Some(0), v.season, v.episode));
-        let episode_rows: Vec<(String, String)> = episodes
-            .iter()
-            .map(|v| {
-                let label = format!(
-                    "S{:02}E{:02}  {}",
-                    v.season.unwrap_or(0),
-                    v.episode.unwrap_or(0),
-                    v.title.clone().unwrap_or_default()
-                );
-                (v.id.clone(), label.trim_end().to_owned())
-            })
-            .collect();
+        all_eps.sort_by_key(|v| (v.season == Some(0), v.season, v.episode));
+        let all_ids: Vec<String> = all_eps.iter().map(|v| v.id.clone()).collect();
         if is_series {
-            lock(&app.known_episodes).insert(
-                meta.id.clone(),
-                episode_rows.iter().map(|(id, _)| id.clone()).collect(),
-            );
+            lock(&app.known_episodes).insert(meta.id.clone(), all_ids.clone());
         }
 
         let (is_fav, last_ep, player_kind) = {
@@ -987,8 +1185,8 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
         };
         let video_id = if is_series {
             last_ep
-                .filter(|e| episode_rows.iter().any(|(id, _)| id == e))
-                .or_else(|| episode_rows.first().map(|(id, _)| id.clone()))
+                .filter(|e| all_ids.iter().any(|id| id == e))
+                .or_else(|| all_ids.first().cloned())
         } else {
             Some(meta.id.clone())
         };
@@ -1012,31 +1210,15 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
                 None => (0.0, false),
             }
         };
-        // Which episodes of this series are watched (for the per-episode checks).
-        let watched_eps: std::collections::HashSet<String> = {
-            let pid = app.profile_id();
-            let st = lock(&app.store);
-            match pid.and_then(|p| st.profile(&p).ok()) {
-                Some(p) => p
-                    .watched
-                    .iter()
-                    .filter(|k| k.starts_with(&format!("{}:", meta.id)))
-                    .cloned()
-                    .collect(),
-                None => Default::default(),
-            }
-        };
 
-        let info = [
-            meta.release_info.clone(),
-            meta.runtime.clone(),
-            Some(meta.genres.join(", ")),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("  ·  ");
+        let info = [meta.release_info.clone(), meta.runtime.clone()]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("  ·  ");
+        let genres = meta.genres.clone();
+        let long_title = meta.name.chars().count() > 40;
         let poster = meta.poster.clone();
         let detail = Arc::new(Detail {
             kind: kind.clone(),
@@ -1053,10 +1235,37 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
                 meta.id.clone(),
                 video_id.clone().unwrap_or_default(),
             );
+            // Season the popup opens on: the one containing the selected episode.
+            let seasons = seasons_of(&meta);
+            let sel_season = video_id.as_deref().and_then(|v| {
+                meta.videos
+                    .iter()
+                    .find(|x| x.id == v)
+                    .and_then(|x| x.season)
+            });
+            let season_idx = seasons
+                .iter()
+                .position(|(s, _)| Some(*s) == sel_season)
+                .unwrap_or(1.min(seasons.len().saturating_sub(1)));
+            let rows = sel_season
+                .map(|s| episodes_of(&meta, s))
+                .unwrap_or_default();
+            let (watched, progress) = episode_flags(&app, &rows);
+            let thumb_wanted: Vec<(String, String)> = rows
+                .iter()
+                .filter_map(|(id, _, url)| url.clone().map(|u| (id.clone(), u)))
+                .collect();
             app.ui(move |ui| {
                 ui.set_detail_id(id.into());
                 ui.set_detail_title(title.into());
+                ui.set_detail_long_title(long_title);
                 ui.set_detail_info(info.into());
+                ui.set_detail_genres(ModelRc::new(VecModel::from(
+                    genres
+                        .iter()
+                        .map(|g| slint::SharedString::from(g.as_str()))
+                        .collect::<Vec<_>>(),
+                )));
                 ui.set_detail_desc(desc.into());
                 ui.set_detail_poster(Image::default());
                 ui.set_detail_has_poster(false);
@@ -1068,22 +1277,24 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
                     PlayerKind::Vlc => "vlc".into(),
                     PlayerKind::Mpv => "mpv".into(),
                 });
-                ui.set_episodes(ModelRc::new(VecModel::from(
-                    episode_rows
-                        .into_iter()
-                        .map(|(id, label)| EpisodeData {
-                            watched: watched_eps.contains(&id),
-                            id: id.into(),
-                            label: label.into(),
-                        })
+                ui.set_season_names(ModelRc::new(VecModel::from(
+                    seasons
+                        .iter()
+                        .map(|(_, name)| slint::SharedString::from(name.as_str()))
                         .collect::<Vec<_>>(),
                 )));
+                ui.set_season_idx(season_idx as i32);
+                ui.set_episodes(ModelRc::new(VecModel::from(episode_model(
+                    &rows, &watched, &progress,
+                ))));
                 ui.set_selected_episode(selected.into());
                 ui.set_sources_summary("Searching sources…".into());
+                ui.set_sources_state("loading".into());
                 ui.set_source_rows(ModelRc::default());
                 ui.set_sources_open(false);
                 ui.set_detail_open(true);
             });
+            app.fetch_episode_thumbs(thumb_wanted);
         }
         if let Some(url) = poster {
             app.fetch_posters(vec![(meta.id.clone(), url)]);
@@ -1125,9 +1336,58 @@ fn select_episode(app: &Arc<App>, id: String) {
             ui.set_detail_watched(watched);
             ui.set_can_resume(resume > 0.0);
             ui.set_sources_summary("Searching sources…".into());
+            ui.set_sources_state("loading".into());
         });
         start_sources(&app, &detail, id);
     });
+}
+
+/// Season selector change in the detail popup: rebuild the episode list.
+fn season_changed(app: &Arc<App>, ui: &MainWindow, idx: i32) {
+    let Some(detail) = lock(&app.detail).clone() else {
+        return;
+    };
+    let seasons = seasons_of(&detail.meta);
+    let Some((season, _)) = seasons.get(idx.max(0) as usize) else {
+        return;
+    };
+    let rows = episodes_of(&detail.meta, *season);
+    let (watched, progress) = episode_flags(app, &rows);
+    let thumb_wanted: Vec<(String, String)> = rows
+        .iter()
+        .filter_map(|(id, _, url)| url.clone().map(|u| (id.clone(), u)))
+        .collect();
+    // Keep the selection if it is in this season, otherwise select the first.
+    let keep = ui.get_selected_episode().to_string();
+    let selected = if rows.iter().any(|(id, _, _)| id == &keep) {
+        keep
+    } else {
+        rows.first()
+            .map(|(id, _, _)| id.clone())
+            .unwrap_or_default()
+    };
+    let sel = selected.clone();
+    let is_watched = {
+        let pid = app.profile_id();
+        let st = lock(&app.store);
+        pid.and_then(|p| st.profile(&p).ok())
+            .map(|p| p.is_watched(&selected))
+            .unwrap_or(false)
+    };
+    let resume = {
+        let pid = app.profile_id();
+        let st = lock(&app.store);
+        pid.and_then(|p| st.profile(&p).ok())
+            .map(|p| p.resume_position(&selected))
+            .unwrap_or(0.0)
+    };
+    ui.set_episodes(ModelRc::new(VecModel::from(episode_model(
+        &rows, &watched, &progress,
+    ))));
+    ui.set_selected_episode(sel.into());
+    ui.set_detail_watched(is_watched);
+    ui.set_can_resume(resume > 0.0);
+    app.fetch_episode_thumbs(thumb_wanted);
 }
 
 fn toggle_favorite(app: &Arc<App>) {
@@ -1578,7 +1838,7 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
     }
     let settings = Settings {
         audio_language: lang_from_index(ui.get_audio_idx()),
-        language_mode: if ui.get_audio_must() {
+        language_mode: if ui.get_audio_mode_idx() == 1 {
             LanguageMode::Must
         } else {
             LanguageMode::Prefer
@@ -1682,6 +1942,8 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     let a = app.clone();
     ui.on_switch_profile(move || show_profiles(&a));
     let a = app.clone();
+    ui.on_manage_profiles_menu(move || show_profiles(&a));
+    let a = app.clone();
     ui.on_navigate(move |page| load_page(&a, page.as_str()));
     let a = app.clone();
     ui.on_open_item(move |id, kind| open_item(&a, id.to_string(), kind.to_string()));
@@ -1694,6 +1956,15 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     ui.on_toggle_favorite(move || toggle_favorite(&a));
     let a = app.clone();
     ui.on_select_episode(move |id| select_episode(&a, id.to_string()));
+    let a = app.clone();
+    {
+        let weak = ui.as_weak();
+        ui.on_season_changed(move |idx| {
+            if let Some(ui) = weak.upgrade() {
+                season_changed(&a, &ui, idx);
+            }
+        });
+    }
     let a = app.clone();
     {
         let weak = ui.as_weak();
@@ -1773,6 +2044,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let ui = MainWindow::new()?;
+    #[cfg(target_family = "windows")]
+    enable_dark_title_bar();
     let app = Arc::new(App {
         rt: rt.handle().clone(),
         ui: ui.as_weak(),

@@ -10,7 +10,10 @@ use tokio::time::timeout;
 /// them concurrently and show each row as soon as its job finishes.
 #[derive(Debug, Clone)]
 pub struct CatalogJob {
+    /// Display name of the catalog (e.g. "Popular").
     pub title: String,
+    /// Display name of the addon serving it (shown as a caption next to the row title).
+    pub addon_name: String,
     pub kind: String,
     addon: Addon,
     cat: CatalogDecl,
@@ -27,7 +30,8 @@ pub fn catalog_jobs(addons: &[Addon], kind: Option<&str>, max_rows: usize) -> Ve
             }
             let name = cat.name.clone().unwrap_or_else(|| cat.id.clone());
             wanted.push(CatalogJob {
-                title: format!("{name} – {}", addon.name()),
+                title: name,
+                addon_name: addon.name().to_owned(),
                 kind: cat.kind.clone(),
                 addon: addon.clone(),
                 cat: cat.clone(),
