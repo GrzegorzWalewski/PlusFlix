@@ -59,4 +59,8 @@ export global Theme {
     out property <length> icon: 20px * scale;   // glyph size inside hit targets
     out property <length> topbar: 64px * scale;
     out property <length> play-h: 56px * scale; // big play button
+
+    // Layout debugging (REEL_DEBUG_LAYOUT=1): outlines buttons/inputs and
+    // their icons so centering offsets become visible in screenshots.
+    in-out property <bool> debug-layout: false;
 }

@@ -48,6 +48,9 @@ pub struct ProgressCard {
     /// Show / movie name.
     pub title: String,
     pub poster: Option<String>,
+    /// Landscape art (backdrop or episode thumbnail) for the 16:9 card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
     /// For series: the episode's video id (the progress map key).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub episode_id: Option<String>,
@@ -401,6 +404,7 @@ mod tests {
             title_id: title.into(),
             title: title.into(),
             poster: None,
+            background: None,
             episode_id: None,
             episode_label: None,
         };

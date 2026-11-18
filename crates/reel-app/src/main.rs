@@ -163,12 +163,18 @@ struct ItemData {
     name: String,
     year: String,
     poster_url: Option<String>,
+    /// Landscape art (backdrop / episode thumbnail) for continue-watching cards.
+    landscape_url: Option<String>,
     /// Series/movie id a continue-watching card opens (empty otherwise).
     title_id: String,
-    /// "S02E05  Title" on continue-watching cards.
+    /// "S02E05" on continue-watching cards.
     episode_label: String,
+    /// "42 min left" on continue-watching cards.
+    time_left: String,
     /// Watch progress 0..1 (0 = no bar).
     progress: f32,
+    /// Duration known, so the progress bar may be shown.
+    has_progress: bool,
     watched: bool,
     fav: bool,
     is_cw: bool,
@@ -182,9 +188,12 @@ impl ItemData {
             name: m.name.clone(),
             year: m.release_info.clone().unwrap_or_default(),
             poster_url: m.poster.clone(),
+            landscape_url: None,
             title_id: String::new(),
             episode_label: String::new(),
+            time_left: String::new(),
             progress: 0.0,
+            has_progress: false,
             watched: false,
             fav: false,
             is_cw: false,
@@ -197,9 +206,12 @@ impl ItemData {
             name: f.name.clone(),
             year: String::new(),
             poster_url: f.poster.clone(),
+            landscape_url: None,
             title_id: String::new(),
             episode_label: String::new(),
+            time_left: String::new(),
             progress: 0.0,
+            has_progress: false,
             watched: false,
             fav: false,
             is_cw: false,
@@ -217,15 +229,33 @@ impl ItemData {
             .filter(|d| *d > 0.0)
             .map(|d| (pr.position_secs / d) as f32)
             .unwrap_or(0.0);
+        // "42 min left" (or hours + minutes for long entries).
+        let time_left = pr.duration_secs.and_then(|d| {
+            let mins = ((d - pr.position_secs) / 60.0).ceil();
+            (mins > 0.0).then(|| {
+                if mins >= 60.0 {
+                    format!(
+                        "{} h {} min left",
+                        (mins / 60.0) as u64,
+                        (mins % 60.0) as u64
+                    )
+                } else {
+                    format!("{mins} min left")
+                }
+            })
+        });
         Some(Self {
             id: video_id,
             kind: card.kind.clone(),
             name: card.title.clone(),
             year: String::new(),
             poster_url: card.poster.clone(),
+            landscape_url: card.background.clone(),
             title_id: card.title_id.clone(),
             episode_label: card.episode_label.clone().unwrap_or_default(),
+            time_left: time_left.unwrap_or_default(),
             progress: frac,
+            has_progress: pr.duration_secs.is_some_and(|d| d > 0.0),
             watched: false,
             fav: false,
             is_cw: true,
@@ -239,7 +269,9 @@ impl ItemData {
             year: self.year.clone().into(),
             title_id: self.title_id.clone().into(),
             episode_label: self.episode_label.clone().into(),
+            time_left: self.time_left.clone().into(),
             progress: self.progress,
+            has_progress: self.has_progress,
             watched: self.watched,
             fav: self.fav,
             is_cw: self.is_cw,
@@ -276,6 +308,12 @@ fn rows_with_posters(
                             if let Some(dec) = posters.get(url) {
                                 it.poster = dec.to_image();
                                 it.has_poster = true;
+                            }
+                        }
+                        if let Some(url) = &d.landscape_url {
+                            if let Some(dec) = posters.get(url) {
+                                it.landscape = dec.to_image();
+                                it.has_landscape = true;
                             }
                         }
                         it
@@ -438,12 +476,12 @@ impl App {
         Some(decoded)
     }
 
-    fn fetch_posters(self: &Arc<Self>, wanted: Vec<(String, String)>) {
-        for (id, url) in wanted {
+    fn fetch_posters(self: &Arc<Self>, wanted: Vec<(String, String, bool)>) {
+        for (id, url, landscape) in wanted {
             let app = self.clone();
             self.rt.spawn(async move {
                 if let Some(dec) = app.poster(&url).await {
-                    app.ui(move |ui| apply_poster(ui, &id, &dec));
+                    app.ui(move |ui| apply_poster(ui, &id, &dec, landscape));
                 }
             });
         }
@@ -462,42 +500,53 @@ impl App {
     }
 }
 
-fn patch_items(items: &ModelRc<Item>, id: &str, img: &Image) {
+fn patch_items(items: &ModelRc<Item>, id: &str, img: &Image, landscape: bool) {
     for i in 0..items.row_count() {
         if let Some(mut it) = items.row_data(i) {
             if it.id.as_str() == id {
-                it.poster = img.clone();
-                it.has_poster = true;
+                if landscape {
+                    it.landscape = img.clone();
+                    it.has_landscape = true;
+                } else {
+                    it.poster = img.clone();
+                    it.has_poster = true;
+                }
                 items.set_row_data(i, it);
             }
         }
     }
 }
 
-fn apply_poster(ui: &MainWindow, id: &str, dec: &Decoded) {
+fn apply_poster(ui: &MainWindow, id: &str, dec: &Decoded, landscape: bool) {
     let img = dec.to_image();
     let rows = ui.get_rows();
     for r in 0..rows.row_count() {
         if let Some(row) = rows.row_data(r) {
-            patch_items(&row.items, id, &img);
+            patch_items(&row.items, id, &img, landscape);
         }
     }
-    patch_items(&ui.get_favorites(), id, &img);
-    patch_items(&ui.get_search_results(), id, &img);
-    if ui.get_detail_id().as_str() == id {
+    patch_items(&ui.get_favorites(), id, &img, landscape);
+    patch_items(&ui.get_search_results(), id, &img, landscape);
+    if !landscape && ui.get_detail_id().as_str() == id {
         ui.set_detail_poster(img);
         ui.set_detail_has_poster(true);
     }
 }
 
-fn poster_wanted(rows: &[(String, Vec<ItemData>)]) -> Vec<(String, String)> {
+/// Image URLs to fetch: (item id, url, is landscape art).
+fn poster_wanted(rows: &[(String, Vec<ItemData>)]) -> Vec<(String, String, bool)> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for (_, items) in rows {
         for it in items {
             if let Some(url) = &it.poster_url {
-                if seen.insert(it.id.clone()) {
-                    out.push((it.id.clone(), url.clone()));
+                if seen.insert((it.id.clone(), false)) {
+                    out.push((it.id.clone(), url.clone(), false));
+                }
+            }
+            if let Some(url) = &it.landscape_url {
+                if seen.insert((it.id.clone(), true)) {
+                    out.push((it.id.clone(), url.clone(), true));
                 }
             }
         }
@@ -596,6 +645,120 @@ fn select_profile(app: &Arc<App>, id: String) {
     sync_account_cw(app);
 }
 
+/// Backfills the landscape art of Continue Watching entries that have no
+/// `background` URL yet (older stores): fetches the title's meta once, picks
+/// the episode thumbnail (series) or backdrop (movie), persists it and
+/// refreshes the row if the home page is showing.
+fn backfill_cw_art(app: &Arc<App>) {
+    let Some(pid) = app.profile_id() else { return };
+    // (video id, title id, kind, episode id) of entries missing art.
+    let wanted: Vec<(String, String, String, Option<String>)> = {
+        let st = lock(&app.store);
+        let Ok(p) = st.profile(&pid) else { return };
+        p.progress
+            .iter()
+            .filter(|(_, pr)| pr.card.as_ref().is_some_and(|c| c.background.is_none()))
+            .map(|(vid, pr)| {
+                let c = pr.card.as_ref().unwrap();
+                (
+                    vid.clone(),
+                    c.title_id.clone(),
+                    c.kind.clone(),
+                    c.episode_id.clone(),
+                )
+            })
+            .collect()
+    };
+    if wanted.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    app.rt.clone().spawn(async move {
+        let addons = lock(&app.addons).clone();
+        for (video_id, title_id, kind, episode_id) in wanted {
+            let Some(addon) = addons.iter().find(|a| a.supports("meta", &kind, &title_id)) else {
+                continue;
+            };
+            let Ok(meta) = app.client.meta(addon, &kind, &title_id).await else {
+                continue;
+            };
+            // Series: the episode's thumbnail; movies: the backdrop. Fall
+            // back to whichever landscape image exists.
+            let background = if kind == "series" {
+                episode_id
+                    .as_deref()
+                    .and_then(|vid| {
+                        meta.videos
+                            .iter()
+                            .find(|v| v.id == vid)
+                            .and_then(|v| v.thumbnail.clone())
+                    })
+                    .or_else(|| meta.background.clone())
+            } else {
+                meta.background.clone().or_else(|| meta.poster.clone())
+            };
+            let Some(background) = background else {
+                continue;
+            };
+            let changed = {
+                let mut st = lock(&app.store);
+                let Ok(p) = st.profile_mut(&pid) else {
+                    continue;
+                };
+                if let Some(pr) = p.progress.get_mut(&video_id) {
+                    if let Some(c) = pr.card.as_mut() {
+                        if c.background.is_none() {
+                            c.background = Some(background);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if changed {
+                app.save();
+            }
+        }
+        // Refresh the Continue Watching row so the new art shows up.
+        if app
+            .ui
+            .upgrade()
+            .is_some_and(|ui| ui.get_page().as_str() == "home")
+        {
+            let cw_items = cw_items_for(&app);
+            let mut data = lock(&app.rows_cache).clone();
+            match data.first_mut() {
+                Some(row) if row.0 == "Continue watching" => row.2 = cw_items,
+                _ => {
+                    if !cw_items.is_empty() {
+                        data.insert(0, ("Continue watching".to_owned(), String::new(), cw_items));
+                    }
+                }
+            }
+            let wanted = poster_wanted(
+                &data
+                    .iter()
+                    .map(|(t, _, items)| (t.clone(), items.clone()))
+                    .collect::<Vec<_>>(),
+            );
+            *lock(&app.rows_cache) = data.clone();
+            let app2 = app.clone();
+            app.ui(move |ui| {
+                if ui.get_page().as_str() == "home" {
+                    let model = rows_with_posters(&data, &lock(&app2.posters));
+                    ui.set_rows(ModelRc::new(VecModel::from(model)));
+                }
+            });
+            app.fetch_posters(wanted);
+        }
+    });
+}
+
 /// Pull Continue Watching entries from the Stremio account library
 /// (`datastoreGet` on `libraryItem`) and merge them into the current
 /// profile's progress. Local entries always win; the row refreshes when done.
@@ -654,6 +817,7 @@ fn sync_account_cw(app: &Arc<App>) {
                             title_id: item.id.clone(),
                             title: item.name.clone(),
                             poster: item.poster.clone(),
+                            background: None, // backfilled lazily
                             episode_id: (item.kind == "series").then(|| video_id.clone()),
                             episode_label: None,
                         }),
@@ -662,6 +826,9 @@ fn sync_account_cw(app: &Arc<App>) {
             }
         }
         app.save();
+        // Newly synced entries have no 16:9 card art yet; fetch it in the
+        // background and let the backfill refresh the row when done.
+        backfill_cw_art(&app);
         // Patch the Continue Watching row in place instead of re-fetching the
         // whole page: the catalog rows are already on screen.
         let on_home = app
@@ -794,7 +961,98 @@ fn fill_settings(ui: &MainWindow, s: &Settings) {
     ui.set_settings_loading(false);
 }
 
+/// REEL_DEBUG_FIXTURE=1: synthetic poster rows (short / 40-char / 120-char
+/// titles plus a missing-poster row) with procedurally drawn posters, so
+/// poster sizing can be checked without the network.
+fn fixture_rows(app: &Arc<App>) -> Vec<(String, String, Vec<ItemData>)> {
+    let long40 = "A Title Of Forty Characters Exactly Padded X".to_string();
+    let long120 =
+        "The Ridiculously Long Continuing Catalog Title Which Goes On And On And Should Be \
+        Elided After Exactly Two Lines Of Thirteen Pixel Text Rendering Here"
+            .to_string();
+    let mk = |i: usize, name: &str, poster: Option<String>| ItemData {
+        id: format!("fx{i}"),
+        kind: "movie".into(),
+        name: name.to_owned(),
+        year: "2026".into(),
+        poster_url: poster,
+        landscape_url: None,
+        title_id: format!("fx{i}"),
+        episode_label: String::new(),
+        time_left: String::new(),
+        progress: 0.0,
+        has_progress: false,
+        watched: false,
+        fav: false,
+        is_cw: false,
+    };
+    let mut rows: Vec<(String, String, Vec<ItemData>)> = Vec::new();
+    let mut idx = 0usize;
+    for (label, name) in [
+        ("Short titles", "Short".to_string()),
+        ("40-char titles", long40.clone()),
+        ("120-char titles", long120.clone()),
+    ] {
+        let items: Vec<ItemData> = (0..8)
+            .map(|_| {
+                idx += 1;
+                mk(idx, &name, Some(format!("fixture://p{idx}")))
+            })
+            .collect();
+        rows.push((label.to_owned(), String::new(), items));
+    }
+    rows.push((
+        "Missing posters".to_owned(),
+        String::new(),
+        (0..6)
+            .map(|_| {
+                idx += 1;
+                mk(idx, &long40, None)
+            })
+            .collect(),
+    ));
+    // Flat-coloured placeholder posters in the cache.
+    let mut posters = lock(&app.posters);
+    for i in 1..=idx {
+        let (w, h) = (30u32, 45u32);
+        let (r, g, b) = match i % 3 {
+            0 => (229u8, 72u8, 77u8),
+            1 => (62u8, 99u8, 221u8),
+            _ => (48u8, 164u8, 108u8),
+        };
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let shade = if (x / 3 + y / 3) % 2 == 0 {
+                    255u32
+                } else {
+                    205
+                };
+                rgba.extend_from_slice(&[
+                    (r as u32 * shade / 255) as u8,
+                    (g as u32 * shade / 255) as u8,
+                    (b as u32 * shade / 255) as u8,
+                    255,
+                ]);
+            }
+        }
+        posters.insert(format!("fixture://p{i}"), Arc::new(Decoded { rgba, w, h }));
+    }
+    rows
+}
+
 fn load_page(app: &Arc<App>, page: &str) {
+    if page == "home" && std::env::var("REEL_DEBUG_FIXTURE").is_ok_and(|v| v == "1") {
+        let data = fixture_rows(app);
+        *lock(&app.rows_cache) = data.clone();
+        let app2 = app.clone();
+        app.ui(move |ui| {
+            ui.set_page("home".into());
+            let model = rows_with_posters(&data, &lock(&app2.posters));
+            ui.set_rows(ModelRc::new(VecModel::from(model)));
+        });
+        return;
+    }
     let page = page.to_owned();
     {
         let page = page.clone();
@@ -823,7 +1081,8 @@ fn load_page(app: &Arc<App>, page: &str) {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                     + 1;
                 let mut data: Vec<(String, String, Vec<ItemData>)> = Vec::new();
-                if page == "home" && !cw_items.is_empty() {
+                let has_cw = page == "home" && !cw_items.is_empty();
+                if has_cw {
                     data.push(("Continue watching".to_owned(), String::new(), cw_items));
                 }
                 *lock(&app.rows_cache) = data.clone();
@@ -842,6 +1101,10 @@ fn load_page(app: &Arc<App>, page: &str) {
                 if let Some((_, _, cw)) = data.first() {
                     let wanted = poster_wanted(&[(String::new(), cw.clone())]);
                     app.fetch_posters(wanted);
+                }
+                // Old progress entries may lack the 16:9 card art; fetch it once.
+                if has_cw {
+                    backfill_cw_art(&app);
                 }
 
                 // One task per catalog: each appends its row to the UI as soon
@@ -1297,7 +1560,7 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
             app.fetch_episode_thumbs(thumb_wanted);
         }
         if let Some(url) = poster {
-            app.fetch_posters(vec![(meta.id.clone(), url)]);
+            app.fetch_posters(vec![(meta.id.clone(), url, false)]);
         }
         match video_id {
             Some(v) => start_sources(&app, &detail, v),
@@ -1510,39 +1773,49 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
         _ => PlayerKind::Mpv,
     };
     // Remember the choice per profile.
-    let (settings, resume) = {
+    let (settings, resume, player_changed) = {
         let mut st = lock(&app.store);
         let (settings, resume) = match st.profile(&pid) {
             Ok(p) => (p.settings.clone(), p.resume_position(&sources.video_id)),
             Err(_) => (Settings::default(), 0.0),
         };
+        let mut player_changed = false;
         if let Ok(p) = st.profile_mut(&pid) {
             if p.settings.player != player_kind {
                 p.settings.player = player_kind;
-                app.save();
+                player_changed = true;
             }
         }
-        (settings, resume)
+        (settings, resume, player_changed)
     };
+    // Save only after the store lock above is released (save locks it again;
+    // this runs on the UI thread, so a nested lock would freeze the app).
+    if player_changed {
+        app.save();
+    }
     let mut settings = settings;
     settings.player = player_kind;
-    // Card info so the entry shows up in Continue Watching.
+    // Card info so the entry shows up in Continue Watching. The 16:9 card art
+    // is the episode thumbnail (series) or the backdrop (movie).
+    let episode = detail.meta.videos.iter().find(|v| v.id == sources.video_id);
     let card = ProgressCard {
         kind: detail.kind.clone(),
         title_id: detail.meta.id.clone(),
         title: detail.meta.name.clone(),
         poster: detail.meta.poster.clone(),
+        background: match &episode {
+            Some(v) => v
+                .thumbnail
+                .clone()
+                .or_else(|| detail.meta.background.clone()),
+            None => detail.meta.background.clone(),
+        },
         episode_id: (detail.kind == "series").then(|| sources.video_id.clone()),
-        episode_label: detail
-            .meta
-            .videos
-            .iter()
-            .find(|v| v.id == sources.video_id)
-            .and_then(|v| {
-                v.season
-                    .zip(v.episode)
-                    .map(|(s, e)| format!("S{s:02}E{e:02}"))
-            }),
+        episode_label: episode.and_then(|v| {
+            v.season
+                .zip(v.episode)
+                .map(|(s, e)| format!("S{s:02}E{e:02}"))
+        }),
     };
     let app = app.clone();
     app.rt.clone().spawn(async move {
@@ -2066,6 +2339,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         poster_slots: Semaphore::new(8),
     });
     wire(&ui, &app);
+    // REEL_DEBUG_LAYOUT=1: draw outlines around buttons/inputs and their icons
+    // so centering offsets are visible in screenshots.
+    if std::env::var("REEL_DEBUG_LAYOUT").is_ok_and(|v| v == "1") {
+        ui.global::<Theme>().set_debug_layout(true);
+    }
     ui.set_player_names(ModelRc::new(VecModel::from(vec![
         slint::SharedString::from("mpv"),
         "VLC".into(),

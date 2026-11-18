@@ -115,13 +115,39 @@ pub async fn run<P: Player>(
                         };
                     }
                     emit(SessionEvent::WaitingForSources);
+                    // The player window hides the app's status text; show it on the player too.
+                    player.notify("Waiting for sources…").await;
                     let remaining = give_up_at.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() || timeout(remaining, rx.changed()).await.is_err() {
+                    if remaining.is_zero() {
                         return if attempts == 0 {
                             Outcome::NoSources
                         } else {
                             Outcome::Exhausted { position }
                         };
+                    }
+                    // While waiting, keep an eye on the player itself: if it is
+                    // closed or dies before any source is available, end the
+                    // session now instead of burning the timeout (queued events
+                    // would make every later load fail anyway).
+                    let ev = tokio::select! {
+                        changed = timeout(remaining, rx.changed()) => {
+                            if changed.is_err() {
+                                return if attempts == 0 {
+                                    Outcome::NoSources
+                                } else {
+                                    Outcome::Exhausted { position }
+                                };
+                            }
+                            continue;
+                        }
+                        ev = player.next_event() => ev,
+                    };
+                    if matches!(
+                        ev,
+                        None | Some(PlayerEvent::Closed) | Some(PlayerEvent::Error(_))
+                    ) {
+                        player.stop().await;
+                        return Outcome::Closed { position };
                     }
                 }
             }
@@ -435,6 +461,62 @@ mod tests {
         .await;
         assert!(matches!(out, Outcome::Finished { .. }));
         assert_eq!(loads.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waits_for_sources_when_play_starts_before_any_loaded() {
+        // Play clicked immediately: the pool is empty and every addon is still loading.
+        let pool = SourcePool::new();
+        pool.begin_tasks(1);
+        let late = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            late.add_streams("Slow", vec![stream("good", "720p")]);
+            late.task_done();
+        });
+        let (mut player, loads) = MockPlayer::new(&[("good", Script::PlayToEnd)]);
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &SessionConfig::default(),
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        assert_eq!(loads.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn player_closed_while_waiting_for_sources_ends_the_session() {
+        // The player dies while nothing has been loaded yet: the session must
+        // end as Closed instead of timing out or failing every late source.
+        let pool = SourcePool::new();
+        pool.begin_tasks(1); // loading forever, so the old wait loop would hang
+        let (mut player, loads) = MockPlayer::new(&[("good", Script::PlayToEnd)]);
+        let tx = player.tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            tx.send(PlayerEvent::Closed).unwrap();
+        });
+        let late = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            late.add_streams("Slow", vec![stream("good", "720p")]);
+        });
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &SessionConfig::default(),
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Closed { position: 0.0 });
+        // The late source must never have been attempted on the dead player.
+        assert!(loads.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
