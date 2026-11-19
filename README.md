@@ -1,4 +1,4 @@
-# Reel
+# PlusFlix
 
 A Stremio-backed desktop player written in Rust (Slint UI + mpv). It signs in with your
 Stremio account, uses the addons installed there, and plays with automatic source failover.
@@ -6,13 +6,13 @@ Stremio account, uses the addons installed there, and plays with automatic sourc
 ## Run
 
 ```
-# needs mpv (>= 0.38) on PATH; on Windows e.g. `winget install mpv` or put mpv.exe next to reel-app.exe
-cargo run --release -p reel-app
+# needs mpv (>= 0.38) on PATH; on Windows e.g. `winget install mpv` or put mpv.exe next to plusflix-app.exe
+cargo run --release -p plusflix-app
 cargo test --workspace
 ```
 
 Data (login key, profiles, favorites, progress) is stored in one JSON file under the OS config
-dir (`Reel/store.json`). Your Stremio password is never stored, only the session key.
+dir (`PlusFlix/store.json`). Your Stremio password is never stored, only the session key.
 
 ## Features
 
@@ -23,7 +23,7 @@ dir (`Reel/store.json`). Your Stremio password is never stored, only the session
   Stremio library (`datastoreGet` on `libraryItem`, same rule Stremio uses)
 - Interface language switcher (Settings → Language): English and Polski, applied immediately
   without restart; the choice is persisted in the store. Locale files live in
-  `crates/reel-app/locales/` (`en.json`, `pl.json`); see `README.md` there for adding a new
+  `crates/plusflix-app/locales/` (`en.json`, `pl.json`); see `README.md` there for adding a new
   language. Missing keys fall back to English.
 - Per-profile settings: player (mpv / VLC), audio language (prefer / must), subtitles language, subtitles requirement
   (required / required only if audio isn't the preferred language / not required), minimum
@@ -48,20 +48,20 @@ Ranking: audio language match, then quality, then debrid-cached, then subtitles 
 
 ## Layout
 
-- `crates/reel-core` – all logic, no UI: Stremio API, addon client, stream parsing, filtering,
+- `crates/plusflix-core` – all logic, no UI: Stremio API, addon client, stream parsing, filtering,
   `SourcePool`, failover `session`, mpv/VLC players, profile store
-- `crates/reel-app` – Slint UI and wiring
+- `crates/plusflix-app` – Slint UI and wiring
 
 ## Icons
 
-The SVG icons in `crates/reel-app/ui/icons/` are from [Lucide](https://lucide.dev),
+The SVG icons in `crates/plusflix-app/ui/icons/` are from [Lucide](https://lucide.dev),
 licensed under the ISC license. Most are from the current Lucide release; `smile.svg`,
 `music.svg`, `trash-2.svg` and `gamepad.svg` come from Lucide v0.263.1 (they were
 renamed upstream since).
 
 ## Fonts
 
-The bundled [Inter](https://rsms.me/inter/) font files in `crates/reel-app/ui/fonts/`
+The bundled [Inter](https://rsms.me/inter/) font files in `crates/plusflix-app/ui/fonts/`
 are licensed under the SIL Open Font License 1.1; see `LICENSE.txt` in that directory.
 
 ## Known limitations / not yet verified
@@ -76,5 +76,5 @@ are licensed under the SIL Open Font License 1.1; see `LICENSE.txt` in that dire
   streams with unknown resolution are excluded when a minimum quality is set.
 - Only direct HTTP(S) streams (debrid + HTTP addons). Torrent info-hash, YouTube and external-URL
   streams are skipped.
-- mpv runs in its own window (fullscreen). Reel's window stays behind it with a "Playing" banner.
+- mpv runs in its own window (fullscreen). PlusFlix's window stays behind it with a "Playing" banner.
 - Next steps: gamepad/remote navigation, search page, Continue Watching row, bundled mpv.

@@ -1,4 +1,4 @@
-// Reel – main window. Uses only custom components from components.slint;
+// PlusFlix – main window. Uses only custom components from components.slint;
 // design values come from theme.slint.
 import { Theme } from "theme.slint";
 export { Theme }
@@ -40,6 +40,8 @@ export struct AddonData {
     name: string,
     kinds: string,
     version: string,
+    // "Wait for this addon" switch state (persisted settings).
+    waited: bool,
 }
 
 export struct SourceRowData {
@@ -54,6 +56,8 @@ component CatalogRow inherits Rectangle {
     in property <RowData> data;
     callback open(string, string);
     callback remove(string);
+    callback toggle-favorite(string, string, string, string); // id, kind, name, poster-url
+    callback toggle-watched(string, string); // id, kind
     property <bool> row-hover: ra.has-hover;
     property <length> gap: Theme.sp-4;
     property <int> cols: clamp(floor((self.width + gap) / (150px * Theme.scale + gap)), 4, 12);
@@ -125,6 +129,12 @@ component CatalogRow inherits Rectangle {
                 clicked => {
                     root.open(item.title-id == "" ? item.id : item.title-id, item.kind);
                 }
+                toggle-favorite => {
+                    root.toggle-favorite(item.id, item.kind, item.name, item.poster-url);
+                }
+                toggle-watched => {
+                    root.toggle-watched(item.id, item.kind);
+                }
             }
         }
     }
@@ -177,7 +187,7 @@ component SettingsRow inherits HorizontalLayout {
 }
 
 export component MainWindow inherits Window {
-    title: "Reel";
+    title: "PlusFlix";
     min-width: 1000px;
     min-height: 680px;
     preferred-width: 1280px;
@@ -302,6 +312,7 @@ export component MainWindow inherits Window {
     in property <string> t-iface-lang-hint;
     in property <string> t-addons-prefix;
     in property <string> t-addons-disclaimer;
+    in property <string> t-addon-wait-tooltip;
     in property <string> t-refresh;
     in property <string> t-refreshing;
 
@@ -312,11 +323,13 @@ export component MainWindow inherits Window {
     callback save-profile(string, string, string, string); // id, name, icon, color
     callback delete-profile(string);
     callback switch-profile();
-    callback manage-profiles-menu();
     callback navigate(string);
     callback open-item(string, string);
     callback close-detail();
     callback toggle-favorite();
+    // Card-level toggles fired straight from catalog cards.
+    callback toggle-favorite-card(string, string, string, string); // id, kind, name, poster-url
+    callback toggle-watched-card(string, string); // id, kind
     callback select-episode(string);
     callback season-changed(int);
     callback play(string); // "mpv" | "vlc" – remembered as the profile's player
@@ -327,6 +340,8 @@ export component MainWindow inherits Window {
     callback toggle-watched();
     callback save-settings();
     callback refresh-addons();
+    // (addon name, wait on/off) - toggles the "Wait for this addon" switch
+    callback toggle-addon-wait(string, bool);
     callback search(string);
     callback language-changed(int); // new language dropdown index
 
@@ -368,7 +383,7 @@ export component MainWindow inherits Window {
                         spacing: Theme.sp-3;
                         alignment: start;
                         Text {
-                            text: "Reel";
+                            text: "PlusFlix";
                             font-size: Theme.fs-display;
                             font-weight: 800;
                             color: Theme.accent;
@@ -775,6 +790,12 @@ export component MainWindow inherits Window {
                         remove(id) => {
                             root.remove-progress(id);
                         }
+                        toggle-favorite(id, kind, name, poster) => {
+                            root.toggle-favorite-card(id, kind, name, poster);
+                        }
+                        toggle-watched(id, kind) => {
+                            root.toggle-watched-card(id, kind);
+                        }
                     }
                 }
             }
@@ -837,6 +858,12 @@ export component MainWindow inherits Window {
                     item: item;
                     clicked => {
                         root.open-item(item.title-id == "" ? item.id : item.title-id, item.kind);
+                    }
+                    toggle-favorite => {
+                        root.toggle-favorite-card(item.id, item.kind, item.name, item.poster-url);
+                    }
+                    toggle-watched => {
+                        root.toggle-watched-card(item.id, item.kind);
                     }
                 }
             }
@@ -1038,6 +1065,10 @@ export component MainWindow inherits Window {
                             height: 44px * Theme.scale;
                             border-radius: Theme.r-sm;
                             background: ata.has-hover ? Theme.hover-bg : Theme.surface;
+                            // hover highlight only, declared before the layout so
+                            // the per-addon Switch below stays clickable (Slint
+                            // hit-testing picks the last sibling)
+                            ata := TouchArea { }
                             HorizontalLayout {
                                 padding-left: Theme.sp-3;
                                 padding-right: Theme.sp-3;
@@ -1066,8 +1097,17 @@ export component MainWindow inherits Window {
                                     font-size: Theme.fs-caption;
                                     vertical-alignment: center;
                                 }
+                                // "Wait for this addon" switch: on = playback
+                                // start (the green/Ready state) waits until this
+                                // addon's sources have loaded.
+                                Switch {
+                                    tooltip: root.t-addon-wait-tooltip;
+                                    checked: a.waited;
+                                    toggled(checked) => {
+                                        root.toggle-addon-wait(a.name, checked);
+                                    }
+                                }
                             }
-                            ata := TouchArea { }
                         }
                     }
                 }
@@ -1091,7 +1131,7 @@ export component MainWindow inherits Window {
                 padding-right: Theme.page-margin;
                 spacing: Theme.sp-6;
                 Text {
-                    text: "Reel";
+                    text: "PlusFlix";
                     color: Theme.accent;
                     font-size: Theme.fs-heading + Theme.sp-2;
                     font-weight: 800;
@@ -1159,7 +1199,7 @@ export component MainWindow inherits Window {
                     icon: root.profile-icon;
                     tint: root.profile-color;
                 }
-                TouchArea {
+                avatar-open := TouchArea {
                     clicked => {
                         avatar-menu.show();
                     }
@@ -1167,9 +1207,15 @@ export component MainWindow inherits Window {
                     avatar-menu := PopupWindow {
                         x: -136px * Theme.scale;
                         y: Theme.hit + 4px * Theme.scale;
+                        // A PopupWindow sizes itself from preferred-width/height,
+                        // not from the child Rectangle's explicit geometry; without
+                        // these the menu has no usable geometry and the item
+                        // TouchAreas never receive clicks.
+                        preferred-width: 180px * Theme.scale;
+                        preferred-height: 2 * 40px * Theme.scale + 10px * Theme.scale;
                         Rectangle {
                             width: 180px * Theme.scale;
-                            height: 3 * 40px * Theme.scale + 8px * Theme.scale;
+                            height: 2 * 40px * Theme.scale + 10px * Theme.scale;
                             border-radius: Theme.r-sm;
                             background: Theme.surface-2;
                             border-width: 1px;
@@ -1181,7 +1227,6 @@ export component MainWindow inherits Window {
                                 spacing: 2px * Theme.scale;
                                 for mi in [
                                     { label: "Switch profile", icon: @image-url("icons/users.svg"), act: "switch" },
-                                    { label: "Manage profiles", icon: @image-url("icons/pencil.svg"), act: "manage" },
                                     { label: "Log out", icon: @image-url("icons/log-out.svg"), act: "logout" },
                                 ]: Rectangle {
                                     height: 40px * Theme.scale;
@@ -1201,12 +1246,15 @@ export component MainWindow inherits Window {
                                     }
                                     ma := TouchArea {
                                         clicked => {
-                                            avatar-menu.close();
+                                            // No explicit `avatar-menu.close()` here: both
+                                            // handlers change `screen`, which unmounts the
+                                            // `screen == "main"` block that owns this popup,
+                                            // so the menu goes away on its own. (Closing the
+                                            // popup *before* the callbacks tore the item tree
+                                            // down mid-handler and silently dropped the
+                                            // callback invocation — see tests/avatar_menu.rs.)
                                             if (mi.act == "switch") {
                                                 root.switch-profile();
-                                            }
-                                            if (mi.act == "manage") {
-                                                root.manage-profiles-menu();
                                             }
                                             if (mi.act == "logout") {
                                                 root.logout();
@@ -1334,7 +1382,15 @@ export component MainWindow inherits Window {
                             height: parent.height;
                             width: pl.width + chev.width + Theme.sp-6;
                             border-radius: Theme.r-pill;
-                            background: root.playing ? Theme.surface-2 : (ptt.has-hover ? #E8E8ED : white);
+                            // Colour mirrors the cached source resolution, like
+                            // the card play pill: green = playable sources ready
+                            // (never while a waited-for addon is still loading),
+                            // red = nothing playable (ptt is disabled), gray =
+                            // still loading.
+                            background: root.playing ? Theme.surface-2
+                                : root.sources-state == "ready" ? Theme.success
+                                : root.sources-state == "none" ? Theme.accent
+                                : (ptt.has-hover ? #E8E8ED : white);
                             animate background { duration: Theme.t-fast; easing: ease-out; }
                             clip: true;
                             accessible-role: button;
@@ -1370,7 +1426,8 @@ export component MainWindow inherits Window {
                             // click anywhere on the label side of the button
                             ptt := TouchArea {
                                 width: parent.width - chev.width;
-                                enabled: !root.playing;
+                                // red state = no playable source: block playback
+                                enabled: !root.playing && root.sources-state != "none";
                                 clicked => {
                                     root.player-menu-open = false;
                                     root.play(root.play-player);
@@ -1463,6 +1520,9 @@ export component MainWindow inherits Window {
                         vertical-stretch: 0;
                         model: root.season-names;
                         current-index <=> root.season-idx;
+                        changed current-index => {
+                            root.season-changed(self.current-index);
+                        }
                         width: 220px * Theme.scale;
                     }
                     if root.detail-is-series && root.episodes.length > 0 && !root.sources-open: Rectangle { vertical-stretch: 0; height: Theme.sp-3; }

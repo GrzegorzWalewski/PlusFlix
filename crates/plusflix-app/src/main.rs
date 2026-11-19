@@ -1,24 +1,24 @@
-//! Reel – a Stremio-backed player. UI glue: Slint on the main thread, everything
+//! PlusFlix – a Stremio-backed player. UI glue: Slint on the main thread, everything
 //! else (network, failover sessions, mpv) on a tokio runtime.
 
 slint::include_modules!();
 
-use reel_core::addon::{Addon, AddonClient};
-use reel_core::home;
-use reel_core::lang::Lang;
-use reel_core::loader::SourceLoader;
-use reel_core::model::{Meta, MetaPreview};
-use reel_core::mpv::{MpvConfig, MpvPlayer};
-use reel_core::player::{LoadRequest, Player, PlayerEvent};
-use reel_core::pool::{PoolStats, SourcePool};
-use reel_core::session::{self, Outcome, SessionConfig, SessionEvent};
-use reel_core::settings::{LanguageMode, PlayerKind, Quality, Settings, SubtitleRequirement};
-use reel_core::store::{
+use plusflix_core::addon::{Addon, AddonClient};
+use plusflix_core::home;
+use plusflix_core::lang::Lang;
+use plusflix_core::loader::SourceLoader;
+use plusflix_core::model::{Meta, MetaPreview};
+use plusflix_core::mpv::{MpvConfig, MpvPlayer};
+use plusflix_core::player::{LoadRequest, Player, PlayerEvent};
+use plusflix_core::pool::{PoolStats, SourcePool};
+use plusflix_core::session::{self, Outcome, SessionConfig, SessionEvent};
+use plusflix_core::settings::{LanguageMode, PlayerKind, Quality, Settings, SubtitleRequirement};
+use plusflix_core::store::{
     self, Favorite, Profile, ProgressCard, Store, MAX_PROFILES, PROFILE_COLORS, PROFILE_ICONS,
 };
-use reel_core::stremio::StremioApi;
-use reel_core::Translations;
-use reel_core::vlc::{VlcConfig, VlcPlayer};
+use plusflix_core::stremio::StremioApi;
+use plusflix_core::Translations;
+use plusflix_core::vlc::{VlcConfig, VlcPlayer};
 use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel, Weak,
 };
@@ -126,6 +126,16 @@ struct Detail {
     stats: Mutex<Option<AbortOnDrop>>,
 }
 
+/// Cached per-item source resolution for the play pill on catalog cards:
+/// Loading (gray), Ready (green — playable sources found), None (red — all
+/// addons finished with no playable source).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SourceStatus {
+    Loading,
+    Ready,
+    None,
+}
+
 struct App {
     rt: Handle,
     ui: Weak<MainWindow>,
@@ -152,6 +162,8 @@ struct App {
     poster_slots: Semaphore,
     /// Episode ids seen for each series (used for the "all episodes watched" badge).
     known_episodes: Mutex<HashMap<String, Vec<String>>>,
+    /// Cached source resolution per item id (play pill colours).
+    source_states: Mutex<HashMap<String, SourceStatus>>,
     /// Last rendered home/movies/series rows as (title, addon subtitle, items),
     /// so the account sync can patch the Continue Watching row without
     /// re-fetching catalogs.
@@ -184,6 +196,8 @@ struct ItemData {
     watched: bool,
     fav: bool,
     is_cw: bool,
+    /// Cached source resolution for the play pill (see `SourceStatus`).
+    source_state: SourceStatus,
 }
 
 impl ItemData {
@@ -203,6 +217,7 @@ impl ItemData {
             watched: false,
             fav: false,
             is_cw: false,
+            source_state: SourceStatus::Loading,
         }
     }
     fn from_favorite(f: &Favorite) -> Self {
@@ -221,10 +236,11 @@ impl ItemData {
             watched: false,
             fav: false,
             is_cw: false,
+            source_state: SourceStatus::Loading,
         }
     }
     /// A Continue Watching card from a progress entry (must have card info).
-    fn from_progress(pr: &reel_core::store::Progress) -> Option<Self> {
+    fn from_progress(pr: &plusflix_core::store::Progress) -> Option<Self> {
         let card = pr.card.as_ref()?;
         let video_id = card
             .episode_id
@@ -265,6 +281,7 @@ impl ItemData {
             watched: false,
             fav: false,
             is_cw: true,
+            source_state: SourceStatus::Loading,
         })
     }
     fn to_slint(&self) -> Item {
@@ -281,6 +298,8 @@ impl ItemData {
             watched: self.watched,
             fav: self.fav,
             is_cw: self.is_cw,
+            poster_url: self.poster_url.clone().unwrap_or_default().into(),
+            source_state: self.source_state as i32,
             ..Default::default()
         }
     }
@@ -330,7 +349,7 @@ fn rows_with_posters(
         .collect()
 }
 
-fn addon_rows(addons: &[Addon]) -> Vec<AddonData> {
+fn addon_rows(addons: &[Addon], waits: &[String]) -> Vec<AddonData> {
     addons
         .iter()
         .map(|a| {
@@ -339,6 +358,8 @@ fn addon_rows(addons: &[Addon]) -> Vec<AddonData> {
                 name: a.name().to_owned().into(),
                 kinds: m.types.join(", ").into(),
                 version: m.version.clone().into(),
+                // "Wait for this addon" switch state (persisted settings).
+                waited: waits.iter().any(|w| w == a.name()).into(),
             }
         })
         .collect()
@@ -370,6 +391,10 @@ fn apply_flags(app: &App, items: &mut [ItemData]) {
         let (watched, fav) = item_flags(app, &it.id, &it.kind);
         it.watched = watched;
         it.fav = fav;
+        it.source_state = lock(&app.source_states)
+            .get(&it.id)
+            .copied()
+            .unwrap_or(SourceStatus::Loading);
     }
 }
 
@@ -380,7 +405,7 @@ enum AnyPlayer {
 }
 
 impl Player for AnyPlayer {
-    async fn load(&mut self, req: LoadRequest) -> reel_core::Result<()> {
+    async fn load(&mut self, req: LoadRequest) -> plusflix_core::Result<()> {
         match self {
             AnyPlayer::Mpv(p) => p.load(req).await,
             AnyPlayer::Vlc(p) => p.load(req).await,
@@ -573,6 +598,7 @@ fn hex_color(hex: &str) -> slint::Color {
 }
 
 fn show_profiles(app: &Arc<App>) {
+    tracing::info!("show_profiles");
     let (profiles, can_add) = {
         let st = lock(&app.store);
         (
@@ -783,7 +809,7 @@ fn sync_account_cw(app: &Arc<App>) {
             }
         };
         // Newest first by lastWatched (ISO strings order correctly).
-        let mut cw: Vec<&reel_core::stremio::LibraryItem> =
+        let mut cw: Vec<&plusflix_core::stremio::LibraryItem> =
             items.iter().filter(|i| i.in_continue_watching()).collect();
         cw.sort_by(|a, b| b.state.last_watched.cmp(&a.state.last_watched));
         let now = std::time::SystemTime::now()
@@ -991,6 +1017,7 @@ fn fixture_rows(app: &Arc<App>) -> Vec<(String, String, Vec<ItemData>)> {
         watched: false,
         fav: false,
         is_cw: false,
+        source_state: SourceStatus::Loading,
     };
     let mut rows: Vec<(String, String, Vec<ItemData>)> = Vec::new();
     let mut idx = 0usize;
@@ -1194,7 +1221,7 @@ fn load_page(app: &Arc<App>, page: &str) {
         }
         "settings" => {
             let s = app.profile_settings();
-            let addons = addon_rows(&lock(&app.addons));
+            let addons = addon_rows(&lock(&app.addons), &s.wait_for_addons);
             app.ui(move |ui| {
                 fill_settings(ui, &s);
                 ui.set_addons(ModelRc::new(VecModel::from(addons)));
@@ -1344,6 +1371,32 @@ fn patch_episode_thumb(ui: &MainWindow, id: &str, dec: &Decoded) {
     }
 }
 
+/// Patches every visible card for `id` (rows, favorites and search grids)
+/// in place, without rebuilding the models.
+fn patch_item(ui: &MainWindow, id: &str, f: impl Fn(&mut Item)) {
+    for model in [ui.get_favorites(), ui.get_search_results()] {
+        for i in 0..model.row_count() {
+            let Some(mut it) = model.row_data(i) else { continue };
+            if it.id.as_str() == id {
+                f(&mut it);
+                model.set_row_data(i, it);
+            }
+        }
+    }
+    let rows = ui.get_rows();
+    for r in 0..rows.row_count() {
+        let Some(row) = rows.row_data(r) else { continue };
+        let items = row.items.clone();
+        for i in 0..items.row_count() {
+            let Some(mut it) = items.row_data(i) else { continue };
+            if it.id.as_str() == id {
+                f(&mut it);
+                items.set_row_data(i, it);
+            }
+        }
+    }
+}
+
 /// Starts (or restarts) background source loading for `video_id`. Must run inside the tokio runtime.
 fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
     let pool = SourcePool::new();
@@ -1362,6 +1415,8 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
     }));
 
     let a = app.clone();
+    // Cache key for the play pill state: the catalog item's own id.
+    let item_id = detail.meta.id.clone();
     let handle = app.rt.spawn(async move {
         loop {
             let settings = a.profile_settings();
@@ -1386,14 +1441,40 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
                 })
                 .collect();
             let text = summary(&stats);
-            let state = if stats.pending_tasks > 0 {
-                "loading"
-            } else if stats.usable > 0 {
+            // "Wait for this addon": while any addon the profile waits for is
+            // still loading, the state stays Loading even when other addons
+            // already delivered usable sources — the green/Ready light (and
+            // the popup play button colour) only turns on once they finish.
+            // Only the state is gated this way; a manual Play click still
+            // starts playback immediately.
+            let waited_pending = settings
+                .wait_for_addons
+                .iter()
+                .any(|name| pool.addon_pending(name));
+            let state = if stats.usable > 0 && !waited_pending {
                 "ready"
+            } else if stats.pending_tasks > 0 {
+                "loading"
             } else {
                 "none"
             };
             let state = state.to_owned();
+            // Mirror the resolution state onto the catalog card play pill.
+            let status = if stats.usable > 0 && !waited_pending {
+                SourceStatus::Ready
+            } else if stats.pending_tasks > 0 {
+                SourceStatus::Loading
+            } else {
+                SourceStatus::None
+            };
+            let id = item_id.clone();
+            if lock(&a.source_states).get(&id).copied() != Some(status) {
+                lock(&a.source_states).insert(id.clone(), status);
+                let a = a.clone();
+                a.ui(move |ui| {
+                    patch_item(ui, &id, |it| it.source_state = status as i32);
+                });
+            }
             a.ui(move |ui| {
                 ui.set_sources_summary(text.into());
                 ui.set_sources_state(state.into());
@@ -1731,6 +1812,81 @@ fn toggle_watched(app: &Arc<App>, ui: &MainWindow) {
     load_page(app, ui.get_page().as_str());
 }
 
+/// Toggle favorite straight from a catalog card (no detail popup). Only the
+/// favorites page rebuilds (the card appears/disappears); every other page
+/// just flips the badge in place.
+fn card_toggle_favorite(app: &Arc<App>, id: String, kind: String, name: String, poster: String) {
+    let Some(pid) = app.profile_id() else { return };
+    let poster = (!poster.is_empty()).then(|| poster);
+    let now_fav = {
+        let mut st = lock(&app.store);
+        let Ok(p) = st.profile_mut(&pid) else { return };
+        p.toggle_favorite(Favorite {
+            id: id.clone(),
+            kind,
+            name,
+            poster,
+        })
+    };
+    app.save();
+    let on_favorites_page = app
+        .ui
+        .upgrade()
+        .is_some_and(|ui| ui.get_page().as_str() == "favorites");
+    if on_favorites_page {
+        load_page(app, "favorites");
+    } else {
+        let id = id;
+        app.ui(move |ui| {
+            patch_item(ui, &id, |it| it.fav = now_fav);
+        });
+    }
+}
+
+/// Toggle watched straight from a catalog card: like the detail's series
+/// logic, all known episodes of a series (the card badge means "all
+/// episodes watched"), the movie itself otherwise.
+fn card_toggle_watched(app: &Arc<App>, id: String, kind: String) {
+    let Some(pid) = app.profile_id() else { return };
+    let now_watched = {
+        let mut st = lock(&app.store);
+        let Ok(p) = st.profile_mut(&pid) else { return };
+        if kind == "series" {
+            let eps = lock(&app.known_episodes)
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            if eps.is_empty() {
+                return;
+            }
+            let all = eps.iter().all(|e| p.is_watched(e));
+            if all {
+                for e in &eps {
+                    p.unmark_watched(e);
+                }
+            } else {
+                for e in &eps {
+                    p.mark_watched(e);
+                }
+            }
+            !all
+        } else {
+            let was = p.is_watched(&id);
+            if was {
+                p.unmark_watched(&id);
+            } else {
+                p.mark_watched(&id);
+            }
+            !was
+        }
+    };
+    app.save();
+    let id = id;
+    app.ui(move |ui| {
+        patch_item(ui, &id, |it| it.watched = now_watched);
+    });
+}
+
 /// Remove one Continue Watching entry.
 fn remove_progress(app: &Arc<App>, video_id: String) {
     let Some(pid) = app.profile_id() else { return };
@@ -1867,7 +2023,7 @@ struct Skippable<P> {
 }
 
 impl<P: Player> Player for Skippable<P> {
-    async fn load(&mut self, req: LoadRequest) -> reel_core::error::Result<()> {
+    async fn load(&mut self, req: LoadRequest) -> plusflix_core::error::Result<()> {
         self.inner.load(req).await
     }
     async fn next_event(&mut self) -> Option<PlayerEvent> {
@@ -2025,7 +2181,7 @@ fn do_search(app: &Arc<App>, query: String) {
 
 // ---------------------------------------------------------------- account
 
-async fn refresh_addons(app: &Arc<App>, auth_key: &str) -> reel_core::Result<()> {
+async fn refresh_addons(app: &Arc<App>, auth_key: &str) -> plusflix_core::Result<()> {
     let list = app.api.addon_collection(auth_key).await?;
     *lock(&app.addons) = list;
     Ok(())
@@ -2045,7 +2201,7 @@ fn login(app: &Arc<App>, email: String, password: String) {
         let result = async {
             let auth = app.api.login(email.trim(), &password).await?;
             refresh_addons(&app, &auth.auth_key).await?;
-            reel_core::Result::Ok(auth)
+            plusflix_core::Result::Ok(auth)
         }
         .await;
         match result {
@@ -2072,7 +2228,8 @@ fn refresh_addons_ui(app: &Arc<App>) {
         app.ui(|ui| ui.set_refreshing_addons(true));
         match refresh_addons(&app, &auth.auth_key).await {
             Ok(()) => {
-                let addons = addon_rows(&lock(&app.addons));
+                let waits = app.profile_settings().wait_for_addons;
+                let addons = addon_rows(&lock(&app.addons), &waits);
                 app.ui(move |ui| {
                     ui.set_addons(ModelRc::new(VecModel::from(addons)));
                     ui.set_refreshing_addons(false);
@@ -2115,7 +2272,8 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
         app.flash("Max file size must be a positive number of GB.");
         return;
     }
-    // Field not (yet) exposed in the UI: keep the stored value.
+    // Set from the per-addon "Wait for this addon" switches
+    // (toggle-addon-wait); keep whatever the switches last persisted.
     let wait_for_addons = app.profile_settings().wait_for_addons;
     let settings = Settings {
         audio_language: lang_from_index(ui.get_audio_idx()),
@@ -2281,6 +2439,7 @@ fn apply_language(app: &Arc<App>) {
         ui.set_t_iface_lang_hint(tr(&app2, "interface_language_hint").into());
         ui.set_t_addons_prefix(tr(&app2, "addons_section_prefix").into());
         ui.set_t_addons_disclaimer(tr(&app2, "addons_disclaimer").into());
+    ui.set_t_addon_wait_tooltip(tr(&app2, "addon_wait_tooltip").into());
         ui.set_t_refresh(tr(&app2, "refresh").into());
         ui.set_t_refreshing(tr(&app2, "refreshing").into());
     });
@@ -2383,9 +2542,35 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
         show_profiles(&a);
     });
     let a = app.clone();
-    ui.on_switch_profile(move || show_profiles(&a));
+    ui.on_switch_profile(move || {
+        tracing::info!("switch-profile");
+        let a = a.clone();
+        a.rt.clone().spawn(async move { show_profiles(&a) });
+    });
     let a = app.clone();
-    ui.on_manage_profiles_menu(move || show_profiles(&a));
+    // "Wait for this addon" switch on a Settings -> Addons row: add/remove
+    // the addon name in the profile's persisted wait_for_addons list.
+    ui.on_toggle_addon_wait(move |name, checked| {
+        let name = name.to_string();
+        let Some(pid) = a.profile_id() else { return };
+        let mut waits = a.profile_settings().wait_for_addons;
+        if checked {
+            if !waits.iter().any(|w| w == &name) {
+                waits.push(name.clone());
+            }
+        } else {
+            waits.retain(|w| w != &name);
+        }
+        if let Ok(p) = lock(&a.store).profile_mut(pid.as_str()) {
+            p.settings.wait_for_addons = waits.clone();
+        }
+        a.save();
+        let addons = addon_rows(&lock(&a.addons), &waits);
+        a.ui(move |ui| {
+            ui.set_addons(ModelRc::new(VecModel::from(addons)));
+        });
+        a.flash("Settings saved.");
+    });
     let a = app.clone();
     ui.on_navigate(move |page| load_page(&a, page.as_str()));
     let a = app.clone();
@@ -2419,6 +2604,20 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     }
     let a = app.clone();
     ui.on_remove_progress(move |id| remove_progress(&a, id.to_string()));
+    let a = app.clone();
+    ui.on_toggle_favorite_card(move |id, kind, name, poster| {
+        card_toggle_favorite(
+            &a,
+            id.to_string(),
+            kind.to_string(),
+            name.to_string(),
+            poster.to_string(),
+        );
+    });
+    let a = app.clone();
+    ui.on_toggle_watched_card(move |id, kind| {
+        card_toggle_watched(&a, id.to_string(), kind.to_string());
+    });
     let a = app.clone();
     ui.on_play(move |kind| play(&a, kind.to_string(), None));
     let a = app.clone();
@@ -2507,6 +2706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         profile: Mutex::new(None),
         detail: Mutex::new(None),
         known_episodes: Mutex::new(HashMap::new()),
+        source_states: Mutex::new(HashMap::new()),
         rows_cache: Mutex::new(Vec::new()),
         load_gen: std::sync::atomic::AtomicUsize::new(0),
         playing: AtomicBool::new(false),

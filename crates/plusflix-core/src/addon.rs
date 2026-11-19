@@ -70,7 +70,7 @@ pub struct AddonClient {
 impl AddonClient {
     pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
-            .user_agent(concat!("Reel/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("PlusFlix/", env!("CARGO_PKG_VERSION")))
             // Self-hosted addons can be slow; Stremio itself waits patiently too.
             .timeout(Duration::from_secs(60))
             .build()?;

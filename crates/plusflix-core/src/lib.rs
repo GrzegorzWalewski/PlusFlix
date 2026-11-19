@@ -1,4 +1,4 @@
-//! Reel core: Stremio account + addons, source selection and failover playback.
+//! PlusFlix core: Stremio account + addons, source selection and failover playback.
 //! No UI code lives here, so the whole playback logic is testable headlessly.
 
 pub mod addon;

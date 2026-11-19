@@ -1,7 +1,7 @@
 //! `Player` implementation that drives an external mpv through its JSON IPC.
 //!
 //! mpv runs in its own (fullscreen) window, so decoding, hardware acceleration,
-//! subtitles and OSD are all mpv's. Reel only sends commands and reads events.
+//! subtitles and OSD are all mpv's. PlusFlix only sends commands and reads events.
 //! Needs mpv >= 0.38 (`loadfile` with an index argument).
 //!
 //! Windows: named pipe `\\.\pipe\reel-mpv-*`; Unix: a socket in the temp dir.

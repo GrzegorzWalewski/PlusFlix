@@ -3607,6 +3607,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
+name = "plusflix-app"
+version = "0.1.0"
+dependencies = [
+ "i-slint-backend-testing",
+ "i-slint-core",
+ "image",
+ "plusflix-core",
+ "slint",
+ "slint-build",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "winresource",
+]
+
+[[package]]
+name = "plusflix-core"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "futures",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3937,38 +3969,6 @@ checksum = "60dc65c0ff1a7ae1294b0c67b9f14baf70b644404010370171787bfac1038fc0"
 dependencies = [
  "libredox",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "reel-app"
-version = "0.1.0"
-dependencies = [
- "i-slint-backend-testing",
- "i-slint-core",
- "image",
- "reel-core",
- "slint",
- "slint-build",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "winresource",
-]
-
-[[package]]
-name = "reel-core"
-version = "0.1.0"
-dependencies = [
- "directories",
- "futures",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "url",
 ]
 
 [[package]]

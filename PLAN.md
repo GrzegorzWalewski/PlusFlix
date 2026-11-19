@@ -1,9 +1,9 @@
-# Plan: Add Translation / i18n to Reel
+# Plan: Add Translation / i18n to PlusFlix
 
 ## Overview
 
 Extract all hardcoded UI strings into an `en.json` locale file, build a minimal translation
-loader in `reel-core`, wire it into `reel-app` via the existing Slint `app_language` property,
+loader in `plusflix-core`, wire it into `plusflix-app` via the existing Slint `app_language` property,
 and add a language-switcher control to the Settings page.
 
 ---
@@ -12,7 +12,7 @@ and add a language-switcher control to the Settings page.
 
 ### 1. [tier:fast] Audit all hardcoded strings in Slint files
 
-Grep `crates/reel-app/ui/` for every quoted string literal that is user-visible (labels,
+Grep `crates/plusflix-app/ui/` for every quoted string literal that is user-visible (labels,
 placeholders, error messages, section headings, tooltips). Produce a deduplicated inventory
 with the source file + line for each string.
 
@@ -20,14 +20,14 @@ with the source file + line for each string.
 
 ### 2. [tier:medium] Create `locales/en.json` with all extracted strings
 
-Using the inventory from step 1, create `crates/reel-app/locales/en.json` with a flat
+Using the inventory from step 1, create `crates/plusflix-app/locales/en.json` with a flat
 key→value map (snake_case keys, English values). Keys should be descriptive
 (`sign_in`, `search_placeholder`, `nothing_to_show_hint`, etc.).
 
 [acceptance]
-check: fileExists path=crates/reel-app/locales/en.json
+check: fileExists path=crates/plusflix-app/locales/en.json
 criteria: Every user-visible string found in the audit is present as a key; no key is duplicated; valid JSON.
-deliverable: crates/reel-app/locales/en.json
+deliverable: crates/plusflix-app/locales/en.json
 [/acceptance]
 
 ---
@@ -39,16 +39,16 @@ Add a short `locales/README.md` explaining the file format, how to create a new 
 it in the app. No code changes.
 
 [acceptance]
-check: fileExists path=crates/reel-app/locales/README.md
+check: fileExists path=crates/plusflix-app/locales/README.md
 criteria: README covers file format, creation workflow, and in-app selection.
-deliverable: crates/reel-app/locales/README.md
+deliverable: crates/plusflix-app/locales/README.md
 [/acceptance]
 
 ---
 
-### 4. [tier:medium] Add translation loader to `reel-core`
+### 4. [tier:medium] Add translation loader to `plusflix-core`
 
-Create `crates/reel-core/src/i18n.rs`:
+Create `crates/plusflix-core/src/i18n.rs`:
 
 - `struct Translations { map: HashMap<String, String> }`
 - `fn load(locale_code: &str, locales_dir: &Path) -> Result<Translations>`  
@@ -60,12 +60,12 @@ Create `crates/reel-core/src/i18n.rs`:
 check: testsPass
 check: buildPasses
 criteria: Unit tests cover: load en.json, load a stub pl.json, fallback to English for a missing key, and key-not-found fallback returning the key itself.
-deliverable: crates/reel-core/src/i18n.rs
+deliverable: crates/plusflix-core/src/i18n.rs
 [/acceptance]
 
 ---
 
-### 5. [tier:medium] Wire translations into `reel-app` / `main.rs`
+### 5. [tier:medium] Wire translations into `plusflix-app` / `main.rs`
 
 - At startup, load the active locale (`en` by default) from `store.json` (add `locale` field).
 - Pass a `Arc<Translations>` into wherever Slint properties are set.
@@ -77,7 +77,7 @@ deliverable: crates/reel-core/src/i18n.rs
 [acceptance]
 check: buildPasses
 criteria: App builds without errors; all previously hardcoded strings are now sourced from the loaded locale file.
-deliverable: crates/reel-app/src/main.rs (modified)
+deliverable: crates/plusflix-app/src/main.rs (modified)
 [/acceptance]
 
 ---
@@ -96,34 +96,34 @@ deliverable: crates/reel-app/src/main.rs (modified)
 [acceptance]
 check: buildPasses
 criteria: Settings page shows the language selector; selecting a locale fires the callback; UI strings update without restart; selection persists across app restarts via store.json.
-deliverable: crates/reel-app/ui/main.slint (modified), crates/reel-app/src/main.rs (modified)
+deliverable: crates/plusflix-app/ui/main.slint (modified), crates/plusflix-app/src/main.rs (modified)
 [/acceptance]
 
 ---
 
 ### 7. [tier:medium] Persist selected locale in `store.json`
 
-- Add `locale: String` field to the store struct in `reel-core` (default `"en"`).
+- Add `locale: String` field to the store struct in `plusflix-core` (default `"en"`).
 - Save it when the user changes language; load it on startup before building the UI.
 
 [acceptance]
 check: testsPass
 check: buildPasses
 criteria: Store serialises/deserialises the new field; existing stores without the field default to "en" gracefully.
-deliverable: crates/reel-core/src/store.rs (or equivalent store module)
+deliverable: crates/plusflix-core/src/store.rs (or equivalent store module)
 [/acceptance]
 
 ---
 
 ### 8. [tier:medium] Ship a starter `pl.json`
 
-Create `crates/reel-app/locales/pl.json` as a fully translated Polish locale (all keys from
+Create `crates/plusflix-app/locales/pl.json` as a fully translated Polish locale (all keys from
 `en.json`, Polish values). This doubles as a concrete example for future translators.
 
 [acceptance]
-check: fileExists path=crates/reel-app/locales/pl.json
+check: fileExists path=crates/plusflix-app/locales/pl.json
 criteria: pl.json contains every key present in en.json; all values are Polish translations; valid JSON.
-deliverable: crates/reel-app/locales/pl.json
+deliverable: crates/plusflix-app/locales/pl.json
 [/acceptance]
 
 ---

@@ -1,6 +1,6 @@
 //! `Player` implementation that drives VLC through its HTTP interface.
 //!
-//! VLC has no JSON IPC like mpv, so Reel starts it with its web interface
+//! VLC has no JSON IPC like mpv, so PlusFlix starts it with its web interface
 //! (`--extraintf=http` on a random port with a random password) and polls
 //! `status.json` to map VLC state onto `PlayerEvent`s. The failover session
 //! works unchanged on top of that.

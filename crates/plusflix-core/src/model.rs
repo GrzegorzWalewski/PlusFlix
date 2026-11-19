@@ -1,4 +1,4 @@
-//! Data types of the Stremio addon protocol (only the fields Reel uses).
+//! Data types of the Stremio addon protocol (only the fields PlusFlix uses).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -93,7 +93,7 @@ impl Stream {
         s
     }
 
-    /// Reel plays direct HTTP(S) URLs only (debrid / direct addons).
+    /// PlusFlix plays direct HTTP(S) URLs only (debrid / direct addons).
     pub fn http_url(&self) -> Option<&str> {
         self.url
             .as_deref()

@@ -1,6 +1,6 @@
-# Reel / PlusFlix I18n Locales
+# PlusFlix I18n Locales
 
-This directory contains the localisation files for the Reel/PlusFlix app. The application discovers and loads these files at runtime.
+This directory contains the localisation files for the PlusFlix app. The application discovers and loads these files at runtime.
 
 ## File format
 
