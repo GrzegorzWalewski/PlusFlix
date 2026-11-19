@@ -64,17 +64,3 @@ renamed upstream since).
 The bundled [Inter](https://rsms.me/inter/) font files in `crates/plusflix-app/ui/fonts/`
 are licensed under the SIL Open Font License 1.1; see `LICENSE.txt` in that directory.
 
-## Known limitations / not yet verified
-
-- **Not run against a real Stremio account or real addons.** The login / `addonCollectionGet`
-  request shapes follow community docs and should be checked on first run.
-- **UI was compiled but not visually tested**, and the Windows named-pipe mpv code path was not
-  compiled here (Linux sandbox). Failover logic and the mpv IPC layer are tested on Linux against a
-  mock player and a fake mpv socket.
-- Language / quality / size / subtitle info is parsed from addon text (names, titles, flags,
-  filenames), so it is heuristic. Streams that don't state a size are not excluded by max size;
-  streams with unknown resolution are excluded when a minimum quality is set.
-- Only direct HTTP(S) streams (debrid + HTTP addons). Torrent info-hash, YouTube and external-URL
-  streams are skipped.
-- mpv runs in its own window (fullscreen). PlusFlix's window stays behind it with a "Playing" banner.
-- Next steps: gamepad/remote navigation, search page, Continue Watching row, bundled mpv.
