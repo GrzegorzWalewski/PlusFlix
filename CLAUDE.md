@@ -40,6 +40,7 @@ Play ──► session::run ──► best untried source ──► mpv (loadfil
 - `session` – failover loop (`session::run`): starts best source; on error, no start in 25 s, stall > 15 s, or premature EOF, loads the next best untried source into the same mpv instance at last position minus 3 s.
 - `player` – `Player` trait (session ↔ player interface); `mpv` implements it via mpv JSON IPC (Windows named pipe, Unix socket). mpv owns decoding/subtitles/OSD in its own fullscreen window.
 - `store` / `settings` – one JSON store under the OS config dir (`Reel/store.json`): up to 5 local profiles with favorites, progress, and per-profile settings (audio/subtitle language requirements, min quality, max size). Session key stored, never the password.
+- `i18n` – interface translations (`Translations::load(locale, dir)` from disk / `Translations::from_json` from JSON embedded in reel-app via `include_str!`). English is always loaded as fallback; missing keys fall back to it, and a total miss logs a warning and returns the key. Locale JSONs live in `crates/reel-app/locales/`; supported languages are the `LANGUAGES` table in `crates/reel-app/src/main.rs` (adding a language = new JSON file + one table row + one `include_str!`).
 
 ### Constraints
 

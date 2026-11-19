@@ -29,6 +29,10 @@ pub struct SessionConfig {
     /// Manual pick: try this candidate key first (user chose it from the
     /// sources list), then fall back to the normal best-untried flow.
     pub first_key: Option<String>,
+    /// Addons (by name) whose sources the first pick waits for: the session
+    /// only starts from one of these addons unless they deliver nothing
+    /// usable. Applies to the first pick only; failover stays ungated.
+    pub wait_addons: Vec<String>,
 }
 
 impl Default for SessionConfig {
@@ -41,6 +45,7 @@ impl Default for SessionConfig {
             premature_eof_secs: 30.0,
             max_attempts: 40,
             first_key: None,
+            wait_addons: Vec::new(),
         }
     }
 }
@@ -102,9 +107,25 @@ pub async fn run<P: Player>(
                 p
             } else {
                 let give_up_at = Instant::now() + cfg.no_source_timeout;
+                // Wait-gate: for the first pick, only sources from the
+                // toggled addons count until each of them is done loading.
+                let mut gated = !cfg.wait_addons.is_empty();
                 loop {
-                    if let Some(p) = pool.next_untried(settings) {
+                    let picked = if gated {
+                        cfg.wait_addons
+                            .iter()
+                            .find_map(|a| pool.next_untried_from(a, settings))
+                    } else {
+                        pool.next_untried(settings)
+                    };
+                    if let Some(p) = picked {
                         break p;
+                    }
+                    if gated && !cfg.wait_addons.iter().any(|a| pool.addon_pending(a)) {
+                        // Every gated addon finished with nothing usable:
+                        // lift the gate and fall back to all addons.
+                        gated = false;
+                        continue;
                     }
                     if !pool.is_loading() {
                         // Nothing left and nobody is going to deliver more.
@@ -439,12 +460,12 @@ mod tests {
     async fn late_arriving_sources_serve_as_backup() {
         // Only one (bad) source at first; a good one arrives later from a slow addon.
         let pool = pool_with(vec![stream("bad", "1080p")]);
-        pool.begin_tasks(1);
+        pool.begin_task("Slow");
         let late = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             late.add_streams("Slow", vec![stream("good", "720p")]);
-            late.task_done();
+            late.task_done("Slow");
         });
         let (mut player, loads) = MockPlayer::new(&[
             ("bad", Script::ErrorImmediately),
@@ -467,12 +488,12 @@ mod tests {
     async fn waits_for_sources_when_play_starts_before_any_loaded() {
         // Play clicked immediately: the pool is empty and every addon is still loading.
         let pool = SourcePool::new();
-        pool.begin_tasks(1);
+        pool.begin_task("Slow");
         let late = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             late.add_streams("Slow", vec![stream("good", "720p")]);
-            late.task_done();
+            late.task_done("Slow");
         });
         let (mut player, loads) = MockPlayer::new(&[("good", Script::PlayToEnd)]);
         let out = run(
@@ -493,7 +514,7 @@ mod tests {
         // The player dies while nothing has been loaded yet: the session must
         // end as Closed instead of timing out or failing every late source.
         let pool = SourcePool::new();
-        pool.begin_tasks(1); // loading forever, so the old wait loop would hang
+        pool.begin_task("Slow"); // loading forever, so the old wait loop would hang
         let (mut player, loads) = MockPlayer::new(&[("good", Script::PlayToEnd)]);
         let tx = player.tx.clone();
         tokio::spawn(async move {
@@ -557,6 +578,77 @@ mod tests {
         .await;
         assert_eq!(out, Outcome::NoSources);
         assert!(loads.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_gate_prefers_slow_toggled_addons_first_source() {
+        // Addon "B" delivers a good source immediately; the toggled addon "A"
+        // delivers a *worse* source 5 s later. The gate must wait for A and
+        // start with its source despite the worse ranking.
+        let pool = SourcePool::new();
+        // Both addons are loading; "B" keeps loading forever, but the gate
+        // only cares about "A".
+        pool.begin_task("B");
+        pool.begin_task("A");
+        let late = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            late.add_streams("A", vec![stream("fromA", "720p")]);
+            late.task_done("A");
+        });
+        let (mut player, loads) =
+            MockPlayer::new(&[("fromB", Script::PlayToEnd), ("fromA", Script::PlayToEnd)]);
+        // Deliver B's (better) source right away.
+        pool.add_streams("B", vec![stream("fromB", "1080p")]);
+
+        let cfg = SessionConfig {
+            wait_addons: vec!["A".into()],
+            ..Default::default()
+        };
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        assert_eq!(loads.lock().unwrap()[0].0, "fromA");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_gate_falls_back_when_toggled_addon_has_nothing() {
+        // Toggled addon "A" finishes without usable streams while "B" already
+        // has sources: the session must start on B without waiting out the clock.
+        let pool = SourcePool::new();
+        pool.begin_task("A");
+        let late = pool.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            late.task_done("A"); // no streams delivered
+        });
+        pool.add_streams("B", vec![stream("fromB", "1080p")]);
+        let (mut player, loads) = MockPlayer::new(&[("fromB", Script::PlayToEnd)]);
+        let cfg = SessionConfig {
+            wait_addons: vec!["A".into()],
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        assert_eq!(loads.lock().unwrap()[0].0, "fromB");
+        // Well before the 90 s no-source timeout.
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_pick_bypasses_wait_gate() {
+        // A toggled addon is still loading, but a manual pick starts right away.
+        let pool = pool_with(vec![stream("manual", "480p")]);
+        pool.begin_task("A");
+        let (mut player, loads) = MockPlayer::new(&[("manual", Script::PlayToEnd)]);
+        let cfg = SessionConfig {
+            first_key: Some("https://x/manual".into()),
+            wait_addons: vec!["A".into()],
+            ..Default::default()
+        };
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        assert_eq!(loads.lock().unwrap()[0].0, "manual");
     }
 
     #[tokio::test(start_paused = true)]

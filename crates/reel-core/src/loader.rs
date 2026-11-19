@@ -36,30 +36,30 @@ impl SourceLoader {
             .filter(|a| a.supports("subtitles", kind, video_id))
             .cloned()
             .collect();
-        pool.begin_tasks(stream_addons.len() + sub_addons.len());
-
         for addon in stream_addons {
             let (client, pool) = (client.clone(), pool.clone());
             let (kind, id) = (kind.to_owned(), video_id.to_owned());
+            pool.begin_task(addon.name());
             tasks.spawn(async move {
                 match timeout(ADDON_TIMEOUT, client.streams(&addon, &kind, &id)).await {
                     Ok(Ok(streams)) => pool.add_streams(addon.name(), streams),
                     Ok(Err(e)) => tracing::warn!("addon {} failed: {e}", addon.name()),
                     Err(_) => tracing::warn!("addon {} timed out", addon.name()),
                 }
-                pool.task_done();
+                pool.task_done(addon.name());
             });
         }
         for addon in sub_addons {
             let (client, pool) = (client.clone(), pool.clone());
             let (kind, id) = (kind.to_owned(), video_id.to_owned());
+            pool.begin_task(addon.name());
             tasks.spawn(async move {
                 match timeout(ADDON_TIMEOUT, client.subtitles(&addon, &kind, &id)).await {
                     Ok(Ok(subs)) => pool.add_subtitles(subs),
                     Ok(Err(e)) => tracing::warn!("subtitle addon {} failed: {e}", addon.name()),
                     Err(_) => tracing::warn!("subtitle addon {} timed out", addon.name()),
                 }
-                pool.task_done();
+                pool.task_done(addon.name());
             });
         }
         Self { tasks, pool }

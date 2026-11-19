@@ -93,7 +93,7 @@ pub struct Profile {
     pub watched: HashSet<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Store {
     #[serde(default)]
     pub auth: Option<AuthState>,
@@ -101,12 +101,44 @@ pub struct Store {
     pub profiles: Vec<Profile>,
     #[serde(default)]
     pub last_profile: Option<String>,
+    #[serde(default = "default_locale")]
+    pub locale: String,
+}
+
+pub fn migrate_store_path(old_path: &std::path::Path, new_path: &std::path::Path) -> std::io::Result<()> {
+    if old_path.exists() {
+        if let Some(parent) = new_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Ensure the new file doesn't exist before renaming to avoid errors on some platforms
+        if new_path.exists() {
+            std::fs::remove_file(new_path)?;
+        }
+        std::fs::rename(old_path, new_path)?;
+    }
+    Ok(())
 }
 
 pub fn default_path() -> PathBuf {
-    directories::ProjectDirs::from("", "", "Reel")
+    directories::ProjectDirs::from("", "", "PlusFlix")
         .map(|d| d.config_dir().join("store.json"))
-        .unwrap_or_else(|| PathBuf::from("reel-store.json"))
+        .unwrap_or_else(|| PathBuf::from("plusflix-store.json"))
+}
+
+
+fn default_locale() -> String {
+    "en".to_owned()
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            auth: None,
+            profiles: Vec::new(),
+            last_profile: None,
+            locale: "en".to_owned(),
+        }
+    }
 }
 
 impl Store {
@@ -447,5 +479,26 @@ mod tests {
         assert!(p.progress.contains_key("tt2"), "mid-way entry stays");
         p.unmark_watched("tt2");
         assert!(!p.is_watched("tt2"));
+    }
+
+    #[test]
+    fn store_locale_defaults_to_en() {
+        // Old store.json without a locale field must deserialise to "en".
+        let old = r#"{"profiles": [], "last_profile": null}"#;
+        let store: Store = serde_json::from_str(old).unwrap();
+        assert_eq!(store.locale, "en");
+
+        // Default construction also yields "en".
+        assert_eq!(Store::default().locale, "en");
+
+        // Round-trip: save and reload preserves the locale field.
+        let dir = std::env::temp_dir().join(format!("reel-store-locale-{}", std::process::id()));
+        let path = dir.join("store.json");
+        let mut s = Store::default();
+        s.locale = "pl".to_owned();
+        s.save(&path).unwrap();
+        let loaded = Store::load(&path).unwrap();
+        assert_eq!(loaded.locale, "pl");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

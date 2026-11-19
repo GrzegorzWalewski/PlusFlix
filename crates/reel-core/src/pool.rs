@@ -62,7 +62,8 @@ struct State {
     keys: HashSet<String>,
     tried: HashSet<String>,
     ext_subs: ExternalSubs,
-    pending: usize,
+    /// In-flight loader tasks per addon name.
+    pending: HashMap<String, usize>,
     not_playable: usize,
     seq: u64,
 }
@@ -101,28 +102,38 @@ impl SourcePool {
         self.tx.subscribe()
     }
 
-    /// Registers background tasks (addon requests) that will report back.
-    pub fn begin_tasks(&self, n: usize) {
-        self.lock().pending += n;
+    /// Registers one background task (addon request) that will report back.
+    pub fn begin_task(&self, addon: &str) {
+        *self.lock().pending.entry(addon.to_owned()).or_insert(0) += 1;
         self.bump();
     }
 
-    pub fn task_done(&self) {
+    pub fn task_done(&self, addon: &str) {
         {
             let mut st = self.lock();
-            st.pending = st.pending.saturating_sub(1);
+            if let Some(n) = st.pending.get_mut(addon) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    st.pending.remove(addon);
+                }
+            }
         }
         self.bump();
     }
 
+    /// True while the addon still has in-flight loader tasks.
+    pub fn addon_pending(&self, addon: &str) -> bool {
+        self.lock().pending.contains_key(addon)
+    }
+
     /// Called when loading is abandoned (loader dropped) so waiters don't hang.
     pub fn cancel_pending(&self) {
-        self.lock().pending = 0;
+        self.lock().pending.clear();
         self.bump();
     }
 
     pub fn is_loading(&self) -> bool {
-        self.lock().pending > 0
+        !self.lock().pending.is_empty()
     }
 
     pub fn add_streams(&self, addon: &str, streams: Vec<Stream>) {
@@ -174,9 +185,22 @@ impl SourcePool {
 
     /// Best candidate that passes the profile's filters and has not been tried yet.
     pub fn next_untried(&self, settings: &Settings) -> Option<Pick> {
+        self.best_untried(settings, None)
+    }
+
+    /// Best untried candidate coming only from `addon` (for the wait-gate).
+    pub fn next_untried_from(&self, addon: &str, settings: &Settings) -> Option<Pick> {
+        self.best_untried(settings, Some(addon))
+    }
+
+    fn best_untried(&self, settings: &Settings, addon: Option<&str>) -> Option<Pick> {
         let st = self.lock();
         let mut best: Option<(crate::select::Rank, &Candidate)> = None;
-        for c in st.candidates.iter().filter(|c| !st.tried.contains(&c.key)) {
+        for c in st
+            .candidates
+            .iter()
+            .filter(|c| addon.is_none_or(|a| c.addon == a) && !st.tried.contains(&c.key))
+        {
             let Ok(rank) = evaluate(&c.info, settings, &st.ext_subs) else {
                 continue;
             };
@@ -248,7 +272,7 @@ impl SourcePool {
         let mut stats = PoolStats {
             total: st.candidates.len(),
             not_playable: st.not_playable,
-            pending_tasks: st.pending,
+            pending_tasks: st.pending.values().sum(),
             ..Default::default()
         };
         for c in &st.candidates {
@@ -386,10 +410,45 @@ mod tests {
     fn loading_state() {
         let pool = SourcePool::new();
         assert!(!pool.is_loading());
-        pool.begin_tasks(2);
-        pool.task_done();
+        pool.begin_task("A");
+        pool.begin_task("B");
         assert!(pool.is_loading());
-        pool.cancel_pending();
+        pool.task_done("A");
+        assert!(!pool.addon_pending("A"));
+        assert!(pool.addon_pending("B"));
+        pool.task_done("B");
         assert!(!pool.is_loading());
+        pool.begin_task("C");
+        pool.cancel_pending();
+        assert!(!pool.addon_pending("C"));
+        assert!(!pool.is_loading());
+    }
+
+    #[test]
+    fn addon_pending_tracks_addons_independently() {
+        let pool = SourcePool::new();
+        pool.begin_task("A");
+        pool.begin_task("A");
+        assert_eq!(pool.stats(&Settings::default()).pending_tasks, 2);
+        pool.task_done("A");
+        assert!(pool.addon_pending("A"));
+        pool.task_done("A");
+        assert!(!pool.addon_pending("A"));
+    }
+
+    #[test]
+    fn next_untried_from_ignores_other_addons_candidates() {
+        let pool = SourcePool::new();
+        pool.add_streams("A", vec![http_stream("https://x/a", "1080p")]);
+        pool.add_streams("B", vec![http_stream("https://x/b", "2160p")]);
+        let s = Settings::default();
+        // Pool-wide pick prefers B's better source.
+        assert_eq!(pool.next_untried(&s).unwrap().candidate.url, "https://x/b");
+        // Restricted pick only considers A's candidates.
+        assert_eq!(
+            pool.next_untried_from("A", &s).unwrap().candidate.url,
+            "https://x/a"
+        );
+        assert!(pool.next_untried_from("Missing", &s).is_none());
     }
 }

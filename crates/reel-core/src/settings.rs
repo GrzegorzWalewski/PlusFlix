@@ -89,6 +89,9 @@ pub struct Settings {
     pub max_filesize_gb: Option<f64>,
     /// Which external player to use.
     pub player: PlayerKind,
+    /// Addons (by manifest id) whose sources are waited for before the first
+    /// playback start, even when other addons deliver earlier.
+    pub wait_for_addons: Vec<String>,
 }
 
 impl Default for Settings {
@@ -101,6 +104,7 @@ impl Default for Settings {
             min_quality: Quality::Unknown,
             max_filesize_gb: None,
             player: PlayerKind::default(),
+            wait_for_addons: Vec::new(),
         }
     }
 }

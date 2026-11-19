@@ -197,12 +197,7 @@ export component MainWindow inherits Window {
     // ---- app state ----
     in-out property <string> screen: "login"; // login | profiles | main
     in-out property <string> page: "home"; // home | movies | series | favorites | search | settings
-    property <[NavTab]> nav-tabs: [
-        { label: "Home", page: "home" },
-        { label: "Movies", page: "movies" },
-        { label: "Series", page: "series" },
-        { label: "Favorites", page: "favorites" },
-    ];
+    in property <[NavTab]> nav-tabs;
     in property <[RowData]> rows;
     in property <[Item]> favorites;
     in property <[ProfileData]> profiles;
@@ -246,6 +241,14 @@ export component MainWindow inherits Window {
     in-out property <bool> player-menu-open: false;
     in property <[string]> player-names;
 
+    // ---- interface language ----
+    in-out property <string> app-language: "en";
+    in-out property <string> app-language-name: "English";
+    // 0 = English, 1 = Polski (Select index of the language dropdown)
+    in-out property <int> language-idx;
+    // Language dropdown entries; filled from the Rust LANGUAGES table.
+    in property <[string]> language-names: [ "English", "Polski" ];
+
     // ---- profile picker / edit ----
     in-out property <bool> manage-profiles: false;
     in-out property <bool> edit-open: false;
@@ -272,7 +275,35 @@ export component MainWindow inherits Window {
     in-out property <int> player-idx;
     // Settings auto-save guard: true while the values are being filled in.
     in-out property <bool> settings-loading: true;
-    property <[string]> subreq-cards: [ "Required", "If audio differs", "Not required" ];
+    in property <[string]> subreq-cards;
+    in property <[string]> audio-mode-names;
+
+    // Translated settings-page strings (set from Rust via Translations).
+    in property <string> t-playback-prefix;
+    in property <string> t-audio;
+    in property <string> t-pref-audio-label;
+    in property <string> t-pref-audio-hint;
+    in property <string> t-audio-req-label;
+    in property <string> t-audio-req-hint;
+    in property <string> t-subtitles;
+    in property <string> t-sub-lang-label;
+    in property <string> t-sub-req-label;
+    in property <string> t-sub-req-hint;
+    in property <string> t-quality;
+    in property <string> t-minq-label;
+    in property <string> t-minq-hint;
+    in property <string> t-maxsize-label;
+    in property <string> t-maxsize-hint;
+    in property <string> t-maxsize-placeholder;
+    in property <string> t-player-label;
+    in property <string> t-player-hint;
+    in property <string> t-language;
+    in property <string> t-iface-lang-label;
+    in property <string> t-iface-lang-hint;
+    in property <string> t-addons-prefix;
+    in property <string> t-addons-disclaimer;
+    in property <string> t-refresh;
+    in property <string> t-refreshing;
 
     callback login(string, string);
     callback logout();
@@ -297,6 +328,7 @@ export component MainWindow inherits Window {
     callback save-settings();
     callback refresh-addons();
     callback search(string);
+    callback language-changed(int); // new language dropdown index
 
     // Auto-save: any control change after the initial fill saves once, and
     // the Rust side shows the "Saved" toast.
@@ -312,6 +344,11 @@ export component MainWindow inherits Window {
     changed minq-idx => { root.settings-changed(); }
     changed max-size => { root.settings-changed(); }
     changed player-idx => { root.settings-changed(); }
+    // Language switching is handled by the language-changed callback (persist +
+    // reload translations), not by the settings auto-save.
+    changed language-idx => {
+        root.language-changed(root.language-idx);
+    }
 
     // ================= login =================
     if root.screen == "login": Rectangle {
@@ -827,18 +864,18 @@ export component MainWindow inherits Window {
                     padding-bottom: Theme.sp-12;
                     spacing: Theme.sp-4;
                     Text {
-                        text: "Playback settings for " + root.profile-name;
+                        text: root.t-playback-prefix + root.profile-name;
                         font-size: Theme.fs-title;
                         font-weight: 800;
                         color: Theme.text;
                     }
                     SettingsCard {
-                        title: "Audio";
+                        title: root.t-audio;
                         VerticalLayout {
                             spacing: Theme.sp-4;
                             SettingsRow {
-                                label: "Preferred audio language";
-                                helper: "Sources matching it rank first.";
+                                label: root.t-pref-audio-label;
+                                helper: root.t-pref-audio-hint;
                                 Select {
                                     model: root.lang-names;
                                     current-index <=> root.audio-idx;
@@ -846,10 +883,10 @@ export component MainWindow inherits Window {
                                 }
                             }
                             SettingsRow {
-                                label: "Requirement";
-                                helper: "Must only allows sources with that audio.";
+                                label: root.t-audio-req-label;
+                                helper: root.t-audio-req-hint;
                                 SegmentedControl {
-                                    model: [ "Prefer", "Must" ];
+                                    model: root.audio-mode-names;
                                     current-index <=> root.audio-mode-idx;
                                     compact: true;
                                 }
@@ -857,11 +894,11 @@ export component MainWindow inherits Window {
                         }
                     }
                     SettingsCard {
-                        title: "Subtitles";
+                        title: root.t-subtitles;
                         VerticalLayout {
                             spacing: Theme.sp-4;
                             SettingsRow {
-                                label: "Subtitle language";
+                                label: root.t-sub-lang-label;
                                 helper: "";
                                 Select {
                                     model: root.lang-names;
@@ -870,8 +907,8 @@ export component MainWindow inherits Window {
                                 }
                             }
                             SettingsRow {
-                                label: "Requirement";
-                                helper: "Only applies when a language is chosen.";
+                                label: root.t-sub-req-label;
+                                helper: root.t-sub-req-hint;
                                 VerticalLayout {
                                     spacing: Theme.sp-2;
                                     width: 300px * Theme.scale;
@@ -913,12 +950,12 @@ export component MainWindow inherits Window {
                         }
                     }
                     SettingsCard {
-                        title: "Quality & size";
+                        title: root.t-quality;
                         VerticalLayout {
                             spacing: Theme.sp-4;
                             SettingsRow {
-                                label: "Minimum quality";
-                                helper: "Sources below it are hidden.";
+                                label: root.t-minq-label;
+                                helper: root.t-minq-hint;
                                 Select {
                                     model: root.quality-names;
                                     current-index <=> root.minq-idx;
@@ -926,12 +963,12 @@ export component MainWindow inherits Window {
                                 }
                             }
                             SettingsRow {
-                                label: "Maximum file size (GB)";
-                                helper: "Empty = no limit.";
+                                label: root.t-maxsize-label;
+                                helper: root.t-maxsize-hint;
                                 TextField {
                                     width: 140px * Theme.scale;
                                     text <=> root.max-size;
-                                    placeholder-text: "e.g. 12";
+                                    placeholder-text: root.t-maxsize-placeholder;
                                 }
                             }
                         }
@@ -941,11 +978,26 @@ export component MainWindow inherits Window {
                         VerticalLayout {
                             spacing: Theme.sp-4;
                             SettingsRow {
-                                label: "Preferred player";
-                                helper: "Used by the Play button.";
+                                label: root.t-player-label;
+                                helper: root.t-player-hint;
                                 SegmentedControl {
                                     model: root.player-names;
                                     current-index <=> root.player-idx;
+                                }
+                            }
+                        }
+                    }
+                    SettingsCard {
+                        title: root.t-language;
+                        VerticalLayout {
+                            spacing: Theme.sp-4;
+                            SettingsRow {
+                                label: root.t-iface-lang-label;
+                                helper: root.t-iface-lang-hint;
+                                Select {
+                                    model: root.language-names;
+                                    current-index <=> root.language-idx;
+                                    width: 240px * Theme.scale;
                                 }
                             }
                         }
@@ -954,7 +1006,7 @@ export component MainWindow inherits Window {
                         spacing: Theme.sp-3;
                         alignment: start;
                         sh-addons := SectionHeader {
-                            title: "Addons (" + root.addons.length + ")";
+                            title: root.t-addons-prefix + root.addons.length + ")";
                         }
                         Rectangle {
                             height: sh-addons.title-height;
@@ -962,7 +1014,7 @@ export component MainWindow inherits Window {
                             Button {
                                 x: Theme.sp-4;
                                 y: (parent.height - self.height) / 2;
-                                text: root.refreshing-addons ? "Refreshing…" : "Refresh";
+                                text: root.refreshing-addons ? root.t-refreshing : root.t-refresh;
                                 icon: @image-url("icons/rotate-cw.svg");
                                 has-icon: true;
                                 disabled: root.refreshing-addons;
@@ -973,7 +1025,7 @@ export component MainWindow inherits Window {
                         }
                     }
                     Text {
-                        text: "Installed in your Stremio account. Only addons that provide direct HTTP(S) streams can play.";
+                        text: root.t-addons-disclaimer;
                         color: Theme.muted;
                         font-size: Theme.fs-caption;
                     }

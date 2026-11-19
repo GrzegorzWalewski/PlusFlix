@@ -21,6 +21,10 @@ dir (`Reel/store.json`). Your Stremio password is never stored, only the session
 - Up to 5 local profiles, each with its own favorites, watch progress and settings
 - Continue Watching row on Home: local progress plus entries synced from the account's
   Stremio library (`datastoreGet` on `libraryItem`, same rule Stremio uses)
+- Interface language switcher (Settings → Language): English and Polski, applied immediately
+  without restart; the choice is persisted in the store. Locale files live in
+  `crates/reel-app/locales/` (`en.json`, `pl.json`); see `README.md` there for adding a new
+  language. Missing keys fall back to English.
 - Per-profile settings: player (mpv / VLC), audio language (prefer / must), subtitles language, subtitles requirement
   (required / required only if audio isn't the preferred language / not required), minimum
   quality, maximum file size

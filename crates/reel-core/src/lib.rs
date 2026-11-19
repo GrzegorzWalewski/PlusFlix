@@ -2,6 +2,7 @@
 //! No UI code lives here, so the whole playback logic is testable headlessly.
 
 pub mod addon;
+pub mod i18n;
 pub mod error;
 pub mod home;
 pub mod lang;
@@ -19,3 +20,4 @@ pub mod stremio;
 pub mod vlc;
 
 pub use error::{Error, Result};
+pub use i18n::Translations;

@@ -17,6 +17,7 @@ use reel_core::store::{
     self, Favorite, Profile, ProgressCard, Store, MAX_PROFILES, PROFILE_COLORS, PROFILE_ICONS,
 };
 use reel_core::stremio::StremioApi;
+use reel_core::Translations;
 use reel_core::vlc::{VlcConfig, VlcPlayer};
 use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel, Weak,
@@ -130,6 +131,11 @@ struct App {
     ui: Weak<MainWindow>,
     store_path: PathBuf,
     store: Mutex<Store>,
+    /// Loaded translations for the current interface language.
+    translations: Mutex<Translations>,
+    /// Set while `apply_language` syncs the language dropdown index
+    /// programmatically, so the `language-changed` callback is ignored.
+    syncing_language_selector: AtomicBool,
     api: StremioApi,
     client: AddonClient,
     addons: Mutex<Vec<Addon>>,
@@ -2109,6 +2115,8 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
         app.flash("Max file size must be a positive number of GB.");
         return;
     }
+    // Field not (yet) exposed in the UI: keep the stored value.
+    let wait_for_addons = app.profile_settings().wait_for_addons;
     let settings = Settings {
         audio_language: lang_from_index(ui.get_audio_idx()),
         language_mode: if ui.get_audio_mode_idx() == 1 {
@@ -2126,6 +2134,7 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
             .copied()
             .unwrap_or_default(),
         max_filesize_gb,
+        wait_for_addons,
         player: match ui.get_player_idx() {
             1 => PlayerKind::Vlc,
             _ => PlayerKind::Mpv,
@@ -2136,6 +2145,167 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
     }
     app.save();
     app.flash("Settings saved.");
+}
+
+// ---------------------------------------------------------------- language
+
+/// The single supported-languages table: (locale code, display name).
+/// Drives the language dropdown model and the locale<->index mapping.
+const LANGUAGES: &[(&str, &str)] = &[("en", "English"), ("pl", "Polski")];
+
+/// Embedded English locale JSON, used as the fallback for every locale.
+const EN_LOCALE_JSON: &str = include_str!("../locales/en.json");
+
+/// Embedded locale JSON for a supported code; `None` for unknown codes.
+/// Adding a locale = one `include_str!` arm here + one row in `LANGUAGES`.
+fn locale_json(code: &str) -> Option<&'static str> {
+    match code {
+        "en" => Some(EN_LOCALE_JSON),
+        "pl" => Some(include_str!("../locales/pl.json")),
+        _ => None,
+    }
+}
+
+/// Load translations for `locale` from the embedded locale JSONs, falling
+/// back to English for unknown or unparsable locales.
+fn load_translations(locale: &str) -> Translations {
+    match locale_json(locale).map(|json| Translations::from_json(json, EN_LOCALE_JSON)) {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => {
+            tracing::warn!("could not parse translations for {locale}: {e}");
+            Translations::from_json(EN_LOCALE_JSON, EN_LOCALE_JSON)
+                .expect("bundled locales/en.json must parse")
+        }
+        None => {
+            tracing::warn!("unknown locale {locale:?}, falling back to English");
+            Translations::from_json(EN_LOCALE_JSON, EN_LOCALE_JSON)
+                .expect("bundled locales/en.json must parse")
+        }
+    }
+}
+
+/// Display name of a locale code for the language dropdown.
+fn language_display_name(code: &str) -> &'static str {
+    LANGUAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, name)| *name)
+        .unwrap_or("English")
+}
+
+/// Language dropdown index for a locale code; unknown codes map to English (0).
+fn locale_to_index(code: &str) -> i32 {
+    LANGUAGES
+        .iter()
+        .position(|(c, _)| *c == code)
+        .map(|i| i as i32)
+        .unwrap_or(0)
+}
+
+/// Locale code for a language dropdown index; out-of-range maps to "en".
+fn index_to_locale(idx: usize) -> String {
+    LANGUAGES
+        .get(idx)
+        .map(|(code, _)| (*code).to_owned())
+        .unwrap_or_else(|| "en".to_owned())
+}
+
+/// Translated string for `key` under the currently loaded translations.
+fn tr(app: &App, key: &str) -> String {
+    lock(&app.translations).t(key)
+}
+
+/// Pushes the locale and every translated UI string into the Slint properties.
+/// Called at startup and after each language switch.
+fn apply_language(app: &Arc<App>) {
+    let locale = lock(&app.store).locale.clone();
+    let name = language_display_name(&locale).to_owned();
+    let idx = locale_to_index(&locale);
+    let names: Vec<slint::SharedString> = LANGUAGES
+        .iter()
+        .map(|(_, name)| (*name).into())
+        .collect();
+    let nav = [
+        ("nav_home", "home"),
+        ("nav_movies", "movies"),
+        ("nav_series", "series"),
+        ("nav_favorites", "favorites"),
+    ]
+    .map(|(key, page)| NavTab {
+        label: tr(app, key).into(),
+        page: page.into(),
+    })
+    .to_vec();
+    let app2 = app.clone();
+    app.ui(move |ui| {
+        ui.set_app_language(locale.into());
+        ui.set_app_language_name(name.into());
+        // Programmatic index sync: guard so it cannot re-enter
+        // `language_changed` through the `changed language-idx` handler.
+        app2.syncing_language_selector
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ui.set_language_idx(idx);
+        app2.syncing_language_selector
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        ui.set_language_names(ModelRc::new(VecModel::from(names)));
+        ui.set_nav_tabs(ModelRc::new(VecModel::from(nav)));
+        ui.set_t_playback_prefix(tr(&app2, "playback_settings_prefix").into());
+        ui.set_t_audio(tr(&app2, "audio_section").into());
+        ui.set_t_pref_audio_label(tr(&app2, "preferred_audio_language_label").into());
+        ui.set_t_pref_audio_hint(tr(&app2, "preferred_audio_language_hint").into());
+        ui.set_t_audio_req_label(tr(&app2, "audio_requirement_label").into());
+        ui.set_t_audio_req_hint(tr(&app2, "audio_requirement_hint").into());
+        ui.set_audio_mode_names(ModelRc::new(VecModel::from(vec![
+            tr(&app2, "audio_prefer").into(),
+            tr(&app2, "audio_must").into(),
+        ])));
+        ui.set_t_subtitles(tr(&app2, "subtitles_section").into());
+        ui.set_t_sub_lang_label(tr(&app2, "subtitle_language_label").into());
+        ui.set_t_sub_req_label(tr(&app2, "subtitle_requirement_label").into());
+        ui.set_t_sub_req_hint(tr(&app2, "subtitle_requirement_hint").into());
+        ui.set_subreq_cards(ModelRc::new(VecModel::from(vec![
+            tr(&app2, "subtitle_req_required").into(),
+            tr(&app2, "subtitle_req_if_audio_differs").into(),
+            tr(&app2, "subtitle_req_not_required").into(),
+        ])));
+        ui.set_t_quality(tr(&app2, "quality_section").into());
+        ui.set_t_minq_label(tr(&app2, "min_quality_label").into());
+        ui.set_t_minq_hint(tr(&app2, "min_quality_hint").into());
+        ui.set_t_maxsize_label(tr(&app2, "max_filesize_label").into());
+        ui.set_t_maxsize_hint(tr(&app2, "max_filesize_hint").into());
+        ui.set_t_maxsize_placeholder(tr(&app2, "max_filesize_placeholder").into());
+        ui.set_t_player_label(tr(&app2, "preferred_player_label").into());
+        ui.set_t_player_hint(tr(&app2, "preferred_player_hint").into());
+        ui.set_t_language(tr(&app2, "language_section").into());
+        ui.set_t_iface_lang_label(tr(&app2, "interface_language_label").into());
+        ui.set_t_iface_lang_hint(tr(&app2, "interface_language_hint").into());
+        ui.set_t_addons_prefix(tr(&app2, "addons_section_prefix").into());
+        ui.set_t_addons_disclaimer(tr(&app2, "addons_disclaimer").into());
+        ui.set_t_refresh(tr(&app2, "refresh").into());
+        ui.set_t_refreshing(tr(&app2, "refreshing").into());
+    });
+}
+
+/// `language-changed` from the Settings dropdown: persist the locale in the
+/// store, reload the translations and re-apply every translated string.
+/// `idx` is the new language dropdown index.
+fn language_changed(app: &Arc<App>, idx: usize) {
+    // Ignore callbacks fired by `apply_language`'s programmatic index sync.
+    if app
+        .syncing_language_selector
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    let locale = index_to_locale(idx);
+    // Same-locale check against the active app state, not just the store file.
+    if lock(&app.store).locale == locale {
+        return;
+    }
+    lock(&app.store).locale = locale.clone();
+    app.save();
+    *lock(&app.translations) = load_translations(&locale);
+    apply_language(app);
 }
 
 // ---------------------------------------------------------------- wiring
@@ -2280,6 +2450,8 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     ui.on_refresh_addons(move || refresh_addons_ui(&a));
     let a = app.clone();
     ui.on_search(move |q| do_search(&a, q.to_string()));
+    let a = app.clone();
+    ui.on_language_changed(move |idx| language_changed(&a, idx as usize));
 }
 
 fn startup(app: &Arc<App>) {
@@ -2315,6 +2487,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("ignoring unreadable store {}: {e}", store_path.display());
         Store::default()
     });
+    // Interface translations: the locale from the store, falling back to
+    // English if unknown/broken (all locale files are embedded at compile time).
+    let translations = load_translations(&store.locale);
 
     let ui = MainWindow::new()?;
     #[cfg(target_family = "windows")]
@@ -2324,6 +2499,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui: ui.as_weak(),
         store_path,
         store: Mutex::new(store),
+        translations: Mutex::new(translations),
+        syncing_language_selector: AtomicBool::new(false),
         api: StremioApi::new(client.http().clone()),
         client,
         addons: Mutex::new(Vec::new()),
@@ -2339,6 +2516,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         poster_slots: Semaphore::new(8),
     });
     wire(&ui, &app);
+    apply_language(&app);
     // REEL_DEBUG_LAYOUT=1: draw outlines around buttons/inputs and their icons
     // so centering offsets are visible in screenshots.
     if std::env::var("REEL_DEBUG_LAYOUT").is_ok_and(|v| v == "1") {
