@@ -41,12 +41,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 // ---------------------------------------------------------------- dark title bar
 
-/// Apply a dark title bar to the main window (Windows only). Best-effort: the
-/// window is created by winit when `run()` is called, so a background thread
-/// polls for it and sets `DWMWA_USE_IMMERSIVE_DARK_MODE` once it exists.
+/// Apply a dark title bar and the app icon to the main window (Windows only).
+/// Best-effort: the window is created by winit when `run()` is called, so a
+/// background thread polls for it and sets `DWMWA_USE_IMMERSIVE_DARK_MODE`
+/// plus `WM_SETICON` (from the exe's icon resource) once it exists.
 #[cfg(target_family = "windows")]
 fn enable_dark_title_bar() {
     use std::os::raw::c_void;
+    use std::ptr::null;
 
     extern "system" {
         fn EnumWindows(
@@ -57,6 +59,9 @@ fn enable_dark_title_bar() {
         fn GetWindowTextLengthW(hwnd: isize) -> i32;
         fn IsWindowVisible(hwnd: isize) -> i32;
         fn DwmSetWindowAttribute(hwnd: isize, attr: u32, value: *const c_void, size: u32) -> i32;
+        fn GetModuleHandleW(name: *const u16) -> isize;
+        fn LoadIconW(instance: isize, name: *const u16) -> isize;
+        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
     }
 
     static TARGET_PID: AtomicU32 = AtomicU32::new(0);
@@ -86,6 +91,19 @@ fn enable_dark_title_bar() {
                 let on: i32 = 1; // DWMWA_USE_IMMERSIVE_DARK_MODE = 20
                 unsafe {
                     DwmSetWindowAttribute(hwnd, 20, &on as *const i32 as *const c_void, 4);
+                }
+                // Title bar + taskbar icon: load the first icon resource from
+                // the exe (the one embedded by winresource in build.rs) and
+                // send WM_SETICON (small = 0, big = 1).
+                unsafe {
+                    let hinst = GetModuleHandleW(null());
+                    if hinst != 0 {
+                        let icon = LoadIconW(hinst, 1 as *const u16);
+                        if icon != 0 {
+                            SendMessageW(hwnd, 0x0080 /* WM_SETICON */, 0 /* ICON_SMALL */, icon);
+                            SendMessageW(hwnd, 0x0080, 1 /* ICON_BIG */, icon);
+                        }
+                    }
                 }
                 return;
             }
