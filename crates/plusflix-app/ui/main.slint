@@ -2,10 +2,30 @@
 // design values come from theme.slint.
 import { Theme } from "theme.slint";
 export { Theme }
+export { TooltipState }
+
+// Plural form index for a count, per the Polish rules:
+//   0 = one   (n == 1)
+//   1 = few   (n % 10 in 2..4 and not n % 100 in 12..14)
+//   2 = many  (everything else)
+// English uses form 0 for n == 1 and form 2 otherwise (its _few keys hold the
+// same text as _many so the same expression works in every locale). Select the
+// noun key with this form wherever a count is composed into a sentence in
+// Slint (see the sources summary); Rust-side strings use `plural_suffix`.
+export global PluralForm {
+    pure public function form(n: int) -> int {
+        if (n == 1) { return 0; }
+        if (mod(n, 10) >= 2 && mod(n, 10) <= 4
+            && !(mod(n, 100) >= 12 && mod(n, 100) <= 14)) {
+            return 1;
+        }
+        return 2;
+    }
+}
 import {
     Item, ProfileIcon, IconLabel, IconButton, Button, TextField, Select,
     Switch, SegmentedControl, Chip, ProgressBar, PosterCard, CwCard,
-    Avatar, VScroll, SearchField, SectionHeader,
+    Avatar, VScroll, SearchField, SectionHeader, TooltipLayer, TooltipState,
 } from "components.slint";
 // ListView is the only std-widget used: it is the virtualized list that keeps
 // hundreds of grid rows smooth (all visible components stay custom).
@@ -47,16 +67,22 @@ export struct AddonData {
     waited: bool,
 }
 
+// One row of the detail-popup sources list. `status-code` selects the row
+// text in Slint: 0 = Ready, 1 = Tried, 2 = Hidden by the profile settings;
+// `reason` is the hidden-reason code (see the reject_* keys), 0 = none.
 export struct SourceRowData {
     key: string,
     label: string,
-    status: string,
-    ok: bool,
+    status-code: int,
+    reason: int,
 }
 
 // One horizontal catalog row with header, edge fades and scroll chevrons.
 component CatalogRow inherits Rectangle {
     in property <RowData> data;
+    // Translated scroll-chevron tooltips (routed through, never literals).
+    in property <string> t-scroll-left;
+    in property <string> t-scroll-right;
     callback open(string, string);
     callback remove(string);
     callback toggle-favorite(string, string, string, string); // id, kind, name, poster-url
@@ -88,7 +114,7 @@ component CatalogRow inherits Rectangle {
             x: Theme.sp-1;
             y: (parent.height - self.height) / 2;
             icon: @image-url("icons/chevron-left.svg");
-            tooltip: "Scroll left";
+            tooltip: root.t-scroll-left;
             clicked => {
                 row-scroll.content-x = min(0px, row-scroll.content-x + parent.width);
             }
@@ -104,7 +130,7 @@ component CatalogRow inherits Rectangle {
             x: parent.width - self.width - Theme.sp-1;
             y: (parent.height - self.height) / 2;
             icon: @image-url("icons/chevron-right.svg");
-            tooltip: "Scroll right";
+            tooltip: root.t-scroll-right;
             clicked => {
                 row-scroll.content-x = max(row-scroll.width - row-scroll.content-width, row-scroll.content-x - parent.width);
             }
@@ -261,6 +287,49 @@ export component MainWindow inherits Window {
     in property <string> t-no-genre-prefix;
     in property <string> t-no-genre-suffix;
 
+    // Translated general UI strings (set from Rust via Translations; the
+    // scan test fails on any literal not routed through one of these).
+    in property <string> t-sign-in;
+    in property <string> t-sign-in-subtitle;
+    in property <string> t-signing-in;
+    in property <string> t-email-placeholder;
+    in property <string> t-password-placeholder;
+    in property <string> t-whos-watching;
+    in property <string> t-manage-profiles;
+    in property <string> t-done;
+    in property <string> t-edit-or-delete-profiles;
+    in property <string> t-log-out;
+    in property <string> t-log-out-tooltip;
+    in property <string> t-switch-profile;
+    in property <string> t-add-profile;
+    in property <string> t-add-profile-heading;
+    in property <string> t-edit-profile-heading;
+    in property <string> t-edit-profile-prefix;
+    in property <string> t-switch-to-profile-prefix;
+    in property <string> t-profile-name-label;
+    in property <string> t-profile-name-placeholder;
+    in property <string> t-profile-icon-label;
+    in property <string> t-profile-colour-label;
+    in property <string> t-save;
+    in property <string> t-delete;
+    in property <string> t-really-delete;
+    in property <string> t-yes-delete;
+    in property <string> t-keep;
+    in property <string> t-close;
+    in property <string> t-loading;
+    in property <string> t-nothing-to-show-hint;
+    in property <string> t-searching;
+    in property <string> t-no-results-hint;
+    in property <string> t-no-favorites-hint;
+    in property <string> t-favorites-title;
+    in property <string> t-search-title;
+    in property <string> t-search-placeholder;
+    in property <string> t-settings-tooltip;
+    in property <string> t-scroll-left;
+    in property <string> t-scroll-right;
+    in property <string> t-player-section;
+    in property <string> t-app-name;
+
     callback genre-chosen(string);      // "" = clear / "All genres"
     // Genre chip clicked in the detail overlay: (canonical) genre name.
     callback detail-genre-chosen(string);
@@ -286,15 +355,101 @@ export component MainWindow inherits Window {
     in-out property <int> season-idx;
     in property <[EpisodeData]> episodes;
     in property <string> selected-episode;
-    in property <string> sources-summary;
-    // "loading" | "ready" | "none" | "hidden"
+    // Sources summary text, composed here (in Slint) from the raw counts and
+    // the t-sources-* keys — never a sentence built on the Rust side.
+    property <string> sources-summary:
+        root.sources-total == 0
+            ? (root.sources-state == "loading"
+                ? root.t-searching-sources
+                : root.t-no-playable-yet)
+        : root.sources-usable == 0 && root.sources-state != "loading"
+            ? root.t-sources-none-prefix + root.sources-hidden + root.t-sources-none-suffix
+        : root.sources-usable
+            + " "
+            + (PluralForm.form(root.sources-usable) == 0 ? root.t-source-noun-one
+                : PluralForm.form(root.sources-usable) == 1 ? root.t-source-noun-few
+                : root.t-source-noun-many)
+            + (root.sources-hidden > 0
+                ? root.t-sources-hidden-prefix + root.sources-hidden
+                : "")
+            + (root.sources-state == "loading" ? root.t-sources-searching-suffix : "");
+    // "loading" | "ready" | "none"
     in property <string> sources-state;
     in property <[SourceRowData]> source-rows;
     in-out property <bool> sources-open;
+    // Raw counts for the sources summary chip: the sentence is composed in
+    // Slint from the t-sources-* keys (DATA, not sentences, is pushed).
+    in property <int> sources-total;
+    in property <int> sources-usable;
+    in property <int> sources-hidden;
+    // Translated sources strings (summary chip + source rows).
+    in property <string> t-searching-sources;
+    in property <string> t-no-playable-yet;
+    in property <string> t-sources-none-prefix;
+    in property <string> t-sources-none-suffix;
+    in property <string> t-source-noun-one;
+    in property <string> t-source-noun-few;
+    in property <string> t-source-noun-many;
+    in property <string> t-sources-hidden-prefix;
+    in property <string> t-sources-searching-suffix;
+    in property <string> t-source-ready;
+    in property <string> t-source-tried;
+    in property <string> t-hidden-prefix;
+    in property <string> t-reject-quality;
+    in property <string> t-reject-size;
+    in property <string> t-reject-audio;
+    in property <string> t-reject-subs;
 
     // ---- playback ----
     in property <bool> playing;
-    in property <string> play-status;
+    // Play status composed here (in Slint) from the t-play-* keys plus the
+    // raw data pushed by Rust: state enum, source label, switch attempt
+    // number and failure reason. Never a sentence built on the Rust side.
+    // state: 0 none, 1 starting (first attempt), 2 switching source,
+    //        3 playing, 4 skipped, 5 failed, 6 waiting for sources,
+    //        7 starting the player
+    in property <int> play-state: 0;
+    in property <string> play-label: "";
+    in property <int> play-attempt: 1;
+    in property <string> play-reason: "";
+    property <string> play-status-line:
+        root.play-state == 1 ? root.t-play-starting-prefix + root.play-label
+        : root.play-state == 2
+            ? root.t-play-switching-prefix + root.play-attempt + root.t-play-switching-mid + root.play-label
+        : root.play-state == 3 ? root.t-playing-prefix + root.play-label
+        : root.play-state == 4 ? root.t-skipped-prefix + root.play-label + root.t-skipped-suffix
+        : root.play-state == 5
+            ? root.t-play-failed-prefix + root.play-label + " (" + root.play-reason + ")"
+        : root.play-state == 6 ? root.t-waiting-sources
+        : root.play-state == 7 ? root.t-starting-player
+        : "";
+    // Translated playback strings.
+    in property <string> t-starting-player;
+    in property <string> t-play-starting-prefix;
+    in property <string> t-play-switching-prefix;
+    in property <string> t-play-switching-mid;
+    in property <string> t-playing-prefix;
+    in property <string> t-playing-in-prefix;
+    in property <string> t-skipped-prefix;
+    in property <string> t-skipped-suffix;
+    in property <string> t-play-failed-prefix;
+    in property <string> t-waiting-sources;
+    in property <string> t-resume;
+    in property <string> t-play;
+    in property <string> t-resume-playback;
+    in property <string> t-choose-player;
+    in property <string> t-cancel;
+    in property <string> t-next-source;
+    // Translated series strings (episodes header; season display names are
+    // rebuilt in Rust from t-season-prefix + the season number).
+    in property <string> t-episodes;
+    in property <string> t-season-prefix;
+    // Translated icon-row tooltips.
+    in property <string> t-add-favorites;
+    in property <string> t-remove-favorites;
+    in property <string> t-mark-watched;
+    in property <string> t-mark-unwatched;
+    in property <string> t-sources-title;
     in property <bool> can-resume;
     in property <bool> detail-watched;
     in-out property <string> play-player: "mpv"; // "mpv" | "vlc"
@@ -439,22 +594,22 @@ export component MainWindow inherits Window {
                             color: Theme.accent;
                         }
                         Text {
-                            text: "Sign in with your Stremio account";
+                            text: root.t-sign-in-subtitle;
                             color: Theme.muted;
                             font-size: Theme.fs-caption;
                         }
                         email := TextField {
-                            placeholder-text: "E-mail";
+                            placeholder-text: root.t-email-placeholder;
                         }
                         pass := TextField {
-                            placeholder-text: "Password";
+                            placeholder-text: root.t-password-placeholder;
                             password: true;
                             accepted(text) => {
                                 root.login(email.text, pass.text);
                             }
                         }
                         Button {
-                            text: root.busy ? "Signing in…" : "Sign in";
+                            text: root.busy ? root.t-signing-in : root.t-sign-in;
                             primary: true;
                             disabled: root.busy;
                             height: Theme.play-h;
@@ -482,7 +637,7 @@ export component MainWindow inherits Window {
             alignment: center;
             spacing: Theme.sp-8;
             Text {
-                text: root.manage-profiles ? "Manage profiles" : "Who's watching?";
+                text: root.manage-profiles ? root.t-manage-profiles : root.t-whos-watching;
                 font-size: Theme.fs-display;
                 font-weight: 800;
                 color: Theme.text;
@@ -550,7 +705,9 @@ export component MainWindow inherits Window {
                             }
                         }
                         accessible-role: button;
-                        accessible-label: root.manage-profiles ? "Edit profile " + p.name : "Switch to profile " + p.name;
+                        accessible-label: root.manage-profiles
+                            ? root.t-edit-profile-prefix + p.name
+                            : root.t-switch-to-profile-prefix + p.name;
                     }
                     Text {
                         width: parent.width;
@@ -604,12 +761,12 @@ export component MainWindow inherits Window {
                             }
                         }
                         accessible-role: button;
-                        accessible-label: "Add profile";
+                        accessible-label: root.t-add-profile;
                     }
                     Text {
                         width: parent.width;
                         height: self.preferred-height;
-                        text: "Add profile";
+                        text: root.t-add-profile;
                         color: Theme.muted;
                         font-size: Theme.fs-body;
                         horizontal-alignment: center;
@@ -623,8 +780,8 @@ export component MainWindow inherits Window {
                     primary: root.manage-profiles;
                     icon: root.manage-profiles ? @image-url("icons/check.svg") : @image-url("icons/pencil.svg");
                     has-icon: true;
-                    text: root.manage-profiles ? "Done" : "Manage profiles";
-                    tooltip: "Edit or delete profiles";
+                    text: root.manage-profiles ? root.t-done : root.t-manage-profiles;
+                    tooltip: root.t-edit-or-delete-profiles;
                     clicked => {
                         root.manage-profiles = !root.manage-profiles;
                     }
@@ -644,8 +801,8 @@ export component MainWindow inherits Window {
             ghost: true;
             icon: @image-url("icons/log-out.svg");
             has-icon: true;
-            text: "Log out";
-            tooltip: "Log out of Stremio";
+            text: root.t-log-out;
+            tooltip: root.t-log-out-tooltip;
             clicked => {
                 root.logout();
             }
@@ -682,7 +839,7 @@ export component MainWindow inherits Window {
                     HorizontalLayout {
                         spacing: Theme.sp-2;
                         Text {
-                            text: root.edit-id == "" ? "Add profile" : "Edit profile";
+                            text: root.edit-id == "" ? root.t-add-profile-heading : root.t-edit-profile-heading;
                             font-size: Theme.fs-title;
                             font-weight: 800;
                             color: Theme.text;
@@ -691,23 +848,23 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; }
                         IconButton {
                             icon: @image-url("icons/x.svg");
-                            tooltip: "Close";
+                            tooltip: root.t-close;
                             clicked => {
                                 root.edit-open = false;
                             }
                         }
                     }
                     Text {
-                        text: "Name";
+                        text: root.t-profile-name-label;
                         color: Theme.muted;
                         font-size: Theme.fs-caption;
                     }
                     TextField {
                         text <=> root.edit-name;
-                        placeholder-text: "Profile name";
+                        placeholder-text: root.t-profile-name-placeholder;
                     }
                     Text {
-                        text: "Icon";
+                        text: root.t-profile-icon-label;
                         color: Theme.muted;
                         font-size: Theme.fs-caption;
                     }
@@ -739,7 +896,7 @@ export component MainWindow inherits Window {
                         }
                     }
                     Text {
-                        text: "Colour";
+                        text: root.t-profile-colour-label;
                         color: Theme.muted;
                         font-size: Theme.fs-caption;
                     }
@@ -765,26 +922,26 @@ export component MainWindow inherits Window {
                         spacing: Theme.sp-2;
                         alignment: start;
                         Button {
-                            text: "Save";
+                            text: root.t-save;
                             primary: true;
                             clicked => {
                                 root.save-profile(root.edit-id, root.edit-name, root.edit-icon, root.edit-color);
                             }
                         }
                         if root.edit-id != "" && !root.confirm-del: Button {
-                            text: "Delete";
+                            text: root.t-delete;
                             danger: true;
                             clicked => {
                                 root.confirm-del = true;
                             }
                         }
                         if root.edit-id != "" && root.confirm-del: Text {
-                            text: "Really delete?";
+                            text: root.t-really-delete;
                             color: Theme.accent;
                             vertical-alignment: center;
                         }
                         if root.edit-id != "" && root.confirm-del: Button {
-                            text: "Yes, delete";
+                            text: root.t-yes-delete;
                             danger: true;
                             clicked => {
                                 root.confirm-del = false;
@@ -793,7 +950,7 @@ export component MainWindow inherits Window {
                             }
                         }
                         if root.edit-id != "" && root.confirm-del: Button {
-                            text: "Keep";
+                            text: root.t-keep;
                             clicked => {
                                 root.confirm-del = false;
                             }
@@ -832,17 +989,19 @@ export component MainWindow inherits Window {
                     padding-bottom: Theme.sp-6;
                     spacing: Theme.sp-8;
                     if root.busy && root.rows.length == 0: Text {
-                        text: "Loading…";
+                        text: root.t-loading;
                         color: Theme.muted;
                         font-size: Theme.fs-body;
                     }
                     if !root.busy && root.rows.length == 0: Text {
-                        text: "Nothing to show. Check that your Stremio account has catalog addons (e.g. Cinemeta).";
+                        text: root.t-nothing-to-show-hint;
                         color: Theme.muted;
                         wrap: word-wrap;
                     }
                     for row in root.rows: CatalogRow {
                         data: row;
+                        t-scroll-left: root.t-scroll-left;
+                        t-scroll-right: root.t-scroll-right;
                         open(id, kind) => {
                             root.open-item(id, kind);
                         }
@@ -1216,12 +1375,12 @@ export component MainWindow inherits Window {
                     x: Theme.page-margin;
                     y: Theme.topbar + Theme.sp-2;
                     width: parent.width - Theme.page-margin - Theme.sp-4;
-                    title: root.page == "favorites" ? "Favorites" : "Search";
+                    title: root.page == "favorites" ? root.t-favorites-title : root.t-search-title;
                 }
                 if root.page == "search" && root.searching && root.search-results.length == 0: Text {
                     x: Theme.page-margin;
                     y: grid-page.grid-top;
-                    text: "Searching…";
+                    text: root.t-searching;
                     color: Theme.muted;
                     font-size: Theme.fs-body;
                 }
@@ -1229,7 +1388,7 @@ export component MainWindow inherits Window {
                     x: Theme.page-margin;
                     y: grid-page.grid-top;
                     width: parent.width - Theme.page-margin - Theme.sp-4;
-                    text: "No results. Your addons may not support search, or the query matched nothing.";
+                    text: root.t-no-results-hint;
                     color: Theme.muted;
                     wrap: word-wrap;
                 }
@@ -1237,7 +1396,7 @@ export component MainWindow inherits Window {
                     x: Theme.page-margin;
                     y: grid-page.grid-top;
                     width: parent.width - Theme.page-margin - Theme.sp-4;
-                    text: "No favorites yet. Open a title and press the heart to add it to this profile's favorites.";
+                    text: root.t-no-favorites-hint;
                     color: Theme.muted;
                     wrap: word-wrap;
                 }
@@ -1392,7 +1551,7 @@ export component MainWindow inherits Window {
                         }
                     }
                     SettingsCard {
-                        title: "Player";
+                        title: root.t-player-section;
                         VerticalLayout {
                             spacing: Theme.sp-4;
                             SettingsRow {
@@ -1562,7 +1721,7 @@ export component MainWindow inherits Window {
             search-box := SearchField {
                 y: (parent.height - self.height) / 2;
                 x: bar-gear.x - Theme.sp-6 - self.width;
-                placeholder-text: "Search…";
+                placeholder-text: root.t-search-placeholder;
                 disabled: root.searching;
                 submitted(text) => {
                     root.search(text);
@@ -1572,7 +1731,7 @@ export component MainWindow inherits Window {
                 y: (parent.height - self.height) / 2;
                 x: bar-avatar.x - Theme.sp-6 - self.width;
                 icon: @image-url("icons/settings.svg");
-                tooltip: "Settings";
+                tooltip: root.t-settings-tooltip;
                 clicked => {
                     root.navigate("settings");
                 }
@@ -1617,8 +1776,8 @@ export component MainWindow inherits Window {
                                 padding: 4px * Theme.scale;
                                 spacing: 2px * Theme.scale;
                                 for mi in [
-                                    { label: "Switch profile", icon: @image-url("icons/users.svg"), act: "switch" },
-                                    { label: "Log out", icon: @image-url("icons/log-out.svg"), act: "logout" },
+                                    { label: root.t-switch-profile, icon: @image-url("icons/users.svg"), act: "switch" },
+                                    { label: root.t-log-out, icon: @image-url("icons/log-out.svg"), act: "logout" },
                                 ]: Rectangle {
                                     height: 40px * Theme.scale;
                                     border-radius: 6px * Theme.scale;
@@ -1710,17 +1869,19 @@ export component MainWindow inherits Window {
                         image-fit: cover;
                     }
                 }
-            // right column: vertical flow; the episode list stretches into
-            // whatever space is left (movies just get a compact card)
-            card-col := Rectangle {
+            // right column: the whole column scrolls (Flickable) — title, meta,
+            // description, play row, status chip, episodes/sources and the icon
+            // row all live in the viewport, nothing is clipped mid-content.
+            card-col := Flickable {
                 x: Theme.sp-8 + card-poster.width + Theme.sp-8;
                 y: Theme.sp-8;
                 width: parent.width - self.x - Theme.sp-8;
                 height: parent.height - 2 * Theme.sp-8;
-                clip: true;
-                VerticalLayout {
-                    width: parent.width;
-                    height: parent.height;
+                // 24px breathing room below the last row while scrolling
+                content-height: col.preferred-height + 24px * Theme.scale;
+                col := VerticalLayout {
+                    width: card-col.width;
+                    height: max(self.preferred-height, card-col.height - 24px * Theme.scale);
                     spacing: 0px;
                     Text {
                         vertical-stretch: 0;
@@ -1790,13 +1951,13 @@ export component MainWindow inherits Window {
                             animate background { duration: Theme.t-fast; easing: ease-out; }
                             clip: true;
                             accessible-role: button;
-                            accessible-label: root.can-resume ? "Resume playback" : "Play";
+                            accessible-label: root.can-resume ? root.t-resume-playback : root.t-play;
                             pl := IconLabel {
                                 x: Theme.sp-6;
                                 y: (parent.height - self.height) / 2;
                                 icon-size: Theme.sp-6;
                                 icon: @image-url("icons/play.svg");
-                                text: root.can-resume ? "Resume" : "Play";
+                                text: root.can-resume ? root.t-resume : root.t-play;
                                 text-size: Theme.fs-heading;
                                 weight: 600;
                                 tint: Theme.on-play;
@@ -1814,7 +1975,7 @@ export component MainWindow inherits Window {
                                 tint: Theme.on-play;
                                 flat: true;
                                 icon: @image-url("icons/chevron-down.svg");
-                                tooltip: "Choose player";
+                                tooltip: root.t-choose-player;
                                 clicked => {
                                     root.player-menu-open = !root.player-menu-open;
                                 }
@@ -1902,24 +2063,24 @@ export component MainWindow inherits Window {
                             tint: root.sources-state == "none" || root.sources-state == "hidden" ? Theme.warning : Theme.text;
                         }
                     }
-                    // series: episode header + season selector + episode list
+                    // series: episodes header + season selector on ONE row
+                    // (header flush left, Select right-aligned)
                     if root.detail-is-series: Rectangle { vertical-stretch: 0; height: Theme.sp-4; }
                     if root.detail-is-series && root.episodes.length > 0: Rectangle {
                         vertical-stretch: 0;
                         height: eps-head.height;
                         eps-head := SectionHeader {
-                            title: "Episodes";
-                            caption: root.season-idx >= 0 && root.season-idx < root.season-names.length ? root.season-names[root.season-idx] : "";
+                            title: root.t-episodes;
                         }
-                    }
-                    if root.detail-is-series && root.episodes.length > 0: Select {
-                        vertical-stretch: 0;
-                        model: root.season-names;
-                        current-index <=> root.season-idx;
-                        changed current-index => {
-                            root.season-changed(self.current-index);
+                        Select {
+                            x: parent.width - self.width;
+                            model: root.season-names;
+                            current-index <=> root.season-idx;
+                            changed current-index => {
+                                root.season-changed(self.current-index);
+                            }
+                            width: 220px * Theme.scale;
                         }
-                        width: 220px * Theme.scale;
                     }
                     if root.detail-is-series && root.episodes.length > 0 && !root.sources-open: Rectangle { vertical-stretch: 0; height: Theme.sp-3; }
                     if root.detail-is-series && root.episodes.length > 0 && !root.sources-open: Rectangle {
@@ -2022,12 +2183,14 @@ export component MainWindow inherits Window {
                     // icon-button row
                     HorizontalLayout {
                         vertical-stretch: 0;
+                        padding-top: Theme.sp-1;
+                        padding-bottom: Theme.sp-1;
                         spacing: Theme.sp-3;
                         alignment: start;
                         IconButton {
                             icon: root.detail-fav ? @image-url("icons/heart-filled.svg") : @image-url("icons/heart.svg");
                             active: root.detail-fav;
-                            tooltip: root.detail-fav ? "Remove from favorites" : "Add to favorites";
+                            tooltip: root.detail-fav ? root.t-remove-favorites : root.t-add-favorites;
                             clicked => {
                                 root.toggle-favorite();
                             }
@@ -2035,14 +2198,14 @@ export component MainWindow inherits Window {
                         IconButton {
                             icon: @image-url("icons/circle-check.svg");
                             tint: root.detail-watched ? Theme.success : Theme.muted;
-                            tooltip: root.detail-watched ? "Mark as unwatched" : "Mark as watched";
+                            tooltip: root.detail-watched ? root.t-mark-unwatched : root.t-mark-watched;
                             clicked => {
                                 root.toggle-watched();
                             }
                         }
                         IconButton {
                             icon: @image-url("icons/list.svg");
-                            tooltip: "Sources";
+                            tooltip: root.t-sources-title;
                             clicked => {
                                 root.sources-open = !root.sources-open;
                             }
@@ -2075,8 +2238,17 @@ export component MainWindow inherits Window {
                                 }
                                 Rectangle { horizontal-stretch: 1; }
                                 Text {
-                                    text: sr.status;
-                                    color: sr.ok ? Theme.muted : Theme.accent;
+                                    // Status composed in Slint from the codes:
+                                    // 0 = Ready, 1 = Tried, 2 = Hidden by the
+                                    // profile settings (reason 1..4 = which
+                                    // setting rejected it, see reject_* keys).
+                                    text: sr.status-code == 0 ? root.t-source-ready
+                                        : sr.status-code == 1 ? root.t-source-tried
+                                        : root.t-hidden-prefix + (sr.reason == 1 ? root.t-reject-quality
+                                            : sr.reason == 2 ? root.t-reject-size
+                                            : sr.reason == 3 ? root.t-reject-audio
+                                            : root.t-reject-subs);
+                                    color: sr.status-code == 2 ? Theme.accent : Theme.muted;
                                     font-size: Theme.fs-caption;
                                     vertical-alignment: center;
                                 }
@@ -2097,7 +2269,7 @@ export component MainWindow inherits Window {
                 x: parent.width - self.width - Theme.sp-3;
                 y: Theme.sp-3;
                 icon: @image-url("icons/x.svg");
-                tooltip: "Close";
+                tooltip: root.t-close;
                 clicked => {
                     root.close-detail();
                 }
@@ -2112,14 +2284,14 @@ export component MainWindow inherits Window {
             alignment: center;
             spacing: Theme.sp-2;
             Text {
-                text: "Playing in " + (root.play-player == "vlc" ? "VLC" : "mpv");
+                text: root.t-playing-in-prefix + (root.play-player == "vlc" ? "VLC" : "mpv");
                 color: Theme.text;
                 font-size: Theme.fs-title;
                 font-weight: 600;
                 horizontal-alignment: center;
             }
             Text {
-                text: root.play-status;
+                text: root.play-status-line;
                 color: Theme.muted;
                 font-size: Theme.fs-body;
                 horizontal-alignment: center;
@@ -2129,7 +2301,7 @@ export component MainWindow inherits Window {
                 alignment: center;
                 spacing: Theme.sp-3;
                 Button {
-                    text: "Cancel";
+                    text: root.t-cancel;
                     icon: @image-url("icons/x.svg");
                     has-icon: true;
                     clicked => {
@@ -2137,7 +2309,7 @@ export component MainWindow inherits Window {
                     }
                 }
                 Button {
-                    text: "Next source";
+                    text: root.t-next-source;
                     icon: @image-url("icons/chevron-right.svg");
                     has-icon: true;
                     clicked => {
@@ -2167,6 +2339,13 @@ export component MainWindow inherits Window {
             horizontal-alignment: center;
             vertical-alignment: center;
         }
+    }
+
+    // The ONE tooltip layer: must be the LAST child of the window so it floats
+    // above every popup and is never clipped (see components.slint).
+    TooltipLayer {
+        window-width: root.width;
+        window-height: root.height;
     }
 }
 
@@ -2203,6 +2382,17 @@ export component TestWindow inherits Window {
     search-test := SearchField {
         x: 40px; y: 120px;
         placeholder-text: "Search…";
+    }
+    // Tooltip probes: the button fills TooltipState after the 500 ms hover
+    // delay, the single layer renders it (tests/tooltip.rs).
+    tip-btn := IconButton {
+        x: 760px; y: 40px;
+        icon: @image-url("icons/settings.svg");
+        tooltip: "Tip";
+    }
+    tip-layer := TooltipLayer {
+        window-width: root.width;
+        window-height: root.height;
     }
     card-short := PosterCard {
         x: 40px; y: 220px; width: 150px;

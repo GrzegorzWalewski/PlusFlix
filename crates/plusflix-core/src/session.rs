@@ -54,17 +54,31 @@ impl Default for SessionConfig {
 
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
-    Trying { label: String, attempt: usize },
+    Trying {
+        label: String,
+        attempt: usize,
+    },
     /// A source actually started playing; `key` identifies it for callers
     /// that want to remember the last-played source.
-    Playing { label: String, key: String },
+    Playing {
+        label: String,
+        key: String,
+    },
     /// A source failed (load error, stall, early EOF, player error).
-    Failed { label: String, reason: String },
+    Failed {
+        label: String,
+        reason: String,
+    },
     /// The user skipped a source: not a failure, it just moves to the back
     /// of the failover queue.
-    Skipped { label: String },
+    Skipped {
+        label: String,
+    },
     WaitingForSources,
-    Position { secs: f64, duration: Option<f64> },
+    Position {
+        secs: f64,
+        duration: Option<f64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -756,23 +770,13 @@ mod tests {
     async fn first_key_is_only_honored_for_the_first_pick() {
         // The preferred source fails: it must not be re-picked forever.
         let pool = pool_with(vec![stream("a", "1080p"), stream("b", "720p")]);
-        let (mut player, loads) = MockPlayer::new(&[
-            ("b", Script::ErrorImmediately),
-            ("a", Script::PlayToEnd),
-        ]);
+        let (mut player, loads) =
+            MockPlayer::new(&[("b", Script::ErrorImmediately), ("a", Script::PlayToEnd)]);
         let cfg = SessionConfig {
             first_key: Some("https://x/b".into()),
             ..Default::default()
         };
-        let out = run(
-            &mut player,
-            &pool,
-            &Settings::default(),
-            &cfg,
-            0.0,
-            None,
-        )
-        .await;
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
         assert_eq!(out, Outcome::Finished { position: 100.0 });
         let urls: Vec<String> = loads
             .lock()
@@ -788,23 +792,13 @@ mod tests {
         // The preferred (worse-ranked) source is picked despite a better one
         // being available.
         let pool = pool_with(vec![stream("a", "1080p"), stream("b", "720p")]);
-        let (mut player, loads) = MockPlayer::new(&[
-            ("a", Script::PlayToEnd),
-            ("b", Script::PlayToEnd),
-        ]);
+        let (mut player, loads) =
+            MockPlayer::new(&[("a", Script::PlayToEnd), ("b", Script::PlayToEnd)]);
         let cfg = SessionConfig {
             first_key: Some("https://x/b".into()),
             ..Default::default()
         };
-        let out = run(
-            &mut player,
-            &pool,
-            &Settings::default(),
-            &cfg,
-            0.0,
-            None,
-        )
-        .await;
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
         assert_eq!(out, Outcome::Finished { position: 100.0 });
         assert_eq!(loads.lock().unwrap()[0].0, "b");
     }

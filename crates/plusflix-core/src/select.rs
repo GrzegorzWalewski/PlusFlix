@@ -33,6 +33,17 @@ pub enum Reject {
 }
 
 impl Reject {
+    /// Numeric reason code for the UI (the `reject_*` locale keys):
+    /// 1 = below min quality, 2 = too large, 3 = wrong audio, 4 = missing subs.
+    pub fn code(&self) -> i32 {
+        match self {
+            Reject::BelowMinQuality => 1,
+            Reject::TooLarge => 2,
+            Reject::WrongAudioLanguage => 3,
+            Reject::MissingSubtitles => 4,
+        }
+    }
+
     /// Why the profile's settings disabled this source (for the sources list).
     pub fn label(&self) -> &'static str {
         match self {

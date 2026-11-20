@@ -15,7 +15,7 @@ use plusflix_core::loader::SourceLoader;
 use plusflix_core::model::{Meta, MetaPreview};
 use plusflix_core::mpv::{MpvConfig, MpvPlayer};
 use plusflix_core::player::{LoadRequest, Player, PlayerEvent};
-use plusflix_core::pool::{PoolStats, SourcePool};
+use plusflix_core::pool::SourcePool;
 use plusflix_core::session::{self, Outcome, SessionConfig, SessionEvent};
 use plusflix_core::settings::{LanguageMode, PlayerKind, Quality, Settings, SubtitleRequirement};
 use plusflix_core::store::{
@@ -98,9 +98,13 @@ fn enable_dark_title_bar() {
                 unsafe {
                     let hinst = GetModuleHandleW(null());
                     if hinst != 0 {
-                        let icon = LoadIconW(hinst, 1 as *const u16);
+                        let icon = LoadIconW(hinst, std::ptr::dangling::<u16>());
                         if icon != 0 {
-                            SendMessageW(hwnd, 0x0080 /* WM_SETICON */, 0 /* ICON_SMALL */, icon);
+                            SendMessageW(
+                                hwnd, 0x0080, /* WM_SETICON */
+                                0,      /* ICON_SMALL */
+                                icon,
+                            );
                             SendMessageW(hwnd, 0x0080, 1 /* ICON_BIG */, icon);
                         }
                     }
@@ -276,7 +280,8 @@ impl ItemData {
         }
     }
     /// A Continue Watching card from a progress entry (must have card info).
-    fn from_progress(pr: &plusflix_core::store::Progress) -> Option<Self> {
+    /// `t` supplies the interface translations (the "min left" wording).
+    fn from_progress(pr: &plusflix_core::store::Progress, t: &Translations) -> Option<Self> {
         let card = pr.card.as_ref()?;
         let video_id = card
             .episode_id
@@ -287,18 +292,19 @@ impl ItemData {
             .filter(|d| *d > 0.0)
             .map(|d| (pr.position_secs / d) as f32)
             .unwrap_or(0.0);
-        // "42 min left" (or hours + minutes for long entries).
+        // "42 minuty" (or hours + minutes for long entries), pluralised per
+        // the interface language via the `min_left_*` keys.
         let time_left = pr.duration_secs.and_then(|d| {
             let mins = ((d - pr.position_secs) / 60.0).ceil();
             (mins > 0.0).then(|| {
+                let m = mins as u64;
+                let mins_word = |n: u64| t.t(&format!("min_left{}", plural_suffix(n)));
                 if mins >= 60.0 {
-                    format!(
-                        "{} h {} min left",
-                        (mins / 60.0) as u64,
-                        (mins % 60.0) as u64
-                    )
+                    let h = (mins / 60.0) as u64;
+                    let rem = m % 60;
+                    format!("{h} h {rem} {}", mins_word(rem))
                 } else {
-                    format!("{mins} min left")
+                    format!("{m} {}", mins_word(m))
                 }
             })
         });
@@ -411,7 +417,7 @@ fn addon_rows(addons: &[Addon], waits: &[String]) -> Vec<AddonData> {
                 kinds: m.types.join(", ").into(),
                 version: m.version.clone().into(),
                 // "Wait for this addon" switch state (persisted settings).
-                waited: waits.iter().any(|w| w == a.name()).into(),
+                waited: waits.iter().any(|w| w == a.name()),
             }
         })
         .collect()
@@ -828,12 +834,13 @@ fn backfill_cw_art(app: &Arc<App>) {
             .is_some_and(|ui| ui.get_page().as_str() == "home")
         {
             let cw_items = cw_items_for(&app);
+            let cw_title = tr(&app, "continue_watching");
             let mut data = lock(&app.rows_cache).clone();
             match data.first_mut() {
-                Some(row) if row.0 == "Continue watching" => row.2 = cw_items,
+                Some(row) if row.0 == cw_title => row.2 = cw_items,
                 _ => {
                     if !cw_items.is_empty() {
-                        data.insert(0, ("Continue watching".to_owned(), String::new(), cw_items));
+                        data.insert(0, (cw_title, String::new(), cw_items));
                     }
                 }
             }
@@ -939,10 +946,11 @@ fn sync_account_cw(app: &Arc<App>) {
         if cw_items.is_empty() {
             return;
         }
+        let cw_title = tr(&app, "continue_watching");
         let mut data = lock(&app.rows_cache).clone();
         match data.first_mut() {
-            Some(row) if row.0 == "Continue watching" => row.2 = cw_items,
-            _ => data.insert(0, ("Continue watching".to_owned(), String::new(), cw_items)),
+            Some(row) if row.0 == cw_title => row.2 = cw_items,
+            _ => data.insert(0, (cw_title, String::new(), cw_items)),
         }
         let wanted = poster_wanted(
             &data
@@ -982,11 +990,12 @@ fn cw_items_for(app: &Arc<App>) -> Vec<ItemData> {
         .profile_id()
         .and_then(|pid| {
             let st = lock(&app.store);
+            let t = lock(&app.translations);
             let p = st.profile(&pid).ok()?;
             Some(
                 p.continue_watching()
                     .iter()
-                    .filter_map(|pr| ItemData::from_progress(pr))
+                    .filter_map(|pr| ItemData::from_progress(pr, &t))
                     .collect::<Vec<_>>(),
             )
         })
@@ -1181,7 +1190,7 @@ fn load_page(app: &Arc<App>, page: &str) {
                 let mut data: Vec<(String, String, Vec<ItemData>)> = Vec::new();
                 let has_cw = page == "home" && !cw_items.is_empty();
                 if has_cw {
-                    data.push(("Continue watching".to_owned(), String::new(), cw_items));
+                    data.push((tr(&app, "continue_watching"), String::new(), cw_items));
                 }
                 *lock(&app.rows_cache) = data.clone();
                 // Render Continue Watching immediately; catalogs stream in.
@@ -1299,35 +1308,12 @@ fn load_page(app: &Arc<App>, page: &str) {
 
 // ---------------------------------------------------------------- detail + sources
 
-fn summary(stats: &PoolStats) -> String {
-    let hidden: usize = stats.rejected.values().sum();
-    let searching = stats.pending_tasks > 0;
-    if stats.total == 0 {
-        return if searching {
-            "Searching sources…".into()
-        } else {
-            "Your addons returned no playable sources.".into()
-        };
-    }
-    if stats.usable == 0 && !searching {
-        return format!("No source matches this profile's settings ({hidden} hidden).");
-    }
-    let mut s = format!(
-        "{} usable source{}",
-        stats.usable,
-        if stats.usable == 1 { "" } else { "s" }
-    );
-    if hidden > 0 {
-        s += &format!(", {hidden} hidden by your settings");
-    }
-    if searching {
-        s += " – still searching…";
-    }
-    s
-}
-
 /// Seasons of a series as (season number, display name), specials (0) last.
-fn seasons_of(meta: &Meta) -> Vec<(u32, String)> {
+/// The display names are translated for the current interface language
+/// (`season_prefix` + number, or `specials` for season 0).
+fn seasons_of(app: &App, meta: &Meta) -> Vec<(u32, String)> {
+    let prefix = tr(app, "season_prefix");
+    let specials = tr(app, "specials");
     let mut seasons: Vec<u32> = Vec::new();
     for v in &meta.videos {
         if let Some(s) = v.season {
@@ -1341,9 +1327,9 @@ fn seasons_of(meta: &Meta) -> Vec<(u32, String)> {
         .into_iter()
         .map(|s| {
             let name = if s == 0 {
-                "Specials".to_owned()
+                specials.clone()
             } else {
-                format!("Season {s}")
+                format!("{prefix}{s}")
             };
             (s, name)
         })
@@ -1496,26 +1482,30 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
         loop {
             let settings = a.profile_settings();
             let stats = pool.stats(&settings);
+            // Rows carry raw status/reason codes; Slint composes the text from
+            // the t-* keys (see the sources list in main.slint).
             let rows: Vec<SourceRowData> = pool
                 .rows(&settings)
                 .into_iter()
                 .map(|r| {
-                    let status = if let Some(rej) = r.rejected {
-                        format!("Hidden – {}", rej.label())
+                    let (status_code, reason) = if let Some(rej) = r.rejected {
+                        // 2 = hidden by the profile settings; the reason code
+                        // is Reject::code() (1 quality, 2 size, 3 audio, 4 subs).
+                        (2, rej.code())
                     } else if r.tried {
-                        "Tried".to_owned()
+                        (1, 0)
                     } else {
-                        "Ready".to_owned()
+                        (0, 0)
                     };
                     SourceRowData {
                         key: r.key.into(),
                         label: r.label.into(),
-                        status: status.into(),
-                        ok: r.rejected.is_none(),
+                        status_code,
+                        reason,
                     }
                 })
                 .collect();
-            let text = summary(&stats);
+            let hidden: usize = stats.rejected.values().sum();
             // "Wait for this addon": while any addon the profile waits for is
             // still loading, the state stays Loading even when other addons
             // already delivered usable sources — the green/Ready light (and
@@ -1533,7 +1523,6 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
             } else {
                 "none"
             };
-            let state = state.to_owned();
             // Mirror the resolution state onto the catalog card play pill.
             let status = if stats.usable > 0 && !waited_pending {
                 SourceStatus::Ready
@@ -1550,8 +1539,13 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
                     patch_item(ui, &id, |it| it.source_state = status as i32);
                 });
             }
+            // Raw counts + state: the summary sentence is composed in Slint.
+            let (total, usable) = (stats.total as i32, stats.usable as i32);
+            let state = state.to_owned();
             a.ui(move |ui| {
-                ui.set_sources_summary(text.into());
+                ui.set_sources_total(total);
+                ui.set_sources_usable(usable);
+                ui.set_sources_hidden(hidden as i32);
                 ui.set_sources_state(state.into());
                 ui.set_source_rows(ModelRc::new(VecModel::from(rows)));
             });
@@ -1674,7 +1668,7 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
                 video_id.clone().unwrap_or_default(),
             );
             // Season the popup opens on: the one containing the selected episode.
-            let seasons = seasons_of(&meta);
+            let seasons = seasons_of(&app, &meta);
             let sel_season = video_id.as_deref().and_then(|v| {
                 meta.videos
                     .iter()
@@ -1727,7 +1721,10 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
                     &rows, &watched, &progress,
                 ))));
                 ui.set_selected_episode(selected.into());
-                ui.set_sources_summary("Searching sources…".into());
+                // Raw counts (all zero) + state: Slint composes the summary.
+                ui.set_sources_total(0);
+                ui.set_sources_usable(0);
+                ui.set_sources_hidden(0);
                 ui.set_sources_state("loading".into());
                 ui.set_source_rows(ModelRc::default());
                 ui.set_sources_open(false);
@@ -1740,7 +1737,7 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
         }
         match video_id {
             Some(v) => start_sources(&app, &detail, v),
-            None => app.flash("This title has no episodes."),
+            None => app.flash(tr(&app, "no_episodes")),
         }
     });
 }
@@ -1774,7 +1771,9 @@ fn select_episode(app: &Arc<App>, id: String) {
             ui.set_selected_episode(shown.into());
             ui.set_detail_watched(watched);
             ui.set_can_resume(resume > 0.0);
-            ui.set_sources_summary("Searching sources…".into());
+            ui.set_sources_total(0);
+            ui.set_sources_usable(0);
+            ui.set_sources_hidden(0);
             ui.set_sources_state("loading".into());
         });
         start_sources(&app, &detail, id);
@@ -1786,7 +1785,7 @@ fn season_changed(app: &Arc<App>, ui: &MainWindow, idx: i32) {
     let Some(detail) = lock(&app.detail).clone() else {
         return;
     };
-    let seasons = seasons_of(&detail.meta);
+    let seasons = seasons_of(app, &detail.meta);
     let Some((season, _)) = seasons.get(idx.max(0) as usize) else {
         return;
     };
@@ -1906,7 +1905,7 @@ fn toggle_watched(app: &Arc<App>, ui: &MainWindow) {
 /// just flips the badge in place.
 fn card_toggle_favorite(app: &Arc<App>, id: String, kind: String, name: String, poster: String) {
     let Some(pid) = app.profile_id() else { return };
-    let poster = (!poster.is_empty()).then(|| poster);
+    let poster = (!poster.is_empty()).then_some(poster);
     let now_fav = {
         let mut st = lock(&app.store);
         let Ok(p) = st.profile_mut(&pid) else { return };
@@ -1925,7 +1924,6 @@ fn card_toggle_favorite(app: &Arc<App>, id: String, kind: String, name: String, 
     if on_favorites_page {
         load_page(app, "favorites");
     } else {
-        let id = id;
         app.ui(move |ui| {
             patch_item(ui, &id, |it| it.fav = now_fav);
         });
@@ -1970,7 +1968,6 @@ fn card_toggle_watched(app: &Arc<App>, id: String, kind: String) {
         }
     };
     app.save();
-    let id = id;
     app.ui(move |ui| {
         patch_item(ui, &id, |it| it.watched = now_watched);
     });
@@ -2012,7 +2009,7 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
         return;
     };
     let Some(sources) = lock(&detail.current).clone() else {
-        app.flash("Pick an episode first.");
+        app.flash(tr(app, "pick_episode_first"));
         return;
     };
     let Some(pid) = app.profile_id() else { return };
@@ -2076,7 +2073,8 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
                 PlayerKind::Vlc => "vlc".into(),
                 PlayerKind::Mpv => "mpv".into(),
             });
-            ui.set_play_status("Starting player…".into());
+            // 7 = starting the player (see the play-state enum in main.slint).
+            ui.set_play_state(7);
         });
         // Cancel flag for the overlay's Cancel button. Dropping `run_playback`
         // mid-await tears the player down (mpv: kill-on-drop; VLC: the poll
@@ -2091,7 +2089,7 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
         };
         let msg = tokio::select! {
             msg = run_playback(&app, &sources, &pid, settings, resume, card, forced) => msg,
-            _ = wait_cancel => Some("Playback cancelled.".to_owned()),
+            _ = wait_cancel => Some(tr(&app, "playback_cancelled")),
         };
         *lock(&app.cancel_playback) = None;
         drop(detail);
@@ -2155,7 +2153,7 @@ async fn run_playback(
         },
         PlayerKind::Mpv => match MpvPlayer::spawn(&MpvConfig::default()).await {
             Ok(p) => AnyPlayer::Mpv(Box::new(p)),
-            Err(e) => return Some(format!("{e} – install mpv and make sure it is on PATH.")),
+            Err(e) => return Some(format!("{}{}", e, tr(app, "mpv_missing_suffix"))),
         },
     };
     let skip = Arc::new(AtomicBool::new(false));
@@ -2171,27 +2169,30 @@ async fn run_playback(
         tokio::spawn(async move {
             let mut last_save = Instant::now();
             while let Some(ev) = rx.recv().await {
-                let status = match ev {
+                // Play status as raw data (state enum + label + attempt number
+                // + failure reason): the sentence is composed in Slint from the
+                // t-play-* keys. State codes: 1 starting (first attempt),
+                // 2 switching source, 3 playing, 4 skipped, 5 failed,
+                // 6 waiting for sources (see main.slint).
+                let status: Option<(i32, String, i32, String)> = match ev {
                     SessionEvent::Trying { label, attempt: 1 } => {
-                        Some(format!("Starting: {label}"))
+                        Some((1, label, 1, String::new()))
                     }
                     SessionEvent::Trying { label, attempt } => {
-                        Some(format!("Switching source (attempt {attempt}): {label}"))
+                        Some((2, label, attempt.max(1) as i32, String::new()))
                     }
                     SessionEvent::Playing { label, key } => {
                         // Remember which source actually played, so the next
                         // play of this item starts from it.
                         lock(&app.last_played).insert(video_id.clone(), key);
-                        Some(format!("Playing: {label}"))
+                        Some((3, label, 1, String::new()))
                     }
-                    SessionEvent::Skipped { label } => {
-                        Some(format!("Skipped {label} – switching…"))
-                    }
+                    SessionEvent::Skipped { label } => Some((4, label, 1, String::new())),
                     SessionEvent::Failed { label, reason } => {
                         tracing::info!("source failed: {label}: {reason}");
-                        Some(format!("{label} failed ({reason})"))
+                        Some((5, label, 1, reason))
                     }
-                    SessionEvent::WaitingForSources => Some("Waiting for more sources…".into()),
+                    SessionEvent::WaitingForSources => Some((6, String::new(), 1, String::new())),
                     SessionEvent::Position { secs, duration } => {
                         *lock(&last) = (secs, duration);
                         if last_save.elapsed() > Duration::from_secs(15) {
@@ -2201,8 +2202,13 @@ async fn run_playback(
                         None
                     }
                 };
-                if let Some(s) = status {
-                    app.ui(move |ui| ui.set_play_status(s.into()));
+                if let Some((state, label, attempt, reason)) = status {
+                    app.ui(move |ui| {
+                        ui.set_play_state(state);
+                        ui.set_play_label(label.into());
+                        ui.set_play_attempt(attempt);
+                        ui.set_play_reason(reason.into());
+                    });
                 }
             }
         })
@@ -2215,11 +2221,7 @@ async fn run_playback(
         &SessionConfig {
             // A manual pick wins; otherwise prefer the source that last
             // actually played for this item.
-            first_key: forced.or_else(|| {
-                lock(&app.last_played)
-                    .get(&sources.video_id)
-                    .cloned()
-            }),
+            first_key: forced.or_else(|| lock(&app.last_played).get(&sources.video_id).cloned()),
             ..Default::default()
         },
         resume,
@@ -2243,12 +2245,10 @@ async fn run_playback(
             save_progress(app, pid, &sources.video_id, position, dur, &card);
             None
         }
-        Outcome::NoSources => {
-            Some("No source matches this profile's settings. Relax them in Settings.".into())
-        }
+        Outcome::NoSources => Some(tr(app, "no_playable_sources")),
         Outcome::Exhausted { position } => {
             save_progress(app, pid, &sources.video_id, position, dur, &card);
-            Some("All available sources failed.".into())
+            Some(tr(app, "all_sources_failed"))
         }
     }
 }
@@ -2262,14 +2262,20 @@ fn do_search(app: &Arc<App>, query: String) {
     }
     let app = app.clone();
     app.rt.clone().spawn(async move {
-        let shown_q = q.clone();
+        // Immediate "Searching for …" status (composed from the prefix/suffix
+        // keys), before the network work.
+        let searching_for = format!(
+            "{}{q}{}",
+            tr(&app, "search_status_prefix"),
+            tr(&app, "search_status_suffix")
+        );
         app.ui(move |ui| {
             ui.set_searching(true);
             ui.set_page("search".into());
             ui.set_rows(ModelRc::default());
             ui.set_favorites(ModelRc::default());
             ui.set_search_results(ModelRc::default());
-            ui.set_status(format!("Searching for “{shown_q}”…").into());
+            ui.set_status(searching_for.into());
         });
         let addons = lock(&app.addons).clone();
         let results = home::search(&app.client, &addons, &q).await;
@@ -2467,9 +2473,7 @@ fn genre_chosen_kind(app: &Arc<App>, kind: &'static str, genre: &str) {
         // `catalogs_for_genre` covers catalogs declaring the name AND catalogs
         // with no options (they accept any genre).
         for catalog in genres::catalogs_for_genre(&addons, kind, name) {
-            let seen = catalogs
-                .iter()
-                .any(|c| c.identity() == catalog.identity());
+            let seen = catalogs.iter().any(|c| c.identity() == catalog.identity());
             if !seen {
                 catalogs.push(catalog);
             }
@@ -2670,7 +2674,14 @@ fn genre_fetch_page(app: &Arc<App>) {
                 ui.set_genre_loading(false);
             });
             if failed > 0 {
-                app.flash(format!("{failed} of {queried} catalogs didn't respond"));
+                // Pluralised per the Polish rules via the catalogs_failed_* keys.
+                let msg = tr(
+                    &app,
+                    &format!("catalogs_failed{}", plural_suffix(failed as u64)),
+                )
+                .replacen("{}", &failed.to_string(), 1)
+                .replacen("{}", &queried.to_string(), 1);
+                app.flash(msg);
             }
             if !wanted.is_empty() {
                 app.fetch_posters(wanted);
@@ -2696,7 +2707,8 @@ async fn refresh_addons(app: &Arc<App>, auth_key: &str) -> plusflix_core::Result
 
 fn login(app: &Arc<App>, email: String, password: String) {
     if email.trim().is_empty() || password.is_empty() {
-        app.ui(|ui| ui.set_status("Enter your e-mail and password.".into()));
+        let msg = tr(app, "sign_in_fields_missing");
+        app.ui(move |ui| ui.set_status(msg.into()));
         return;
     }
     let app = app.clone();
@@ -2717,10 +2729,13 @@ fn login(app: &Arc<App>, email: String, password: String) {
                 app.save();
                 show_profiles(&app);
             }
-            Err(e) => app.ui(move |ui| {
-                ui.set_busy(false);
-                ui.set_status(format!("Login failed: {e}").into());
-            }),
+            Err(e) => {
+                let msg = tr(&app, "login_failed_prefix");
+                app.ui(move |ui| {
+                    ui.set_busy(false);
+                    ui.set_status(format!("{msg}{e}").into());
+                })
+            }
         }
     });
 }
@@ -2729,7 +2744,7 @@ fn refresh_addons_ui(app: &Arc<App>) {
     let app = app.clone();
     app.rt.clone().spawn(async move {
         let Some(auth) = lock(&app.store).auth.clone() else {
-            app.flash("Not signed in.");
+            app.flash(tr(&app, "not_signed_in"));
             return;
         };
         app.ui(|ui| ui.set_refreshing_addons(true));
@@ -2741,11 +2756,11 @@ fn refresh_addons_ui(app: &Arc<App>) {
                     ui.set_addons(ModelRc::new(VecModel::from(addons)));
                     ui.set_refreshing_addons(false);
                 });
-                app.flash("Addon list refreshed.");
+                app.flash(tr(&app, "addons_refreshed"));
             }
             Err(e) => {
                 app.ui(|ui| ui.set_refreshing_addons(false));
-                app.flash(format!("Refresh failed: {e}"));
+                app.flash(format!("{}{e}", tr(&app, "refresh_failed_prefix")));
             }
         }
     });
@@ -2776,7 +2791,7 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
         max.parse::<f64>().ok().filter(|g| *g > 0.0)
     };
     if !max.is_empty() && max_filesize_gb.is_none() {
-        app.flash("Max file size must be a positive number of GB.");
+        app.flash(tr(app, "max_size_invalid"));
         return;
     }
     // Set from the per-addon "Wait for this addon" switches
@@ -2809,7 +2824,7 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
         p.settings = settings;
     }
     app.save();
-    app.flash("Settings saved.");
+    app.flash(tr(app, "settings_saved"));
 }
 
 // ---------------------------------------------------------------- language
@@ -2878,6 +2893,20 @@ fn index_to_locale(idx: usize) -> String {
 /// Translated string for `key` under the currently loaded translations.
 fn tr(app: &App, key: &str) -> String {
     lock(&app.translations).t(key)
+}
+
+/// Plural-key suffix for a count, per the Polish rules (the same rule drives
+/// `PluralForm.form` in main.slint; English `_few` keys hold the same text as
+/// `_many`, so the one rule serves every locale): n == 1 -> "_one";
+/// n % 10 in 2..4 and not n % 100 in 12..14 -> "_few"; else "_many".
+fn plural_suffix(n: u64) -> &'static str {
+    if n == 1 {
+        "_one"
+    } else if (2..=4).contains(&(n % 10)) && !(12..=14).contains(&(n % 100)) {
+        "_few"
+    } else {
+        "_many"
+    }
 }
 
 /// Pushes the locale and every translated UI string into the Slint properties.
@@ -2955,7 +2984,134 @@ fn apply_language(app: &Arc<App>) {
         ui.set_t_clear_genre(tr(&app2, "clear_genre_filter").into());
         ui.set_t_no_genre_prefix(tr(&app2, "no_genre_results_prefix").into());
         ui.set_t_no_genre_suffix(tr(&app2, "no_genre_results_suffix").into());
+        // General UI strings (sign-in, profile picker, headers, search).
+        ui.set_t_sign_in(tr(&app2, "sign_in").into());
+        ui.set_t_sign_in_subtitle(tr(&app2, "sign_in_subtitle").into());
+        ui.set_t_signing_in(tr(&app2, "signing_in").into());
+        ui.set_t_email_placeholder(tr(&app2, "email_placeholder").into());
+        ui.set_t_password_placeholder(tr(&app2, "password_placeholder").into());
+        ui.set_t_whos_watching(tr(&app2, "whos_watching").into());
+        ui.set_t_manage_profiles(tr(&app2, "manage_profiles").into());
+        ui.set_t_done(tr(&app2, "done").into());
+        ui.set_t_edit_or_delete_profiles(tr(&app2, "edit_or_delete_profiles").into());
+        ui.set_t_log_out(tr(&app2, "log_out").into());
+        ui.set_t_log_out_tooltip(tr(&app2, "log_out_tooltip").into());
+        ui.set_t_switch_profile(tr(&app2, "switch_profile").into());
+        ui.set_t_add_profile(tr(&app2, "add_profile").into());
+        ui.set_t_add_profile_heading(tr(&app2, "add_profile_heading").into());
+        ui.set_t_edit_profile_heading(tr(&app2, "edit_profile_heading").into());
+        ui.set_t_edit_profile_prefix(tr(&app2, "edit_profile_prefix").into());
+        ui.set_t_switch_to_profile_prefix(tr(&app2, "switch_to_profile_prefix").into());
+        ui.set_t_profile_name_label(tr(&app2, "profile_name_label").into());
+        ui.set_t_profile_name_placeholder(tr(&app2, "profile_name_placeholder").into());
+        ui.set_t_profile_icon_label(tr(&app2, "profile_icon_label").into());
+        ui.set_t_profile_colour_label(tr(&app2, "profile_colour_label").into());
+        ui.set_t_save(tr(&app2, "save").into());
+        ui.set_t_delete(tr(&app2, "delete").into());
+        ui.set_t_really_delete(tr(&app2, "really_delete").into());
+        ui.set_t_yes_delete(tr(&app2, "yes_delete").into());
+        ui.set_t_keep(tr(&app2, "keep").into());
+        ui.set_t_close(tr(&app2, "close").into());
+        ui.set_t_loading(tr(&app2, "loading").into());
+        ui.set_t_nothing_to_show_hint(tr(&app2, "nothing_to_show_hint").into());
+        ui.set_t_searching(tr(&app2, "searching").into());
+        ui.set_t_no_results_hint(tr(&app2, "no_results_hint").into());
+        ui.set_t_no_favorites_hint(tr(&app2, "no_favorites_hint").into());
+        ui.set_t_favorites_title(tr(&app2, "favorites_title").into());
+        ui.set_t_search_title(tr(&app2, "search_title").into());
+        ui.set_t_search_placeholder(tr(&app2, "search_placeholder").into());
+        ui.set_t_settings_tooltip(tr(&app2, "settings_tooltip").into());
+        ui.set_t_scroll_left(tr(&app2, "scroll_left").into());
+        ui.set_t_scroll_right(tr(&app2, "scroll_right").into());
+        ui.set_t_player_section(tr(&app2, "player_section").into());
+        ui.set_t_app_name(tr(&app2, "app_name").into());
+        // Detail-popup sources list. The rows carry raw status/reason codes;
+        // the summary chip and row texts are composed in Slint from these keys.
+        ui.set_t_searching_sources(tr(&app2, "searching_sources").into());
+        ui.set_t_no_playable_yet(tr(&app2, "no_playable_yet").into());
+        ui.set_t_sources_none_prefix(tr(&app2, "sources_none_prefix").into());
+        ui.set_t_sources_none_suffix(tr(&app2, "sources_none_suffix").into());
+        ui.set_t_source_noun_one(tr(&app2, "source_noun_one").into());
+        ui.set_t_source_noun_few(tr(&app2, "source_noun_few").into());
+        ui.set_t_source_noun_many(tr(&app2, "source_noun_many").into());
+        ui.set_t_sources_hidden_prefix(tr(&app2, "sources_hidden_prefix").into());
+        ui.set_t_sources_searching_suffix(tr(&app2, "sources_searching_suffix").into());
+        ui.set_t_source_ready(tr(&app2, "source_ready").into());
+        ui.set_t_source_tried(tr(&app2, "source_tried").into());
+        ui.set_t_hidden_prefix(tr(&app2, "hidden_prefix").into());
+        ui.set_t_reject_quality(tr(&app2, "reject_quality").into());
+        ui.set_t_reject_size(tr(&app2, "reject_size").into());
+        ui.set_t_reject_audio(tr(&app2, "reject_audio").into());
+        ui.set_t_reject_subs(tr(&app2, "reject_subs").into());
+        // Playback + series strings. `play-status-line` (and the sources
+        // summary) are composed in Slint from raw data, so updating these
+        // keys re-renders them without re-pushing anything.
+        ui.set_t_starting_player(tr(&app2, "starting_player").into());
+        ui.set_t_play_starting_prefix(tr(&app2, "play_starting_prefix").into());
+        ui.set_t_play_switching_prefix(tr(&app2, "play_switching_prefix").into());
+        ui.set_t_play_switching_mid(tr(&app2, "play_switching_mid").into());
+        ui.set_t_playing_prefix(tr(&app2, "playing_prefix").into());
+        ui.set_t_playing_in_prefix(tr(&app2, "playing_in_prefix").into());
+        ui.set_t_skipped_prefix(tr(&app2, "skipped_prefix").into());
+        ui.set_t_skipped_suffix(tr(&app2, "skipped_suffix").into());
+        ui.set_t_play_failed_prefix(tr(&app2, "play_failed_prefix").into());
+        ui.set_t_waiting_sources(tr(&app2, "waiting_for_sources").into());
+        ui.set_t_resume(tr(&app2, "resume").into());
+        ui.set_t_play(tr(&app2, "play").into());
+        ui.set_t_resume_playback(tr(&app2, "resume_playback").into());
+        ui.set_t_choose_player(tr(&app2, "choose_player").into());
+        ui.set_t_cancel(tr(&app2, "cancel").into());
+        ui.set_t_next_source(tr(&app2, "next_source").into());
+        ui.set_t_episodes(tr(&app2, "episodes").into());
+        ui.set_t_season_prefix(tr(&app2, "season_prefix").into());
+        ui.set_t_add_favorites(tr(&app2, "add_favorites").into());
+        ui.set_t_remove_favorites(tr(&app2, "remove_favorites").into());
+        ui.set_t_mark_watched(tr(&app2, "mark_watched").into());
+        ui.set_t_mark_unwatched(tr(&app2, "mark_unwatched").into());
+        ui.set_t_sources_title(tr(&app2, "sources_title").into());
     });
+    // Locale-dependent lists that were pushed earlier hold text baked in the
+    // OLD locale; rebuild them so already-rendered views update too. The
+    // sources summary chip and the play-status line are composed in Slint
+    // from raw values (counts/state), so the t-* setters above re-render
+    // them without any re-push.
+    // Season names of the open detail popup ("Season N" / "Specials").
+    let detail = lock(&app.detail).clone();
+    let app2 = app.clone();
+    app.ui(move |ui| {
+        let Some(detail) = detail.filter(|_| ui.get_detail_open()) else {
+            return;
+        };
+        let seasons = seasons_of(&app2, &detail.meta);
+        ui.set_season_names(ModelRc::new(VecModel::from(
+            seasons
+                .iter()
+                .map(|(_, name)| slint::SharedString::from(name.as_str()))
+                .collect::<Vec<_>>(),
+        )));
+    });
+    // Continue Watching row title + item badges ("42 min left", "S2E5") on
+    // the home page, rebuilt from the rows cache.
+    let cw_title = tr(app, "continue_watching");
+    let mut data = lock(&app.rows_cache).clone();
+    if let Some(row) = data
+        .first_mut()
+        .filter(|row| row.2.iter().any(|item| item.is_cw))
+    {
+        row.0 = cw_title;
+        row.2 = cw_items_for(app);
+    }
+    if !data.is_empty() {
+        *lock(&app.rows_cache) = data;
+        let app2 = app.clone();
+        app.ui(move |ui| {
+            if ui.get_page().as_str() == "home" {
+                let data = lock(&app2.rows_cache).clone();
+                let model = rows_with_posters(&data, &lock(&app2.posters));
+                ui.set_rows(ModelRc::new(VecModel::from(model)));
+            }
+        });
+    }
     // Rebuild the translated genre-name lists for the new locale (the
     // canonical lists stay untouched — only their display twins change).
     update_genre_options(app);
@@ -3021,7 +3177,8 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
         let id = id.to_string();
         let name = name.trim().to_owned();
         if name.is_empty() {
-            a.ui(|ui| ui.set_status("Profile name cannot be empty.".into()));
+            let msg = tr(&a, "profile_name_empty");
+            a.ui(move |ui| ui.set_status(msg.into()));
             return;
         }
         let (icon, color) = (icon.to_string(), color.to_string());
@@ -3190,7 +3347,7 @@ fn startup(app: &Arc<App>) {
                 show_profiles(&app);
                 // Stored session expired or was revoked: back to the login screen.
                 if lock(&app.addons).is_empty() {
-                    app.flash("Could not load your Stremio addons – check your connection or sign in again.");
+                    app.flash(tr(&app, "addons_load_failed"));
                 }
             });
         }

@@ -496,8 +496,10 @@ mod tests {
         // Round-trip: save and reload preserves the locale field.
         let dir = std::env::temp_dir().join(format!("reel-store-locale-{}", std::process::id()));
         let path = dir.join("store.json");
-        let mut s = Store::default();
-        s.locale = "pl".to_owned();
+        let s = Store {
+            locale: "pl".to_owned(),
+            ..Store::default()
+        };
         s.save(&path).unwrap();
         let loaded = Store::load(&path).unwrap();
         assert_eq!(loaded.locale, "pl");

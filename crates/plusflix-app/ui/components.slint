@@ -2,6 +2,73 @@
 // motion and metrics stay consistent. No std-widgets are used anywhere.
 import { Theme } from "theme.slint";
 
+// ---------------------------------------------------------------- tooltips
+
+// Singleton tooltip state, filled by IconButton/Button on hover (after the
+// 500 ms delay) and rendered by the single TooltipLayer at the root of
+// MainWindow. `target-*` is the hovered button's rect in WINDOW coordinates
+// (via `absolute-position`), so the layer can position/flip/clamp itself.
+export global TooltipState {
+    in-out property <string> text: "";
+    in-out property <bool> visible: false;
+    // Hovered button geometry, in window coordinates.
+    in-out property <length> target-x;
+    in-out property <length> target-y;
+    in-out property <length> target-w;
+    in-out property <length> target-h;
+    public function show(text: string, x: length, y: length, w: length, h: length) {
+        root.text = text;
+        root.target-x = x;
+        root.target-y = y;
+        root.target-w = w;
+        root.target-h = h;
+        root.visible = true;
+    }
+    public function hide() {
+        root.visible = false;
+    }
+}
+
+// The ONE tooltip layer. Instantiated once as the last child of MainWindow
+// (and of the TestWindow test harness), above everything, never clipped.
+// Shows below the hovered button by default, flips above when there is not
+// enough room below, and clamps horizontally inside the window with an 8px
+// margin. Max width 280px, wrapping text.
+export component TooltipLayer inherits Rectangle {
+    in property <length> window-width;
+    in property <length> window-height;
+    visible: TooltipState.visible && TooltipState.text != "";
+    width: min(280px * Theme.scale, root.window-width - 16px * Theme.scale);
+    height: tip-t.preferred-height + 2 * Theme.sp-2;
+    property <bool> fits-below:
+        TooltipState.target-y + TooltipState.target-h + 6px * Theme.scale + root.height
+        <= root.window-height;
+    x: clamp(
+        TooltipState.target-x + (TooltipState.target-w - root.width) / 2,
+        8px * Theme.scale,
+        root.window-width - root.width - 8px * Theme.scale);
+    y: root.fits-below
+        ? TooltipState.target-y + TooltipState.target-h + 6px * Theme.scale
+        : max(8px * Theme.scale,
+              TooltipState.target-y - 6px * Theme.scale - root.height);
+    border-radius: 6px * Theme.scale;
+    background: Theme.surface-2;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-blur: 12px;
+    drop-shadow-color: #000000A0;
+    tip-t := Text {
+        x: Theme.sp-2;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - 2 * Theme.sp-2;
+        text: TooltipState.text;
+        color: Theme.text;
+        font-size: Theme.fs-caption;
+        font-family: Theme.font;
+        wrap: word-wrap;
+    }
+}
+
 // Plain data shared with Rust (see main.rs `ItemData`).
 export struct Item {
     id: string,
@@ -134,7 +201,6 @@ export component IconButton inherits Rectangle {
     in property <string> tooltip;
     callback clicked();
     property <bool> hov: ta.has-hover;
-    property <bool> show-tip: false;
     property <bool> has-label: root.label != "";
     height: Theme.hit;
     vertical-stretch: 0;
@@ -178,12 +244,19 @@ export component IconButton inherits Rectangle {
     }
     ta := TouchArea {
         clicked => {
-            root.show-tip = false;
+            TooltipState.hide();
             root.clicked();
         }
         changed has-hover => {
             if !ta.has-hover {
-                root.show-tip = false;
+                TooltipState.hide();
+            }
+        }
+        // Hide as soon as the button is pressed (the timer restarts on the
+        // next hover anyway).
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                TooltipState.hide();
             }
         }
     }
@@ -204,29 +277,18 @@ export component IconButton inherits Rectangle {
         border-radius: Theme.r-pill;
         background: transparent;
     }
+    // One tooltip for every button: after hovering for 500 ms the button fills
+    // the TooltipState singleton (text + its window rect) and the single
+    // TooltipLayer at the window root renders it. Cancelled by leaving or
+    // pressing (above), and hidden when a popup closes (the TouchArea's
+    // has-hover then flips to false).
     Timer {
         interval: 500ms;
-        running: hov && root.tooltip != "";
+        running: ta.has-hover && !ta.pressed && root.tooltip != "";
         triggered => {
-            root.show-tip = true;
-        }
-    }
-    if root.show-tip && root.tooltip != "": Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: -self.height - 6px * Theme.scale;
-        width: tip-t.preferred-width + Theme.sp-6;
-        height: tip-t.preferred-height + Theme.sp-3;
-        border-radius: 6px * Theme.scale;
-        background: Theme.surface-2;
-        border-width: 1px;
-        border-color: Theme.border;
-        tip-t := Text {
-            text: root.tooltip;
-            color: Theme.text;
-            font-size: Theme.fs-caption;
-            font-family: Theme.font;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+            TooltipState.show(root.tooltip,
+                root.absolute-position.x, root.absolute-position.y,
+                root.width, root.height);
         }
     }
 }
@@ -245,7 +307,6 @@ export component Button inherits Rectangle {
     in property <bool> outline; // outlined pill (profile picker "Manage")
     callback clicked();
     property <bool> hov: ta.has-hover && !root.disabled;
-    property <bool> show-tip: false;
     height: Theme.hit;
     vertical-stretch: 0;
     width: 2 * Theme.sp-6 + (root.has-icon ? ib.icon-size + Theme.sp-2 : 0px) + ib.text-width;
@@ -274,13 +335,18 @@ export component Button inherits Rectangle {
     ta := TouchArea {
         enabled: !root.disabled;
         clicked => {
-            root.show-tip = false;
+            TooltipState.hide();
             fs.focus();
             root.clicked();
         }
         changed has-hover => {
             if !ta.has-hover {
-                root.show-tip = false;
+                TooltipState.hide();
+            }
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                TooltipState.hide();
             }
         }
     }
@@ -301,29 +367,14 @@ export component Button inherits Rectangle {
         border-radius: Theme.r-pill;
         background: transparent;
     }
+    // Same single-layer tooltip as IconButton (see the note there).
     Timer {
         interval: 500ms;
-        running: hov && root.tooltip != "";
+        running: root.hov && !ta.pressed && root.tooltip != "";
         triggered => {
-            root.show-tip = true;
-        }
-    }
-    if root.show-tip && root.tooltip != "": Rectangle {
-        x: (parent.width - self.width) / 2;
-        y: -self.height - 6px * Theme.scale;
-        width: tip-t.preferred-width + Theme.sp-6;
-        height: tip-t.preferred-height + Theme.sp-3;
-        border-radius: 6px * Theme.scale;
-        background: Theme.surface-2;
-        border-width: 1px;
-        border-color: Theme.border;
-        tip-t := Text {
-            text: root.tooltip;
-            color: Theme.text;
-            font-size: Theme.fs-caption;
-            font-family: Theme.font;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+            TooltipState.show(root.tooltip,
+                root.absolute-position.x, root.absolute-position.y,
+                root.width, root.height);
         }
     }
 }
@@ -611,7 +662,9 @@ export component ProgressBar inherits Rectangle {
 // Clicking anywhere in the field focuses the input; Esc clears and blurs;
 // Enter submits. No layouts inside — every child is placed explicitly.
 export component SearchField inherits FocusScope {
-    in property <string> placeholder-text: "Search…";
+    // Default empty so no untranslated string can ever show; callers pass the
+    // translated placeholder via `placeholder-text`.
+    in property <string> placeholder-text: "";
     in property <bool> disabled;
     in-out property <string> text <=> ti.text;
     callback submitted(string); // Enter pressed

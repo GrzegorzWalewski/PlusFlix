@@ -479,7 +479,10 @@ mod tests {
             ),
             addon(
                 "https://b.example",
-                manifest("imdbRating", serde_json::json!(["action", "  Romans ", "Talk-show"])),
+                manifest(
+                    "imdbRating",
+                    serde_json::json!(["action", "  Romans ", "Talk-show"]),
+                ),
             ),
             addon(
                 "https://c.example",

@@ -49,11 +49,8 @@ impl Translations {
         Translations::from_json(&locale_json, &fallback_json)
     }
 
-    /// Return translated string for `key`, falling back through:
-    ///   1. selected locale map
-    ///   2. English fallback map
-    ///   3. the key itself (as a last resort)
-    /// Returns the translation for `key`, falling back to English, then to the key itself.
+    /// Returns the translation for `key`, falling back to English, then to
+    /// the key itself (as a last resort).
     pub fn t(&self, key: &str) -> String {
         if let Some(value) = self.map.get(key).or_else(|| self.fallback.get(key)) {
             return value.clone();
