@@ -1,6 +1,10 @@
 //! PlusFlix – a Stremio-backed player. UI glue: Slint on the main thread, everything
 //! else (network, failover sessions, mpv) on a tokio runtime.
 
+// Release builds show only the graphic window; debug builds keep the console so
+// logs remain visible during development.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 slint::include_modules!();
 
 use plusflix_core::addon::{Addon, AddonClient};
