@@ -163,14 +163,73 @@ pub struct CatalogDecl {
     pub kind: String,
     pub id: String,
     pub name: Option<String>,
+    /// Long manifest format: `extra: [{ name, isRequired, options, optionsLimit }]`.
     #[serde(default, deserialize_with = "null_as_default")]
     pub extra: Vec<ExtraDecl>,
+    /// Short manifest format: `extraSupported: ["skip", "genre", ...]` (no options).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub extra_supported: Vec<String>,
+    /// Short manifest format: `extraRequired: [...]` (no options).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub extra_required: Vec<String>,
 }
 
 impl CatalogDecl {
+    /// All extras this catalog accepts: the long `extra` list plus the short
+    /// `extraSupported` / `extraRequired` names, normalized into one list.
+    pub fn extras(&self) -> std::borrow::Cow<'_, [ExtraDecl]> {
+        use std::borrow::Cow;
+        if self.extra_supported.is_empty() && self.extra_required.is_empty() {
+            return Cow::Borrowed(&self.extra);
+        }
+        let mut merged = self.extra.clone();
+        for (names, required) in [
+            (self.extra_required.as_slice(), true),
+            (self.extra_supported.as_slice(), false),
+        ] {
+            for name in names {
+                match merged.iter_mut().find(|e| e.name == *name) {
+                    Some(e) => {
+                        if required {
+                            e.is_required = true;
+                        }
+                    }
+                    None => merged.push(ExtraDecl {
+                        name: name.clone(),
+                        is_required: required,
+                        ..Default::default()
+                    }),
+                }
+            }
+        }
+        Cow::Owned(merged)
+    }
+
+    /// Does the catalog accept this extra (in either manifest format)?
+    pub fn supports_extra(&self, name: &str) -> bool {
+        self.extras().iter().any(|e| e.name == name)
+    }
+
+    /// Does the catalog require an extra other than the given ones?
+    /// (A catalog with other required extras can't be browsed by genre.)
+    pub fn requires_other_than(&self, names: &[&str]) -> bool {
+        self.extras()
+            .iter()
+            .any(|e| e.is_required && !names.contains(&e.name.as_str()))
+    }
+
+    /// The declared options of the `genre` extra (empty when the catalog takes no genre).
+    /// Only the long `extra` format declares options; short-format catalogs return empty.
+    pub fn genre_options(&self) -> &[String] {
+        self.extra
+            .iter()
+            .find(|e| e.name == "genre")
+            .map_or(&[], |e| &e.options)
+    }
+
     /// Catalogs that need a mandatory argument (search, genre, ...) can't be shown as plain rows.
     pub fn browsable(&self) -> bool {
-        !self.extra.iter().any(|e| e.is_required)
+        !self.extras().iter().any(|e| e.is_required)
     }
 }
 
@@ -179,6 +238,30 @@ impl CatalogDecl {
 pub struct ExtraDecl {
     pub name: String,
     pub is_required: bool,
+    /// The values this extra accepts, as declared by the addon (may be empty).
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub options: Vec<String>,
+    /// How many values may be selected at once; the protocol default is 1.
+    pub options_limit: Option<u32>,
+}
+
+impl ExtraDecl {
+    /// The effective options limit (protocol default 1).
+    pub fn effective_options_limit(&self) -> u32 {
+        self.options_limit.unwrap_or(1)
+    }
+
+    /// Options that are all 4-digit numbers are YEARS (e.g. Cinemeta's "New"
+    /// catalog hides a year filter behind a required `genre` extra), not genre
+    /// names: such catalogs are excluded from genre lists. Extension point for
+    /// a future Year filter - not built yet.
+    pub fn is_year_options(&self) -> bool {
+        !self.options.is_empty()
+            && self
+                .options
+                .iter()
+                .all(|o| o.len() == 4 && o.bytes().all(|b| b.is_ascii_digit()))
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +285,69 @@ mod tests {
         let c: CatalogDecl =
             serde_json::from_str(r#"{"type":"movie","id":"top","extra":null}"#).unwrap();
         assert!(c.browsable());
+    }
+
+    #[test]
+    fn short_extra_format_parses() {
+        // Short format: extraSupported / extraRequired at the catalog level.
+        let c: CatalogDecl = serde_json::from_str(
+            r#"{"type":"movie","id":"top","extraSupported":["skip","genre"],"extraRequired":null}"#,
+        )
+        .unwrap();
+        assert!(c.supports_extra("skip") && c.supports_extra("genre"));
+        assert!(!c.requires_other_than(&["genre", "skip"]));
+        assert!(c.browsable()); // nothing is required
+        assert!(c.genre_options().is_empty()); // short format declares no options
+    }
+
+    #[test]
+    fn short_extra_required_marks_catalog_unbrowsable() {
+        let c: CatalogDecl = serde_json::from_str(
+            r#"{"type":"movie","id":"year","extraRequired":["genre"],"extraSupported":["skip"]}"#,
+        )
+        .unwrap();
+        assert!(!c.browsable());
+        assert!(c.supports_extra("skip") && c.supports_extra("genre"));
+        assert!(!c.requires_other_than(&["genre", "skip"]));
+    }
+
+    #[test]
+    fn long_extra_format_parses_with_options() {
+        let c: CatalogDecl = serde_json::from_str(
+            r#"{"type":"movie","id":"top","extra":[
+                {"name":"genre","isRequired":false,"options":["Action","Sci-Fi"],"optionsLimit":1},
+                {"name":"skip","isRequired":false,"options":null}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            c.genre_options(),
+            &["Action".to_string(), "Sci-Fi".to_string()]
+        );
+        assert!(c.supports_extra("skip"));
+        assert!(!c.requires_other_than(&["genre", "skip"]));
+        // A required extra other than genre/skip makes genre browsing impossible.
+        let c2: CatalogDecl = serde_json::from_str(
+            r#"{"type":"movie","id":"kinds","extra":[{"name":"genre","options":["Action"]},{"name":"kind","isRequired":true}]}"#,
+        )
+        .unwrap();
+        assert!(c2.requires_other_than(&["genre", "skip"]));
+    }
+
+    #[test]
+    fn year_options_detected() {
+        let year: ExtraDecl = serde_json::from_str(
+            r#"{"name":"genre","isRequired":true,"options":["2023","2024","2019"]}"#,
+        )
+        .unwrap();
+        assert!(year.is_year_options());
+        let genre: ExtraDecl =
+            serde_json::from_str(r#"{"name":"genre","options":["Action","Sci-Fi"]}"#).unwrap();
+        assert!(!genre.is_year_options());
+        assert!(!ExtraDecl::default().is_year_options());
+        assert_eq!(genre.effective_options_limit(), 1);
+        let two: ExtraDecl =
+            serde_json::from_str(r#"{"name":"genre","options":["a"],"optionsLimit":5}"#).unwrap();
+        assert_eq!(two.effective_options_limit(), 5);
     }
 }

@@ -558,16 +558,18 @@ export component SegmentedControl inherits Rectangle {
     }
 }
 
-// Small rounded label (genres etc.).
+// Small rounded label (genres etc.). Clickable: `clicked` fires with the
+// chip's text; chips without a handler just don't fire.
 export component Chip inherits Rectangle {
     in property <string> text;
+    callback clicked();
     height: 24px * Theme.scale;
     width: self.preferred-width;
     preferred-width: label.preferred-width + 2 * Theme.sp-3;
     border-radius: Theme.r-pill;
-    background: Theme.surface-2;
+    background: ta.has-hover ? Theme.hover-bg : Theme.surface-2;
     border-width: 1px;
-    border-color: Theme.border;
+    border-color: ta.has-hover ? Theme.border-strong : Theme.border;
     vertical-stretch: 0;
     label := Text {
         x: (parent.width - self.width) / 2;
@@ -576,6 +578,12 @@ export component Chip inherits Rectangle {
         color: Theme.muted;
         font-size: Theme.fs-caption;
         font-family: Theme.font;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
     }
 }
 

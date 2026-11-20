@@ -7,6 +7,9 @@ import {
     Switch, SegmentedControl, Chip, ProgressBar, PosterCard, CwCard,
     Avatar, VScroll, SearchField, SectionHeader,
 } from "components.slint";
+// ListView is the only std-widget used: it is the virtualized list that keeps
+// hundreds of grid rows smooth (all visible components stay custom).
+import { ListView } from "std-widgets.slint";
 
 export struct NavTab {
     label: string,
@@ -220,6 +223,50 @@ export component MainWindow inherits Window {
     in property <[Item]> search-results;
     in property <bool> searching;
 
+    // ---- genre browsing (Movies / Series) ----
+    // Genre lists with "All genres" as entry 0, straight from the addon
+    // manifests (only genres some catalog really supports). Canonical
+    // (English) names: these go back into the addon URLs.
+    in property <[string]> movie-genres;
+    in property <[string]> series-genres;
+    // Parallel display translations of the lists above (same indices), per
+    // the interface language; unmapped names fall back to the canonical name.
+    in property <[string]> movie-genres-t;
+    in property <[string]> series-genres-t;
+    // Flat items of the active genre browse; the grid re-rows them.
+    in property <[Item]> genre-items;
+    // First page in flight: show a skeleton grid.
+    in property <bool> genre-busy;
+    // Next page in flight: show a spinner row at the end of the grid.
+    in property <bool> genre-loading;
+    in property <bool> genre-has-more;
+    // Catalog chips for the active genre: "All" + catalog display names.
+    in property <[string]> genre-catalogs;
+    in-out property <int> genre-catalog-idx;
+    // Selected genre per page; "" = none (row view is the default).
+    // Canonical names in -genre, display translations in -genre-t.
+    in-out property <string> movies-genre;
+    in-out property <string> series-genre;
+    in-out property <string> movies-genre-t;
+    in-out property <string> series-genre-t;
+    in-out property <bool> genre-popover-open;
+    // Highlighted row of the open genre popover (keyboard navigation).
+    in-out property <int> genre-popover-idx;
+    // Genre strings, translated with the interface language.
+    in property <string> t-genres;
+    in property <string> t-all-genres;
+    in property <string> t-movies-title;
+    in property <string> t-series-title;
+    in property <string> t-clear-genre;
+    in property <string> t-no-genre-prefix;
+    in property <string> t-no-genre-suffix;
+
+    callback genre-chosen(string);      // "" = clear / "All genres"
+    // Genre chip clicked in the detail overlay: (canonical) genre name.
+    callback detail-genre-chosen(string);
+    callback genre-catalog-chosen(int); // index into genre-catalogs
+    callback genre-load-more();          // grid scrolled near the bottom
+
     // ---- detail overlay ----
     in-out property <bool> detail-open;
     in property <string> detail-id;
@@ -227,6 +274,9 @@ export component MainWindow inherits Window {
     in property <bool> detail-long-title; // true = use the smaller title size
     in property <string> detail-info; // year · runtime (text part of the meta row)
     in property <[string]> detail-genres; // rendered as chips
+    // Display translations of detail-genres (same indices); canonical names
+    // still go into genre-chosen fired from the chips.
+    in property <[string]> detail-genres-t;
     in property <string> detail-desc;
     in property <image> detail-poster;
     in property <bool> detail-has-poster;
@@ -758,6 +808,12 @@ export component MainWindow inherits Window {
     if root.screen == "main": Rectangle {
         // ---- catalog pages ----
         if root.page == "home" || root.page == "movies" || root.page == "series": Rectangle {
+            // While a genre browse is active on Movies/Series the plain rows
+            // are unmounted (not just covered): nothing underneath the genre
+            // grid may stay clickable or scrollable.
+            if root.page == "home"
+                || (root.page == "movies" && root.movies-genre == "")
+                || (root.page == "series" && root.series-genre == ""): Rectangle {
             flick := Flickable {
                 x: 0;
                 width: parent.width - Theme.sp-2;
@@ -769,7 +825,10 @@ export component MainWindow inherits Window {
                     height: max(self.preferred-height, flick.height);
                     padding-left: Theme.page-margin;
                     padding-right: Theme.page-margin;
-                    padding-top: Theme.topbar + Theme.sp-2;
+                    // Movies/Series clear the fixed page header; Home doesn't have one.
+                    padding-top: root.page == "home"
+                        ? Theme.topbar + Theme.sp-2
+                        : Theme.topbar + Theme.sp-2 + Theme.hit + Theme.sp-1;
                     padding-bottom: Theme.sp-6;
                     spacing: Theme.sp-8;
                     if root.busy && root.rows.length == 0: Text {
@@ -805,6 +864,338 @@ export component MainWindow inherits Window {
                 x: parent.width - self.width - 2px * Theme.scale;
                 height: parent.height;
                 content-y <=> flick.content-y;
+            }
+            }
+
+            // Fixed page header for Movies / Series (the rows flick clears it
+            // via padding-top): title, clear button and the genre pill.
+            if root.page != "home": cat-head := Rectangle {
+                y: Theme.topbar + Theme.sp-2;
+                x: Theme.page-margin;
+                width: parent.width - 2 * Theme.page-margin;
+                height: Theme.hit;
+                // Genre popover data lives here (not on the PopupWindow): a
+                // PopupWindow's own properties can't be accessed from outside.
+                // `glist` stays canonical (English, straight into the addon
+                // URLs); `glist-t` is the same list translated for display.
+                property <[string]> glist: root.page == "movies" ? root.movie-genres : root.series-genres;
+                property <[string]> glist-t: root.page == "movies" ? root.movie-genres-t : root.series-genres-t;
+                property <string> sel-genre: root.page == "movies" ? root.movies-genre : root.series-genre;
+                property <string> sel-genre-t: root.page == "movies" ? root.movies-genre-t : root.series-genre-t;
+                property <string> page-title: root.page == "movies" ? root.t-movies-title : root.t-series-title;
+                // The popup's intended width — the cell grid below derives its
+                // column count from THIS, not from cat-head.width (the header
+                // spans the whole window, which made every cell huge).
+                property <length> gp-w: min(680px * Theme.scale, self.width);
+                property <int> gp-cols: clamp(floor(self.gp-w / (170px * Theme.scale)), 3, 4);
+                property <length> gp-cell-w: (self.gp-w - 2 * Theme.sp-2) / self.gp-cols;
+                HorizontalLayout {
+                    Text {
+                        text: cat-head.sel-genre == ""
+                            ? cat-head.page-title
+                            : cat-head.page-title + ": " + cat-head.sel-genre-t;
+                        font-size: Theme.fs-heading;
+                        font-weight: 600;
+                        color: Theme.text;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { } // stretch spacer
+                    genre-pill := Rectangle {
+                        height: 34px * Theme.scale;
+                        vertical-stretch: 0;
+                        width: Theme.sp-3 + gp-label.preferred-width + Theme.sp-2 + 16px * Theme.scale + Theme.sp-2;
+                        border-radius: Theme.r-pill;
+                        background: gp-ta.has-hover ? Theme.hover-bg : Theme.surface-2;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        gp-label := Text {
+                            x: Theme.sp-3;
+                            y: (parent.height - self.height) / 2;
+                            text: cat-head.sel-genre == "" ? root.t-genres : cat-head.sel-genre-t;
+                            font-size: Theme.fs-body;
+                            color: Theme.text;
+                        }
+                        Image {
+                            source: @image-url("icons/chevron-down.svg");
+                            width: 16px * Theme.scale;
+                            height: 16px * Theme.scale;
+                            colorize: Theme.muted;
+                            x: parent.width - Theme.sp-2 - self.width;
+                            y: (parent.height - self.height) / 2;
+                        }
+                        gp-ta := TouchArea {
+                            clicked => {
+                                root.genre-popover-open = true;
+                                gp-popup.show();
+                                gp-focus.focus();
+                            }
+                        }
+                        gp-popup := PopupWindow {
+                            x: 0;
+                            y: parent.height + Theme.sp-2;
+                            // PopupWindow sizes via preferred-width/height;
+                            // plain width/height bindings are ignored.
+                            preferred-width: cat-head.gp-w;
+                            preferred-height: 2 * Theme.sp-2 + ceil(cat-head.glist.length / cat-head.gp-cols) * 36px * Theme.scale;
+                            Rectangle {
+                                // Explicit geometry: a PopupWindow child with
+                                // percentage size gets no usable geometry and
+                                // the cell TouchAreas never receive clicks
+                                // (same lesson as the avatar menu).
+                                width: cat-head.gp-w;
+                                height: 2 * Theme.sp-2 + ceil(cat-head.glist.length / cat-head.gp-cols) * 36px * Theme.scale;
+                                background: #10151CF2;
+                                border-width: 1px;
+                                border-color: Theme.border-strong;
+                                drop-shadow-blur: 40px;
+                                drop-shadow-color: #000000C0;
+                                for g[i] in cat-head.glist: Rectangle {
+                                    // "All genres" is index 0 in both lists;
+                                    // match it by index (its display name is
+                                    // translated, so a string compare breaks).
+                                    property <bool> active: (i == 0 && cat-head.sel-genre == "") || g == cat-head.sel-genre;
+                                    x: Theme.sp-2 + mod(i, cat-head.gp-cols) * cat-head.gp-cell-w;
+                                    y: Theme.sp-2 + floor(i / cat-head.gp-cols) * 36px * Theme.scale;
+                                    width: cat-head.gp-cell-w - Theme.sp-1;
+                                    height: 36px * Theme.scale - Theme.sp-1;
+                                    border-radius: Theme.r-sm;
+                                    background: self.active ? Theme.accent : (gp-cell.has-hover ? Theme.hover-bg : transparent);
+                                    Text {
+                                        x: Theme.sp-3;
+                                        y: (parent.height - self.height) / 2;
+                                        // Display translation of the canonical
+                                        // name (same index in glist-t).
+                                        text: cat-head.glist-t[i];
+                                        font-size: Theme.fs-body;
+                                        color: parent.active ? #FFFFFF : Theme.text;
+                                    }
+                                    // TouchArea LAST: earlier siblings (the Text)
+                                    // would otherwise sit on top and eat the clicks.
+                                    gp-cell := TouchArea {
+                                        clicked => {
+                                            // Invoke the callback FIRST, close the popup
+                                            // LAST: closing (or unmounting) earlier tears
+                                            // the item tree down mid-handler and silently
+                                            // drops the callback (see tests/avatar_menu.rs).
+                                            root.genre-chosen(g == "All genres" ? "" : g);
+                                            root.genre-popover-open = false;
+                                            gp-popup.close();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Clear button sits to the RIGHT of the pill, with a gap,
+                    // both 34px tall so they line up.
+                    if cat-head.sel-genre != "": Rectangle {
+                        width: Theme.sp-2;
+                        height: 34px * Theme.scale;
+                        vertical-stretch: 0;
+                    }
+                    if cat-head.sel-genre != "": IconButton {
+                        icon: @image-url("icons/x.svg");
+                        tooltip: root.t-clear-genre;
+                        height: 34px * Theme.scale;
+                        clicked => {
+                            root.genre-chosen("");
+                        }
+                    }
+                }
+                gp-focus := FocusScope {
+                    width: 0px;
+                    height: 0px;
+                    key-pressed(e) => {
+                        if (e.text == Key.Escape) {
+                            root.genre-popover-open = false;
+                            gp-popup.close();
+                            return accept;
+                        }
+                        if (e.text == Key.Return) {
+                            // Callback first, close last (see gp-cell note).
+                            if (root.genre-popover-idx == 0) {
+                                root.genre-chosen("");
+                            } else if (root.genre-popover-idx < cat-head.glist.length) {
+                                root.genre-chosen(cat-head.glist[root.genre-popover-idx] == "All genres" ? "" : cat-head.glist[root.genre-popover-idx]);
+                            }
+                            root.genre-popover-open = false;
+                            gp-popup.close();
+                            return accept;
+                        }
+                        if (e.text == Key.LeftArrow) {
+                            root.genre-popover-idx = max(0, root.genre-popover-idx - 1);
+                            return accept;
+                        }
+                        if (e.text == Key.RightArrow) {
+                            root.genre-popover-idx = min(cat-head.glist.length - 1, root.genre-popover-idx + 1);
+                            return accept;
+                        }
+                        if (e.text == Key.UpArrow) {
+                            root.genre-popover-idx = max(0, root.genre-popover-idx - cat-head.gp-cols);
+                            return accept;
+                        }
+                        if (e.text == Key.DownArrow) {
+                            root.genre-popover-idx = min(cat-head.glist.length - 1, root.genre-popover-idx + cat-head.gp-cols);
+                            return accept;
+                        }
+                        return reject;
+                    }
+                }
+            }
+        }
+
+        // ---- genre grid (Movies / Series with an active genre) ----
+        // Only the CURRENT page's genre counts: a Movies genre selection must
+        // not keep the grid mounted over the Series rows (and vice versa).
+        if (root.page == "movies" || root.page == "series") && (root.page == "movies" ? root.movies-genre : root.series-genre) != "": genre-grid := Rectangle {
+            // Starts below the fixed page header: cat-head is declared earlier
+            // in this file, so a full-size grid would paint right over it.
+            y: Theme.topbar + Theme.sp-2 + Theme.hit + Theme.sp-1;
+            height: parent.height - self.y;
+            property <bool> is-movies: root.page == "movies";
+            property <string> sel-genre: is-movies ? root.movies-genre : root.series-genre;
+            property <string> sel-genre-t: is-movies ? root.movies-genre-t : root.series-genre-t;
+            background: Theme.bg;
+            property <int> cols: max(4, floor((self.width - 2 * Theme.page-margin + 24px * Theme.scale) / (150px * Theme.scale + 24px * Theme.scale)));
+            property <length> cell-w: (self.width - 2 * Theme.page-margin - (cols - 1) * 24px * Theme.scale) / cols;
+            property <length> cell-h: cell-w * 1.5 + Theme.sp-1 + 34px * Theme.scale;
+            property <int> row-count: (root.genre-items.length + cols - 1) / cols;
+            // y's inside the grid are relative to its origin (below the header).
+            property <length> grid-top: Theme.sp-1 + 36px * Theme.scale + Theme.sp-2;
+
+            // catalog chips: "All" + per-addon catalogs, narrowing the active genre
+            chips := Flickable {
+                y: Theme.sp-1;
+                x: 0;
+                width: parent.width - Theme.sp-2;
+                height: 36px * Theme.scale;
+                content-width: chip-row.preferred-width;
+                chip-row := HorizontalLayout {
+                    x: Theme.page-margin;
+                    height: parent.height;
+                    alignment: start;
+                    spacing: Theme.sp-2;
+                    for c[ci] in root.genre-catalogs: chip := Rectangle {
+                        property <bool> chosen: root.genre-catalog-idx == ci;
+                        height: parent.height;
+                        border-radius: Theme.r-pill;
+                        background: self.chosen ? Theme.accent : (chip-ta.has-hover ? Theme.hover-bg : Theme.surface-2);
+                        border-width: 1px;
+                        border-color: self.chosen ? transparent : Theme.border;
+                        HorizontalLayout {
+                            padding-left: Theme.sp-3;
+                            padding-right: Theme.sp-3;
+                            Text {
+                                text: c;
+                                font-size: Theme.fs-caption;
+                                vertical-alignment: center;
+                                color: chip.chosen ? #FFFFFF : Theme.text;
+                            }
+                        }
+                        chip-ta := TouchArea {
+                            clicked => {
+                                root.genre-catalog-chosen(ci);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // skeleton grid while the first page is in flight
+            if root.genre-busy && root.genre-items.length == 0: Rectangle {
+                x: Theme.page-margin;
+                y: genre-grid.grid-top;
+                width: parent.width - 2 * Theme.page-margin;
+                height: parent.height - self.y;
+                for r in 3: Rectangle {
+                    for c in genre-grid.cols: Rectangle {
+                        x: c * (genre-grid.cell-w + 24px * Theme.scale);
+                        y: r * (genre-grid.cell-h + 24px * Theme.scale);
+                        width: genre-grid.cell-w;
+                        height: genre-grid.cell-h;
+                        border-radius: Theme.r-sm;
+                        background: #FFFFFF14;
+                    }
+                }
+            }
+
+            // nothing matched (every catalog answered or failed)
+            if !root.genre-busy && root.genre-items.length == 0: Rectangle {
+                x: Theme.page-margin;
+                y: genre-grid.grid-top;
+                width: parent.width - 2 * Theme.page-margin;
+                height: parent.height - self.y;
+                VerticalLayout {
+                    padding-top: Theme.sp-12;
+                    alignment: start;
+                    spacing: Theme.sp-4;
+                    Text {
+                        text: root.t-no-genre-prefix + genre-grid.sel-genre-t + root.t-no-genre-suffix;
+                        wrap: word-wrap;
+                        color: Theme.muted;
+                        font-size: Theme.fs-body;
+                    }
+                    Button {
+                        text: root.t-clear-genre;
+                        primary: true;
+                        clicked => {
+                            root.genre-chosen("");
+                        }
+                    }
+                }
+            }
+
+            // the grid itself: virtualized rows of PosterCards
+            if !root.genre-busy && root.genre-items.length > 0: ListView {
+                y: genre-grid.grid-top;
+                x: 0;
+                width: parent.width - Theme.sp-2;
+                height: parent.height - self.y;
+                for row-idx in genre-grid.row-count: Rectangle {
+                    height: genre-grid.cell-h + 24px * Theme.scale;
+                    HorizontalLayout {
+                        padding-left: Theme.page-margin;
+                        padding-right: Theme.page-margin;
+                        spacing: 24px * Theme.scale;
+                        for ci in genre-grid.cols: cell := Rectangle {
+                            property <int> flat: row-idx * genre-grid.cols + ci;
+                            property <bool> in-range: flat < root.genre-items.length;
+                            width: genre-grid.cell-w;
+                            height: genre-grid.cell-h;
+                            if in-range: PosterCard {
+                                width: parent.width;
+                                height: parent.height;
+                                item: root.genre-items[cell.flat];
+                                clicked => {
+                                    root.open-item(self.item.title-id == "" ? self.item.id : self.item.title-id, self.item.kind);
+                                }
+                                toggle-favorite => {
+                                    root.toggle-favorite-card(self.item.id, self.item.kind, self.item.name, self.item.poster-url);
+                                }
+                                toggle-watched => {
+                                    root.toggle-watched-card(self.item.id, self.item.kind);
+                                }
+                            }
+                        }
+                    }
+                    // Infinite-scroll sentinel: instantiated only when the
+                    // ListView builds a near-bottom row (or the grid is short
+                    // enough to show one right away) — kicks off the next page.
+                    if root.genre-has-more && row-idx >= genre-grid.row-count - 2: Rectangle {
+                        width: parent.width;
+                        height: 16px * Theme.scale + Theme.sp-1;
+                        y: parent.height - self.height - Theme.sp-2;
+                        if root.genre-loading: IconLabel {
+                            icon: @image-url("icons/rotate-cw.svg");
+                            text: "";
+                            spin: true;
+                            x: (parent.width - self.width) / 2;
+                        }
+                        init => {
+                            root.genre-load-more();
+                        }
+                    }
+                }
             }
         }
 
@@ -1354,8 +1745,13 @@ export component MainWindow inherits Window {
                             vertical-alignment: center;
                             height: parent.height;
                         }
-                        for g in root.detail-genres: Chip {
-                            text: g;
+                        for g[gi] in root.detail-genres: Chip {
+                            text: root.detail-genres-t[gi];
+                            clicked => {
+                                // g stays canonical (English): it goes back
+                                // into the addon URLs via genre browsing.
+                                root.detail-genre-chosen(g);
+                            }
                         }
                     }
                     Rectangle { vertical-stretch: 0; height: Theme.sp-3; }

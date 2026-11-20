@@ -2,9 +2,10 @@
 //! No UI code lives here, so the whole playback logic is testable headlessly.
 
 pub mod addon;
-pub mod i18n;
 pub mod error;
+pub mod genres;
 pub mod home;
+pub mod i18n;
 pub mod lang;
 pub mod loader;
 pub mod model;
@@ -17,6 +18,8 @@ pub mod session;
 pub mod settings;
 pub mod store;
 pub mod stremio;
+#[cfg(test)]
+pub(crate) mod testhttp;
 pub mod vlc;
 
 pub use error::{Error, Result};

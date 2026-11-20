@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
-plusflix-core = { version = "0.1.0", path = "../plusflix-core" }
+plusflix-core = { version = "1.1.0", path = "../plusflix-core" }
 slint = "1.19.0"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"

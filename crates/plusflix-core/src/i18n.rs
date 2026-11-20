@@ -1,12 +1,12 @@
+use crate::error::Result;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-use crate::error::Result;
-use std::fs;
 
 pub struct Translations {
     map: HashMap<String, String>,
-    fallback: HashMap<String, String>,  // always English
+    fallback: HashMap<String, String>, // always English
 }
 
 /// Keys already warned about by `t()` (each missing key is logged once).
@@ -66,6 +66,16 @@ impl Translations {
             }
         }
         key.to_owned()
+    }
+
+    /// Translated string for `key`, or `None` when neither the locale nor the
+    /// English fallback has it (no warning). Used for optional keys whose
+    /// natural fallback is caller-supplied (e.g. addon genre names).
+    pub fn t_opt(&self, key: &str) -> Option<String> {
+        self.map
+            .get(key)
+            .or_else(|| self.fallback.get(key))
+            .cloned()
     }
 }
 
@@ -135,6 +145,24 @@ mod tests {
         // Missing everywhere: returns the key (and warns once per key).
         assert_eq!(translations.t("nonexistent_key"), "nonexistent_key");
         assert_eq!(translations.t("nonexistent_key"), "nonexistent_key");
+        Ok(())
+    }
+
+    #[test]
+    fn test_t_opt() -> Result<()> {
+        let translations = Translations::from_json(
+            r#"{"genre_action": "Akcja"}"#,
+            r#"{"genre_action": "Action", "genre_horror": "Horror"}"#,
+        )?;
+        // Locale hit.
+        assert_eq!(translations.t_opt("genre_action"), Some("Akcja".to_owned()));
+        // Locale miss, English fallback hit.
+        assert_eq!(
+            translations.t_opt("genre_horror"),
+            Some("Horror".to_owned())
+        );
+        // Missing everywhere: None (no warn, caller supplies the fallback).
+        assert_eq!(translations.t_opt("genre_bogus"), None);
         Ok(())
     }
 }

@@ -4,6 +4,7 @@
 slint::include_modules!();
 
 use plusflix_core::addon::{Addon, AddonClient};
+use plusflix_core::genres::{self, CatalogRef, GenreBrowser};
 use plusflix_core::home;
 use plusflix_core::lang::Lang;
 use plusflix_core::loader::SourceLoader;
@@ -17,8 +18,8 @@ use plusflix_core::store::{
     self, Favorite, Profile, ProgressCard, Store, MAX_PROFILES, PROFILE_COLORS, PROFILE_ICONS,
 };
 use plusflix_core::stremio::StremioApi;
-use plusflix_core::Translations;
 use plusflix_core::vlc::{VlcConfig, VlcPlayer};
+use plusflix_core::Translations;
 use slint::{
     ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel, Weak,
 };
@@ -171,6 +172,15 @@ struct App {
     /// Bumped on every page load; background catalog tasks only patch the UI
     /// while their generation is current.
     load_gen: std::sync::atomic::AtomicUsize,
+    /// Active genre browse (Movies/Series), if any.
+    genre: Mutex<Option<GenreState>>,
+    /// Bumped on every new genre selection; page fetches compare it against
+    /// the state's token and are dropped when the selection was replaced.
+    genre_gen: std::sync::atomic::AtomicUsize,
+    /// True while a genre page fetch is running; load-more triggers that
+    /// arrive meanwhile set `genre_pending` instead.
+    genre_fetching: AtomicBool,
+    genre_pending: AtomicBool,
 }
 
 /// Plain-data twin of the Slint `Item` (Slint images are not `Send`).
@@ -303,6 +313,22 @@ impl ItemData {
             ..Default::default()
         }
     }
+}
+
+/// One active genre browse (Movies or Series with a chosen genre): the pager
+/// plus the flat item list the UI grid re-rows.
+struct GenreState {
+    kind: String,
+    genre: String,
+    /// Every catalog serving this genre; the chips narrow it down.
+    catalogs: Vec<CatalogRef>,
+    browser: GenreBrowser,
+    items: Vec<ItemData>,
+    /// False once every selected catalog is exhausted.
+    has_more: bool,
+    /// `genre_gen` value at creation: page fetches check it to drop results
+    /// that belong to a replaced selection.
+    token: usize,
 }
 
 fn items_model(items: &[ItemData]) -> ModelRc<Item> {
@@ -558,6 +584,7 @@ fn apply_poster(ui: &MainWindow, id: &str, dec: &Decoded, landscape: bool) {
     }
     patch_items(&ui.get_favorites(), id, &img, landscape);
     patch_items(&ui.get_search_results(), id, &img, landscape);
+    patch_items(&ui.get_genre_items(), id, &img, landscape);
     if !landscape && ui.get_detail_id().as_str() == id {
         ui.set_detail_poster(img);
         ui.set_detail_has_poster(true);
@@ -618,6 +645,7 @@ fn show_profiles(app: &Arc<App>) {
     };
     *lock(&app.profile) = None;
     *lock(&app.detail) = None;
+    *lock(&app.genre) = None;
     app.ui(move |ui| {
         let model: Vec<ProfileData> = profiles
             .into_iter()
@@ -635,6 +663,17 @@ fn show_profiles(app: &Arc<App>) {
         ui.set_playing(false);
         ui.set_manage_profiles(false);
         ui.set_edit_open(false);
+        // Any genre browse is off once we leave the main screen.
+        ui.set_movies_genre("".into());
+        ui.set_series_genre("".into());
+        ui.set_movies_genre_t("".into());
+        ui.set_series_genre_t("".into());
+        ui.set_genre_catalogs(ModelRc::default());
+        ui.set_genre_catalog_idx(0);
+        ui.set_genre_items(ModelRc::default());
+        ui.set_genre_has_more(false);
+        ui.set_genre_busy(false);
+        ui.set_genre_loading(false);
         ui.set_icon_choices(ModelRc::new(VecModel::from(
             PROFILE_ICONS
                 .iter()
@@ -1374,9 +1413,15 @@ fn patch_episode_thumb(ui: &MainWindow, id: &str, dec: &Decoded) {
 /// Patches every visible card for `id` (rows, favorites and search grids)
 /// in place, without rebuilding the models.
 fn patch_item(ui: &MainWindow, id: &str, f: impl Fn(&mut Item)) {
-    for model in [ui.get_favorites(), ui.get_search_results()] {
+    for model in [
+        ui.get_favorites(),
+        ui.get_search_results(),
+        ui.get_genre_items(),
+    ] {
         for i in 0..model.row_count() {
-            let Some(mut it) = model.row_data(i) else { continue };
+            let Some(mut it) = model.row_data(i) else {
+                continue;
+            };
             if it.id.as_str() == id {
                 f(&mut it);
                 model.set_row_data(i, it);
@@ -1385,10 +1430,14 @@ fn patch_item(ui: &MainWindow, id: &str, f: impl Fn(&mut Item)) {
     }
     let rows = ui.get_rows();
     for r in 0..rows.row_count() {
-        let Some(row) = rows.row_data(r) else { continue };
+        let Some(row) = rows.row_data(r) else {
+            continue;
+        };
         let items = row.items.clone();
         for i in 0..items.row_count() {
-            let Some(mut it) = items.row_data(i) else { continue };
+            let Some(mut it) = items.row_data(i) else {
+                continue;
+            };
             if it.id.as_str() == id {
                 f(&mut it);
                 items.set_row_data(i, it);
@@ -1568,6 +1617,11 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
             .collect::<Vec<_>>()
             .join("  ·  ");
         let genres = meta.genres.clone();
+        // Display translations of the canonical (English) meta genre names.
+        let genres_t: Vec<slint::SharedString> = genres
+            .iter()
+            .map(|g| slint::SharedString::from(genre_label(&app, g)))
+            .collect();
         let long_title = meta.name.chars().count() > 40;
         let poster = meta.poster.clone();
         let detail = Arc::new(Detail {
@@ -1616,6 +1670,7 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
                         .map(|g| slint::SharedString::from(g.as_str()))
                         .collect::<Vec<_>>(),
                 )));
+                ui.set_detail_genres_t(ModelRc::new(VecModel::from(genres_t)));
                 ui.set_detail_desc(desc.into());
                 ui.set_detail_poster(Image::default());
                 ui.set_detail_has_poster(false);
@@ -2181,9 +2236,362 @@ fn do_search(app: &Arc<App>, query: String) {
 
 // ---------------------------------------------------------------- account
 
+// ---------------------------------------------------------------- genres
+
+/// Locale key for a genre name: lowercase, non-alphanumerics folded into a
+/// single underscore (e.g. "Sci-Fi" -> `genre_scifi`).
+fn genre_key(name: &str) -> String {
+    let mut key = String::from("genre_");
+    let mut prev_us = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            key.push(ch.to_ascii_lowercase());
+            prev_us = false;
+        } else if !prev_us && !key.ends_with('_') {
+            key.push('_');
+            prev_us = true;
+        }
+    }
+    let trimmed = key.trim_end_matches('_').to_owned();
+    trimmed
+}
+
+/// Display name for a canonical (English) genre: the interface language's
+/// translation from the locale files, or the canonical name itself when the
+/// locale has no entry for it (no warning — addon lists are open-ended).
+fn genre_label(app: &App, name: &str) -> String {
+    lock(&app.translations)
+        .t_opt(&genre_key(name))
+        .unwrap_or_else(|| name.to_owned())
+}
+
+/// Genre list for one kind: "All genres" + the union of every catalog's
+/// options (only genres some catalog really supports). Canonical names —
+/// they go straight back into the addon URLs.
+fn genre_names(addons: &[Addon], kind: &str) -> Vec<slint::SharedString> {
+    let mut out = vec![slint::SharedString::from("All genres")];
+    out.extend(
+        genres::genre_options(addons, kind)
+            .iter()
+            .map(|o| slint::SharedString::from(o.name.as_str())),
+    );
+    out
+}
+
+/// Display translations parallel to [`genre_names`]: same order, entry 0 is the
+/// translated "All genres", every other entry the translated genre name (or
+/// the canonical name when the locale has no entry).
+fn genre_names_t(app: &App, addons: &[Addon], kind: &str) -> Vec<slint::SharedString> {
+    let mut out = vec![slint::SharedString::from(
+        lock(&app.translations).t("all_genres"),
+    )];
+    out.extend(
+        genres::genre_options(addons, kind)
+            .iter()
+            .map(|o| slint::SharedString::from(genre_label(app, &o.name))),
+    );
+    out
+}
+
+/// Rebuilds the Movies/Series genre lists from the current addon manifests
+/// (pure manifest data, no requests). Runs on every addon refresh.
+fn update_genre_options(app: &Arc<App>) {
+    let addons = lock(&app.addons).clone();
+    for kind in ["movie", "series"] {
+        let catalogs = genres::genre_catalogs(&addons, kind);
+        tracing::info!(
+            "[genres] {kind}: catalogs with genre support: {}",
+            catalogs
+                .iter()
+                .map(|c| c.catalog_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let options = genres::genre_options(&addons, kind);
+        tracing::info!(
+            "[genres] {kind}: {} genre options: {}",
+            options.len(),
+            options
+                .iter()
+                .map(|o| o.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let movie = genre_names(&addons, "movie");
+    let series = genre_names(&addons, "series");
+    let movie_t = genre_names_t(app, &addons, "movie");
+    let series_t = genre_names_t(app, &addons, "series");
+    app.ui(move |ui| {
+        ui.set_movie_genres(ModelRc::new(VecModel::from(movie)));
+        ui.set_series_genres(ModelRc::new(VecModel::from(series)));
+        ui.set_movie_genres_t(ModelRc::new(VecModel::from(movie_t)));
+        ui.set_series_genres_t(ModelRc::new(VecModel::from(series_t)));
+    });
+}
+
+/// Kind of the current catalog page ("movie" / "series"), or None off it.
+fn page_kind(app: &App) -> Option<&'static str> {
+    let page = app.ui.upgrade().map(|ui| ui.get_page());
+    match page.as_deref() {
+        Some("movies") => Some("movie"),
+        Some("series") => Some("series"),
+        _ => None,
+    }
+}
+
+/// Starts browsing a genre on the current page ("" = back to the plain rows).
+fn genre_chosen(app: &Arc<App>, genre: &str) {
+    let Some(kind) = page_kind(app) else {
+        tracing::warn!("[genres] genre-chosen fired off the movies/series pages");
+        return;
+    };
+    genre_chosen_kind(app, kind, genre);
+}
+
+/// Same, but with the catalog kind passed explicitly — for callers that just
+/// switched pages (`load_page` updates `page` via a queued ui closure, so
+/// `page_kind` would read the stale page and silently drop the filter).
+fn genre_chosen_kind(app: &Arc<App>, kind: &'static str, genre: &str) {
+    let is_movie = kind == "movie";
+    if genre.is_empty() {
+        tracing::info!("[genres] {kind}: genre filter cleared");
+        *lock(&app.genre) = None;
+        app.ui(move |ui| {
+            if is_movie {
+                ui.set_movies_genre("".into());
+                ui.set_movies_genre_t("".into());
+            } else {
+                ui.set_series_genre("".into());
+                ui.set_series_genre_t("".into());
+            }
+            ui.set_genre_catalogs(ModelRc::default());
+            ui.set_genre_catalog_idx(0);
+            ui.set_genre_items(ModelRc::default());
+            ui.set_genre_has_more(false);
+            ui.set_genre_busy(false);
+            ui.set_genre_loading(false);
+        });
+        return;
+    }
+    let addons = lock(&app.addons).clone();
+    let catalogs = genres::catalogs_for_genre(&addons, kind, genre);
+    tracing::info!(
+        "[genres] {kind} / \"{genre}\": catalogs: {}",
+        catalogs
+            .iter()
+            .map(|c| c.catalog_name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let chips: Vec<slint::SharedString> = std::iter::once(slint::SharedString::from(
+        lock(&app.translations).t("genre_all_catalogs"),
+    ))
+    .chain(
+        catalogs
+            .iter()
+            .map(|c| slint::SharedString::from(c.catalog_name.as_str())),
+    )
+    .collect();
+    let token = app.genre_gen.fetch_add(1, SeqCst) + 1;
+    *lock(&app.genre) = Some(GenreState {
+        kind: String::from(kind),
+        genre: String::from(genre),
+        browser: GenreBrowser::new(kind, genre, catalogs.clone()),
+        catalogs,
+        items: Vec::new(),
+        has_more: true,
+        token,
+    });
+    let g = String::from(genre);
+    let g_t = genre_label(app, genre);
+    app.ui(move |ui| {
+        if is_movie {
+            ui.set_movies_genre(g.into());
+            ui.set_movies_genre_t(g_t.into());
+        } else {
+            ui.set_series_genre(g.into());
+            ui.set_series_genre_t(g_t.into());
+        }
+        ui.set_genre_catalogs(ModelRc::new(VecModel::from(chips)));
+        ui.set_genre_catalog_idx(0);
+        ui.set_genre_items(ModelRc::default());
+        ui.set_genre_has_more(false);
+        ui.set_genre_busy(true);
+        ui.set_genre_loading(false);
+    });
+    genre_fetch_page(app);
+}
+
+/// Narrows the active genre browse to one catalog (index 0 = "All").
+fn genre_catalog_chosen(app: &Arc<App>, idx: i32) {
+    let Some(kind) = page_kind(app) else { return };
+    let sel = {
+        let mut state = lock(&app.genre);
+        let Some(st) = state.as_mut() else { return };
+        if st.kind != kind {
+            return;
+        }
+        if idx <= 0 {
+            st.catalogs.clone()
+        } else {
+            match st.catalogs.get(idx as usize - 1) {
+                Some(c) => vec![c.clone()],
+                None => return,
+            }
+        }
+    };
+    {
+        let mut state = lock(&app.genre);
+        let Some(st) = state.as_mut() else { return };
+        st.browser.set_selection(&st.genre, sel);
+        st.items.clear();
+        st.has_more = true;
+    }
+    app.ui(move |ui| {
+        ui.set_genre_catalog_idx(idx);
+        ui.set_genre_items(ModelRc::default());
+        ui.set_genre_has_more(false);
+        ui.set_genre_busy(true);
+        ui.set_genre_loading(false);
+    });
+    genre_fetch_page(app);
+}
+
+/// Genre chip clicked in the detail overlay: close the detail, switch to the
+/// matching catalog page and start browsing that genre there. `genre` is the
+/// canonical (English) name, straight from the meta.
+fn detail_genre_chosen(app: &Arc<App>, genre: &str) {
+    if genre.is_empty() {
+        return;
+    }
+    // Off the detail overlay there is nothing to navigate from.
+    let Some(kind) = lock(&app.detail).as_ref().map(|d| d.kind.clone()) else {
+        return;
+    };
+    let (page, kind): (&str, &'static str) = match kind.as_str() {
+        "movie" => ("movies", "movie"),
+        "series" => ("series", "series"),
+        _ => return,
+    };
+    // Close the detail first (same as close-detail), then load the target page
+    // and start the genre browse there. `load_page` updates `page` via a
+    // queued ui closure, so the kind is passed to `genre_chosen_kind`
+    // directly — `genre_chosen` would re-read the stale page and bail.
+    *lock(&app.detail) = None;
+    app.ui(|ui| ui.set_detail_open(false));
+    tracing::info!("[genres] detail chip: {kind} / \"{genre}\"");
+    load_page(app, page);
+    genre_chosen_kind(app, kind, genre);
+}
+
+/// Genre-grid model: plain items with already-decoded posters filled in
+/// (mirror of `rows_with_posters` for the flat grid).
+fn genre_items_with_posters(
+    items: &[ItemData],
+    posters: &HashMap<String, Arc<Decoded>>,
+) -> ModelRc<Item> {
+    ModelRc::new(VecModel::from(
+        items
+            .iter()
+            .map(|d| {
+                let mut it = d.to_slint();
+                if let Some(url) = &d.poster_url {
+                    if let Some(dec) = posters.get(url) {
+                        it.poster = dec.to_image();
+                        it.has_poster = true;
+                    }
+                }
+                it
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// Fetches the next page of the active genre browse and merges it into the
+/// grid. Concurrent load-more triggers coalesce: while a page is in flight
+/// they set `genre_pending`, and one more page runs afterwards.
+fn genre_fetch_page(app: &Arc<App>) {
+    let app = app.clone();
+    app.rt.clone().spawn(async move {
+        if app.genre_fetching.swap(true, SeqCst) {
+            app.genre_pending.store(true, SeqCst);
+            return;
+        }
+        loop {
+            // Plan the next page (or stop: nothing active / fully loaded).
+            let (plan, token) = {
+                let mut state = lock(&app.genre);
+                let Some(st) = state.as_mut() else { break };
+                if !st.items.is_empty() && !st.has_more {
+                    break;
+                }
+                (st.browser.plan(), st.token)
+            };
+            app.ui(|ui| ui.set_genre_loading(true));
+            let responses = genres::fetch_page(&app.client, &plan).await;
+            // Whole selection replaced while this page was in flight?
+            if app.genre_gen.load(SeqCst) != token {
+                break;
+            }
+            let page = {
+                let mut state = lock(&app.genre);
+                let Some(st) = state.as_mut() else { break };
+                st.browser.absorb(&plan, &responses)
+            };
+            let Some(page) = page else { break };
+            let mut items: Vec<ItemData> = page.items.iter().map(ItemData::from_preview).collect();
+            apply_flags(&app, &mut items);
+            let wanted = poster_wanted(&[(String::new(), items.clone())]);
+            let has_more = page.has_more;
+            let failed = page.failed;
+            let queried = page.queried;
+            let snapshot = {
+                let mut state = lock(&app.genre);
+                let Some(st) = state.as_mut() else { break };
+                st.items.extend(items);
+                st.has_more = has_more;
+                st.items.clone()
+            };
+            tracing::info!(
+                "[genres] page: +{} new ({} total), has_more: {}, failed {}/{}",
+                page.items.len(),
+                snapshot.len(),
+                has_more,
+                failed,
+                queried
+            );
+            let app2 = app.clone();
+            app.ui(move |ui| {
+                // ModelRc is not Send: build it here, from the plain snapshot.
+                let model = genre_items_with_posters(&snapshot, &lock(&app2.posters));
+                ui.set_genre_items(model);
+                ui.set_genre_has_more(has_more);
+                ui.set_genre_busy(false);
+                ui.set_genre_loading(false);
+            });
+            if failed > 0 {
+                app.flash(format!("{failed} of {queried} catalogs didn't respond"));
+            }
+            if !wanted.is_empty() {
+                app.fetch_posters(wanted);
+            }
+            if !has_more || !app.genre_pending.swap(false, SeqCst) {
+                break;
+            }
+        }
+        app.genre_fetching.store(false, SeqCst);
+        if app.genre_pending.swap(false, SeqCst) {
+            genre_fetch_page(&app);
+        }
+    });
+}
+
 async fn refresh_addons(app: &Arc<App>, auth_key: &str) -> plusflix_core::Result<()> {
     let list = app.api.addon_collection(auth_key).await?;
     *lock(&app.addons) = list;
+    // Genre lists are pure manifest data: refresh them with the addons.
+    update_genre_options(app);
     Ok(())
 }
 
@@ -2379,10 +2787,8 @@ fn apply_language(app: &Arc<App>) {
     let locale = lock(&app.store).locale.clone();
     let name = language_display_name(&locale).to_owned();
     let idx = locale_to_index(&locale);
-    let names: Vec<slint::SharedString> = LANGUAGES
-        .iter()
-        .map(|(_, name)| (*name).into())
-        .collect();
+    let names: Vec<slint::SharedString> =
+        LANGUAGES.iter().map(|(_, name)| (*name).into()).collect();
     let nav = [
         ("nav_home", "home"),
         ("nav_movies", "movies"),
@@ -2439,10 +2845,21 @@ fn apply_language(app: &Arc<App>) {
         ui.set_t_iface_lang_hint(tr(&app2, "interface_language_hint").into());
         ui.set_t_addons_prefix(tr(&app2, "addons_section_prefix").into());
         ui.set_t_addons_disclaimer(tr(&app2, "addons_disclaimer").into());
-    ui.set_t_addon_wait_tooltip(tr(&app2, "addon_wait_tooltip").into());
+        ui.set_t_addon_wait_tooltip(tr(&app2, "addon_wait_tooltip").into());
         ui.set_t_refresh(tr(&app2, "refresh").into());
         ui.set_t_refreshing(tr(&app2, "refreshing").into());
+        // Genre browsing strings (locale files carry the genre-name table).
+        ui.set_t_genres(tr(&app2, "genres_label").into());
+        ui.set_t_all_genres(tr(&app2, "all_genres").into());
+        ui.set_t_movies_title(tr(&app2, "movies_title").into());
+        ui.set_t_series_title(tr(&app2, "series_title").into());
+        ui.set_t_clear_genre(tr(&app2, "clear_genre_filter").into());
+        ui.set_t_no_genre_prefix(tr(&app2, "no_genre_results_prefix").into());
+        ui.set_t_no_genre_suffix(tr(&app2, "no_genre_results_suffix").into());
     });
+    // Rebuild the translated genre-name lists for the new locale (the
+    // canonical lists stay untouched — only their display twins change).
+    update_genre_options(app);
 }
 
 /// `language-changed` from the Settings dropdown: persist the locale in the
@@ -2651,6 +3068,14 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     ui.on_search(move |q| do_search(&a, q.to_string()));
     let a = app.clone();
     ui.on_language_changed(move |idx| language_changed(&a, idx as usize));
+    let a = app.clone();
+    ui.on_genre_chosen(move |genre| genre_chosen(&a, genre.as_str()));
+    let a = app.clone();
+    ui.on_detail_genre_chosen(move |genre| detail_genre_chosen(&a, genre.as_str()));
+    let a = app.clone();
+    ui.on_genre_catalog_chosen(move |idx| genre_catalog_chosen(&a, idx));
+    let a = app.clone();
+    ui.on_genre_load_more(move || genre_fetch_page(&a));
 }
 
 fn startup(app: &Arc<App>) {
@@ -2709,6 +3134,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         source_states: Mutex::new(HashMap::new()),
         rows_cache: Mutex::new(Vec::new()),
         load_gen: std::sync::atomic::AtomicUsize::new(0),
+        genre: Mutex::new(None),
+        genre_gen: std::sync::atomic::AtomicUsize::new(0),
+        genre_fetching: AtomicBool::new(false),
+        genre_pending: AtomicBool::new(false),
         playing: AtomicBool::new(false),
         cancel_playback: Mutex::new(None),
         skip_playback: Mutex::new(None),

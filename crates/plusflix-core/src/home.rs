@@ -46,7 +46,7 @@ pub fn catalog_jobs(addons: &[Addon], kind: Option<&str>, max_rows: usize) -> Ve
 pub async fn fetch_job(client: &AddonClient, job: &CatalogJob) -> Option<Vec<MetaPreview>> {
     let items = timeout(
         Duration::from_secs(15),
-        client.catalog(&job.addon, &job.cat.kind, &job.cat.id, None),
+        client.catalog(&job.addon, &job.cat.kind, &job.cat.id, &[]),
     )
     .await;
     match items {
@@ -72,10 +72,9 @@ pub async fn search(client: &AddonClient, addons: &[Addon], query: &str) -> Vec<
         .collect();
 
     let fetches = wanted.into_iter().map(|(addon, cat)| async move {
-        let extra = format!("search={q}");
         let items = timeout(
             Duration::from_secs(15),
-            client.catalog(addon, &cat.kind, &cat.id, Some(&extra)),
+            client.catalog(addon, &cat.kind, &cat.id, &[("search", q)]),
         )
         .await;
         match items {

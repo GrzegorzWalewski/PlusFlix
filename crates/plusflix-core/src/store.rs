@@ -105,7 +105,10 @@ pub struct Store {
     pub locale: String,
 }
 
-pub fn migrate_store_path(old_path: &std::path::Path, new_path: &std::path::Path) -> std::io::Result<()> {
+pub fn migrate_store_path(
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+) -> std::io::Result<()> {
     if old_path.exists() {
         if let Some(parent) = new_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -124,7 +127,6 @@ pub fn default_path() -> PathBuf {
         .map(|d| d.config_dir().join("store.json"))
         .unwrap_or_else(|| PathBuf::from("plusflix-store.json"))
 }
-
 
 fn default_locale() -> String {
     "en".to_owned()
