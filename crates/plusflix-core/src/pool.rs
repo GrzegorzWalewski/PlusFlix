@@ -61,6 +61,8 @@ struct State {
     candidates: Vec<Candidate>,
     keys: HashSet<String>,
     tried: HashSet<String>,
+    /// Manually skipped by the user: still eligible, just last in line.
+    skipped: HashSet<String>,
     ext_subs: ExternalSubs,
     /// In-flight loader tasks per addon name.
     pending: HashMap<String, usize>,
@@ -183,6 +185,12 @@ impl SourcePool {
         self.lock().tried.insert(key.to_owned());
     }
 
+    /// Manual skip: the candidate is *not* failed, but it only gets picked
+    /// once every unskipped candidate has been exhausted.
+    pub fn mark_skipped(&self, key: &str) {
+        self.lock().skipped.insert(key.to_owned());
+    }
+
     /// Best candidate that passes the profile's filters and has not been tried yet.
     pub fn next_untried(&self, settings: &Settings) -> Option<Pick> {
         self.best_untried(settings, None)
@@ -196,6 +204,9 @@ impl SourcePool {
     fn best_untried(&self, settings: &Settings, addon: Option<&str>) -> Option<Pick> {
         let st = self.lock();
         let mut best: Option<(crate::select::Rank, &Candidate)> = None;
+        // Manually skipped sources stay in the failover queue, but only
+        // after every unskipped one is exhausted.
+        let mut best_skipped: Option<(crate::select::Rank, &Candidate)> = None;
         for c in st
             .candidates
             .iter()
@@ -204,16 +215,21 @@ impl SourcePool {
             let Ok(rank) = evaluate(&c.info, settings, &st.ext_subs) else {
                 continue;
             };
-            let better = match &best {
+            let slot = if st.skipped.contains(&c.key) {
+                &mut best_skipped
+            } else {
+                &mut best
+            };
+            let better = match slot {
                 None => true,
                 // Higher rank wins; on ties the earlier arrival (earlier addon) wins.
                 Some((r, b)) => rank > *r || (rank == *r && c.seq < b.seq),
             };
             if better {
-                best = Some((rank, c));
+                *slot = Some((rank, c));
             }
         }
-        best.map(|(_, c)| Pick {
+        best.or(best_skipped).map(|(_, c)| Pick {
             subtitles: settings
                 .subtitle_language
                 .map(|l| st.ext_subs.for_lang(l))
@@ -404,6 +420,31 @@ mod tests {
         );
         pool.mark_tried("https://x/1080");
         assert!(pool.rows(&s)[0].tried);
+    }
+
+    #[test]
+    fn skipped_candidates_rank_last_but_stay_eligible() {
+        let pool = SourcePool::new();
+        pool.add_streams(
+            "A",
+            vec![
+                http_stream("https://x/1080", "1080p"),
+                http_stream("https://x/720", "720p"),
+            ],
+        );
+        let s = Settings::default();
+        pool.mark_skipped("https://x/1080");
+        // The skipped 1080 loses to the unskipped 720…
+        assert_eq!(
+            pool.next_untried(&s).unwrap().candidate.url,
+            "https://x/720"
+        );
+        // …but stays in the queue once nothing else is left.
+        pool.mark_tried("https://x/720");
+        assert_eq!(
+            pool.next_untried(&s).unwrap().candidate.url,
+            "https://x/1080"
+        );
     }
 
     #[test]

@@ -33,6 +33,10 @@ pub enum PlayerEvent {
     /// The user closed the player / it exited.
     Closed,
     Error(String),
+    /// The user manually skipped this source (e.g. a "next source" button).
+    /// Not a failure: the session should move the source to the back of the
+    /// failover queue instead of marking it tried.
+    Skipped,
 }
 
 pub trait Player: Send {

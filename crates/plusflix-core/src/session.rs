@@ -28,6 +28,8 @@ pub struct SessionConfig {
     pub max_attempts: usize,
     /// Manual pick: try this candidate key first (user chose it from the
     /// sources list), then fall back to the normal best-untried flow.
+    /// Only honored for the very first pick, so a failing preferred source
+    /// cannot be re-picked forever.
     pub first_key: Option<String>,
     /// Addons (by name) whose sources the first pick waits for: the session
     /// only starts from one of these addons unless they deliver nothing
@@ -53,8 +55,14 @@ impl Default for SessionConfig {
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Trying { label: String, attempt: usize },
-    Playing { label: String },
+    /// A source actually started playing; `key` identifies it for callers
+    /// that want to remember the last-played source.
+    Playing { label: String, key: String },
+    /// A source failed (load error, stall, early EOF, player error).
     Failed { label: String, reason: String },
+    /// The user skipped a source: not a failure, it just moves to the back
+    /// of the failover queue.
+    Skipped { label: String },
     WaitingForSources,
     Position { secs: f64, duration: Option<f64> },
 }
@@ -93,16 +101,18 @@ pub async fn run<P: Player>(
     let mut duration: Option<f64> = None;
     let mut attempts = 0usize;
     let mut rx = pool.subscribe();
+    // Consumed on the first pick only: a failing preferred source must not
+    // be re-picked on every failover iteration.
+    let mut first_key = cfg.first_key.clone();
 
     'sources: loop {
         // ---- pick the next source (waiting for the loaders if necessary) ----
         let pick: Pick = {
             // A manually chosen source (from the sources list) goes first,
             // even if the settings would have hidden it.
-            if let Some(p) = cfg
-                .first_key
-                .as_deref()
-                .and_then(|k| pool.pick_by_key(k, settings))
+            if let Some(p) = first_key
+                .take()
+                .and_then(|k| pool.pick_by_key(&k, settings))
             {
                 p
             } else {
@@ -178,7 +188,7 @@ pub async fn run<P: Player>(
             return Outcome::Exhausted { position };
         }
         let label = pick.candidate.label.clone();
-        pool.mark_tried(&pick.candidate.key);
+        let key = pick.candidate.key.clone();
         emit(SessionEvent::Trying {
             label: label.clone(),
             attempt: attempts,
@@ -209,6 +219,7 @@ pub async fn run<P: Player>(
         };
 
         if let Err(e) = player.load(req).await {
+            pool.mark_tried(&key);
             emit(SessionEvent::Failed {
                 label,
                 reason: e.to_string(),
@@ -226,6 +237,7 @@ pub async fn run<P: Player>(
                 ev = player.next_event() => ev,
                 _ = sleep_until(deadline) => {
                     let reason = if started { "stalled" } else { "did not start in time" };
+                    pool.mark_tried(&key);
                     emit(SessionEvent::Failed { label: label.clone(), reason: reason.into() });
                     continue 'sources;
                 }
@@ -241,6 +253,7 @@ pub async fn run<P: Player>(
                     deadline = far_future();
                     emit(SessionEvent::Playing {
                         label: label.clone(),
+                        key: key.clone(),
                     });
                 }
                 Some(PlayerEvent::Position(p)) => {
@@ -261,6 +274,7 @@ pub async fn run<P: Player>(
                 Some(PlayerEvent::Ended) => {
                     let premature = duration.is_some_and(|d| d - position > cfg.premature_eof_secs);
                     if premature {
+                        pool.mark_tried(&key);
                         emit(SessionEvent::Failed {
                             label: label.clone(),
                             reason: "stream ended early".into(),
@@ -270,7 +284,18 @@ pub async fn run<P: Player>(
                     player.stop().await;
                     return Outcome::Finished { position };
                 }
+                Some(PlayerEvent::Skipped) => {
+                    // Manual skip: not a failure — the source keeps its place
+                    // in the queue (at the very back) instead of being marked
+                    // tried, so a later play of the item can start with it.
+                    pool.mark_skipped(&key);
+                    emit(SessionEvent::Skipped {
+                        label: label.clone(),
+                    });
+                    continue 'sources;
+                }
                 Some(PlayerEvent::Error(reason)) => {
+                    pool.mark_tried(&key);
                     emit(SessionEvent::Failed {
                         label: label.clone(),
                         reason,
@@ -299,6 +324,8 @@ mod tests {
         Hang,
         /// Starts, plays to `until`, then errors.
         PlayThenError { until: f64 },
+        /// Starts, plays to `until`, then the user skips the source.
+        PlayThenSkipped { until: f64 },
         /// Starts, plays 100 s of a 100 s file, ends.
         PlayToEnd,
         /// Starts, then drops the connection: EOF at 40 of 100 s.
@@ -355,6 +382,12 @@ mod tests {
                     tx.send(PlayerEvent::Position(until)).unwrap();
                     tx.send(PlayerEvent::Error("connection reset".into()))
                         .unwrap();
+                }
+                Script::PlayThenSkipped { until } => {
+                    tx.send(PlayerEvent::Started).unwrap();
+                    tx.send(PlayerEvent::Position(start)).unwrap();
+                    tx.send(PlayerEvent::Position(until)).unwrap();
+                    tx.send(PlayerEvent::Skipped).unwrap();
                 }
                 Script::PlayToEnd => {
                     tx.send(PlayerEvent::Started).unwrap();
@@ -649,6 +682,131 @@ mod tests {
         let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
         assert_eq!(out, Outcome::Finished { position: 100.0 });
         assert_eq!(loads.lock().unwrap()[0].0, "manual");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_skip_does_not_mark_the_source_tried() {
+        // The user skips the best source: it must not count as failed/tried.
+        let pool = pool_with(vec![stream("a", "1080p"), stream("b", "720p")]);
+        let (mut player, loads) = MockPlayer::new(&[
+            ("a", Script::PlayThenSkipped { until: 42.0 }),
+            ("b", Script::PlayToEnd),
+        ]);
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &SessionConfig::default(),
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        let urls: Vec<String> = loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect();
+        assert_eq!(urls, ["a", "b"]);
+        // The skipped source is still eligible for the next pick.
+        let s = Settings::default();
+        let a = pool
+            .rows(&s)
+            .into_iter()
+            .find(|r| r.key == "https://x/a")
+            .unwrap();
+        assert!(!a.tried);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skipped_source_goes_to_the_back_of_the_failover_queue() {
+        // a (best) is skipped, b fails, c works: the queue order is a, b, c —
+        // the skipped a is only picked again once everything else is gone.
+        let pool = pool_with(vec![
+            stream("a", "2160p"),
+            stream("b", "1080p"),
+            stream("c", "720p"),
+        ]);
+        let (mut player, loads) = MockPlayer::new(&[
+            ("a", Script::PlayThenSkipped { until: 10.0 }),
+            ("b", Script::ErrorImmediately),
+            ("c", Script::PlayToEnd),
+        ]);
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &SessionConfig::default(),
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        let urls: Vec<String> = loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect();
+        assert_eq!(urls, ["a", "b", "c"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_key_is_only_honored_for_the_first_pick() {
+        // The preferred source fails: it must not be re-picked forever.
+        let pool = pool_with(vec![stream("a", "1080p"), stream("b", "720p")]);
+        let (mut player, loads) = MockPlayer::new(&[
+            ("b", Script::ErrorImmediately),
+            ("a", Script::PlayToEnd),
+        ]);
+        let cfg = SessionConfig {
+            first_key: Some("https://x/b".into()),
+            ..Default::default()
+        };
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &cfg,
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        let urls: Vec<String> = loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect();
+        assert_eq!(urls, ["b", "a"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_key_picks_its_source_over_the_ranked_best() {
+        // The preferred (worse-ranked) source is picked despite a better one
+        // being available.
+        let pool = pool_with(vec![stream("a", "1080p"), stream("b", "720p")]);
+        let (mut player, loads) = MockPlayer::new(&[
+            ("a", Script::PlayToEnd),
+            ("b", Script::PlayToEnd),
+        ]);
+        let cfg = SessionConfig {
+            first_key: Some("https://x/b".into()),
+            ..Default::default()
+        };
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &cfg,
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        assert_eq!(loads.lock().unwrap()[0].0, "b");
     }
 
     #[tokio::test(start_paused = true)]

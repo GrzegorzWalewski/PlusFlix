@@ -179,8 +179,12 @@ struct App {
     /// watches it and tears the player down.
     cancel_playback: Mutex<Option<Arc<AtomicBool>>>,
     /// Set by the "Next source" button; makes the session fail over to the
-    /// next source at once (reported to it as a player error).
+    /// next source at once (reported to it as a `Skipped` event, not a
+    /// failure).
     skip_playback: Mutex<Option<Arc<AtomicBool>>>,
+    /// Key of the source that last actually played, per video id, so the
+    /// next play of the same item starts from the same source.
+    last_played: Mutex<HashMap<String, String>>,
     posters: Mutex<HashMap<String, Arc<Decoded>>>,
     poster_slots: Semaphore,
     /// Episode ids seen for each series (used for the "all episodes watched" badge).
@@ -2092,8 +2096,9 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
 }
 
 /// Wraps the real player so the "Next source" button can break the session's
-/// `next_event` wait: the flag turns into a player error, which makes the
-/// session abandon the current source and load the next best one.
+/// `next_event` wait: the flag turns into a `Skipped` event, which makes the
+/// session move the current source to the back of the failover queue (it is
+/// *not* marked failed) and load the next best one.
 struct Skippable<P> {
     inner: P,
     skip: Arc<AtomicBool>,
@@ -2111,7 +2116,11 @@ impl<P: Player> Player for Skippable<P> {
         };
         tokio::select! {
             ev = self.inner.next_event() => ev,
-            _ = wait_skip => Some(PlayerEvent::Error("skipped by user".into())),
+            _ = wait_skip => {
+                // Consume the flag: one click skips one source.
+                self.skip.store(false, SeqCst);
+                Some(PlayerEvent::Skipped)
+            }
         }
     }
     async fn notify(&mut self, text: &str) {
@@ -2161,7 +2170,15 @@ async fn run_playback(
                     SessionEvent::Trying { label, attempt } => {
                         Some(format!("Switching source (attempt {attempt}): {label}"))
                     }
-                    SessionEvent::Playing { label } => Some(format!("Playing: {label}")),
+                    SessionEvent::Playing { label, key } => {
+                        // Remember which source actually played, so the next
+                        // play of this item starts from it.
+                        lock(&app.last_played).insert(video_id.clone(), key);
+                        Some(format!("Playing: {label}"))
+                    }
+                    SessionEvent::Skipped { label } => {
+                        Some(format!("Skipped {label} – switching…"))
+                    }
                     SessionEvent::Failed { label, reason } => {
                         tracing::info!("source failed: {label}: {reason}");
                         Some(format!("{label} failed ({reason})"))
@@ -2188,7 +2205,13 @@ async fn run_playback(
         &sources.pool,
         &settings,
         &SessionConfig {
-            first_key: forced,
+            // A manual pick wins; otherwise prefer the source that last
+            // actually played for this item.
+            first_key: forced.or_else(|| {
+                lock(&app.last_played)
+                    .get(&sources.video_id)
+                    .cloned()
+            }),
             ..Default::default()
         },
         resume,
@@ -3163,6 +3186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         playing: AtomicBool::new(false),
         cancel_playback: Mutex::new(None),
         skip_playback: Mutex::new(None),
+        last_played: Mutex::new(HashMap::new()),
         posters: Mutex::new(HashMap::new()),
         poster_slots: Semaphore::new(8),
     });
