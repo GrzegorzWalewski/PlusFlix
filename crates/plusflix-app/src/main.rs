@@ -179,6 +179,12 @@ struct App {
     profile: Mutex<Option<String>>,
     detail: Mutex<Option<Arc<Detail>>>,
     playing: AtomicBool,
+    /// True while any "Wait for this addon" addon is still pending in the
+    /// current detail's source pool (maintained by the stats poll loop).
+    waited_pending: AtomicBool,
+    /// Player kind queued by a Play click that hit the wait gate: the poll
+    /// loop auto-starts it once the watched addons finish loading.
+    play_queued: Mutex<Option<String>>,
     /// Set by the Cancel button while a playback task is running; the task
     /// watches it and tears the player down.
     cancel_playback: Mutex<Option<Arc<AtomicBool>>>,
@@ -1516,6 +1522,19 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
                 .wait_for_addons
                 .iter()
                 .any(|name| pool.addon_pending(name));
+            a.waited_pending.store(waited_pending, SeqCst);
+            // Auto-start queued by a gated Play click: once the waited-for
+            // addons finish loading, play once. `take` clears the flag first,
+            // so a failing start cannot loop; if nothing playable turned up,
+            // the normal no-sources handling takes over inside `play`.
+            if !waited_pending {
+                if let Some(kind) = lock(&a.play_queued).take() {
+                    // Dismiss the waiting screen first: if `play` early-returns
+                    // (flash), it must not stay stuck on the black overlay.
+                    a.ui(|ui| ui.set_waiting_play(false));
+                    play(&a, kind, None);
+                }
+            }
             let state = if stats.usable > 0 && !waited_pending {
                 "ready"
             } else if stats.pending_tasks > 0 {
@@ -1543,6 +1562,7 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
             let (total, usable) = (stats.total as i32, stats.usable as i32);
             let state = state.to_owned();
             a.ui(move |ui| {
+                ui.set_waiting_for_addon(waited_pending);
                 ui.set_sources_total(total);
                 ui.set_sources_usable(usable);
                 ui.set_sources_hidden(hidden as i32);
@@ -1558,6 +1578,9 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
 fn open_item(app: &Arc<App>, id: String, kind: String) {
     let app = app.clone();
     app.rt.clone().spawn(async move {
+        // A new item supersedes any queued gated auto-start.
+        *lock(&app.play_queued) = None;
+        app.ui(|ui| ui.set_waiting_play(false));
         let addons = lock(&app.addons).clone();
         let fallback = || Meta {
             id: id.clone(),
@@ -2013,9 +2036,26 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
         return;
     };
     let Some(pid) = app.profile_id() else { return };
+    // Auto-pick gate: while any "Wait for this addon" addon is still loading,
+    // a plain Play click must NOT start playback of an already-loaded source.
+    // Instead show the "waiting for more sources" screen and queue an
+    // auto-start — the stats poll loop fires it once the watched addons
+    // finish. A manual pick from the source list (`forced`) bypasses the
+    // gate entirely and always plays.
+    if forced.is_none() && app.waited_pending.load(SeqCst) {
+        app.ui(|ui| {
+            // 6 = waiting for sources (see the play-state enum in main.slint).
+            ui.set_play_state(6);
+            ui.set_waiting_play(true);
+        });
+        *lock(&app.play_queued) = Some(kind.clone());
+        return;
+    }
     if app.playing.swap(true, SeqCst) {
         return;
     }
+    // A real start supersedes any queued auto-start.
+    *lock(&app.play_queued) = None;
     let player_kind = match kind.as_str() {
         "vlc" => PlayerKind::Vlc,
         _ => PlayerKind::Mpv,
@@ -2075,6 +2115,7 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
             });
             // 7 = starting the player (see the play-state enum in main.slint).
             ui.set_play_state(7);
+            ui.set_waiting_play(false);
         });
         // Cancel flag for the overlay's Cancel button. Dropping `run_playback`
         // mid-await tears the player down (mpv: kill-on-drop; VLC: the poll
@@ -3395,6 +3436,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         genre_fetching: AtomicBool::new(false),
         genre_pending: AtomicBool::new(false),
         playing: AtomicBool::new(false),
+        waited_pending: AtomicBool::new(false),
+        play_queued: Mutex::new(None),
         cancel_playback: Mutex::new(None),
         skip_playback: Mutex::new(None),
         last_played: Mutex::new(HashMap::new()),

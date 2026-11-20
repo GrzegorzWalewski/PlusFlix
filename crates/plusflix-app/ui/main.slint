@@ -402,6 +402,13 @@ export component MainWindow inherits Window {
 
     // ---- playback ----
     in property <bool> playing;
+    // True while any "Wait for this addon" addon is still loading:
+    // the play buttons read as waiting (not clickable-ready) and the
+    // auto-pick gate in Rust defers playback until it lifts.
+    in property <bool> waiting-for-addon: false;
+    // A gated Play click was received: show the "waiting for more sources"
+    // black screen until the watched addons finish (then Rust auto-starts).
+    in property <bool> waiting-play: false;
     // Play status composed here (in Slint) from the t-play-* keys plus the
     // raw data pushed by Rust: state enum, source label, switch attempt
     // number and failure reason. Never a sentence built on the Rust side.
@@ -1943,8 +1950,8 @@ export component MainWindow inherits Window {
                             // the card play pill: green = playable sources ready
                             // (never while a waited-for addon is still loading),
                             // red = nothing playable (ptt is disabled), gray =
-                            // still loading.
-                            background: root.playing ? Theme.surface-2
+                            // still loading / waiting for a watched addon.
+                            background: root.playing || root.waiting-for-addon ? Theme.surface-2
                                 : root.sources-state == "ready" ? Theme.success
                                 : root.sources-state == "none" ? Theme.accent
                                 : (ptt.has-hover ? #E8E8ED : white);
@@ -1983,8 +1990,11 @@ export component MainWindow inherits Window {
                             // click anywhere on the label side of the button
                             ptt := TouchArea {
                                 width: parent.width - chev.width;
-                                // red state = no playable source: block playback
-                                enabled: !root.playing && root.sources-state != "none";
+                                // red state = no playable source: block playback.
+                                // waiting-for-addon = a watched addon is still
+                                // loading: block the auto-pick (a manual pick
+                                // from the source list stays allowed).
+                                enabled: !root.playing && root.sources-state != "none" && !root.waiting-for-addon;
                                 clicked => {
                                     root.player-menu-open = false;
                                     root.play(root.play-player);
@@ -2317,6 +2327,21 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    // ================= waiting for more sources =================
+    // Shown when Play was clicked while a waited-for addon was still
+    // loading: the auto-start (fired by the Rust poll loop once the
+    // watched addons finish) clears `waiting-play` and takes over.
+    if root.waiting-play && !root.playing: Rectangle {
+        background: #000000E6;
+        Text {
+            text: root.t-waiting-sources;
+            color: Theme.text;
+            font-size: Theme.fs-title;
+            font-weight: 600;
+            horizontal-alignment: center;
         }
     }
 
