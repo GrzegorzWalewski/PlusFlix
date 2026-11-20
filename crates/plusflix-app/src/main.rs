@@ -1642,7 +1642,15 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("  ·  ");
-        let genres = meta.genres.clone();
+        // Dedupe genre names that differ only by case/whitespace/punctuation
+        // (e.g. after an addon language change), keeping the first-seen spelling.
+        let mut seen_genres = std::collections::HashSet::new();
+        let genres: Vec<String> = meta
+            .genres
+            .iter()
+            .filter(|g| seen_genres.insert(plusflix_core::genres::normalize_genre_key(g)))
+            .cloned()
+            .collect();
         // Display translations of the canonical (English) meta genre names.
         let genres_t: Vec<slint::SharedString> = genres
             .iter()
@@ -2310,30 +2318,53 @@ fn genre_label(app: &App, name: &str) -> String {
         .unwrap_or_else(|| name.to_owned())
 }
 
-/// Genre list for one kind: "All genres" + the union of every catalog's
-/// options (only genres some catalog really supports). Canonical names —
-/// they go straight back into the addon URLs.
-fn genre_names(addons: &[Addon], kind: &str) -> Vec<slint::SharedString> {
+/// Genre dropdown rows for one kind, merged by *translated label*: options
+/// whose display labels collide are the same genre to the user — e.g. the
+/// canonical English "Romance" translates to Polish "Romans" while a
+/// Polish-configured addon natively declares "Romans" — so they are one row.
+/// Each row is `(canonical name, translated label)`; the canonical name (of
+/// the first option, in `genre_options` order) is what selection routes back.
+fn merged_genre_rows(app: &App, addons: &[Addon], kind: &str) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new(); // (label key, canonical)
+    let mut labels: Vec<String> = Vec::new();
+    for option in genres::genre_options(addons, kind) {
+        let label = genre_label(app, &option.name);
+        let key = genres::normalize_genre_key(&label);
+        if rows.iter().any(|(k, _)| *k == key) {
+            continue; // same label: covered by an earlier canonical name
+        }
+        rows.push((key, option.name.clone()));
+        labels.push(label);
+    }
+    rows.into_iter()
+        .zip(labels)
+        .map(|((_, name), label)| (name, label))
+        .collect()
+}
+
+/// Genre list for one kind: "All genres" + the merged genre rows' canonical
+/// names (they go straight back into the addon URLs on selection).
+fn genre_names(app: &App, addons: &[Addon], kind: &str) -> Vec<slint::SharedString> {
     let mut out = vec![slint::SharedString::from("All genres")];
     out.extend(
-        genres::genre_options(addons, kind)
-            .iter()
-            .map(|o| slint::SharedString::from(o.name.as_str())),
+        merged_genre_rows(app, addons, kind)
+            .into_iter()
+            .map(|(name, _)| slint::SharedString::from(name.as_str())),
     );
     out
 }
 
 /// Display translations parallel to [`genre_names`]: same order, entry 0 is the
-/// translated "All genres", every other entry the translated genre name (or
-/// the canonical name when the locale has no entry).
+/// translated "All genres", every other entry the merged rows' translated
+/// label (or the canonical name when the locale has no entry).
 fn genre_names_t(app: &App, addons: &[Addon], kind: &str) -> Vec<slint::SharedString> {
     let mut out = vec![slint::SharedString::from(
         lock(&app.translations).t("all_genres"),
     )];
     out.extend(
-        genres::genre_options(addons, kind)
-            .iter()
-            .map(|o| slint::SharedString::from(genre_label(app, &o.name))),
+        merged_genre_rows(app, addons, kind)
+            .into_iter()
+            .map(|(_, label)| slint::SharedString::from(label.as_str())),
     );
     out
 }
@@ -2363,8 +2394,8 @@ fn update_genre_options(app: &Arc<App>) {
                 .join(", ")
         );
     }
-    let movie = genre_names(&addons, "movie");
-    let series = genre_names(&addons, "series");
+    let movie = genre_names(app, &addons, "movie");
+    let series = genre_names(app, &addons, "series");
     let movie_t = genre_names_t(app, &addons, "movie");
     let series_t = genre_names_t(app, &addons, "series");
     app.ui(move |ui| {
@@ -2420,7 +2451,30 @@ fn genre_chosen_kind(app: &Arc<App>, kind: &'static str, genre: &str) {
         return;
     }
     let addons = lock(&app.addons).clone();
-    let catalogs = genres::catalogs_for_genre(&addons, kind, genre);
+    // The chosen row routes back its canonical name, but the dropdown merges
+    // by translated label: every canonical genre name sharing the chosen
+    // name's label (e.g. "Romance" and a Polish addon's native "Romans") must
+    // contribute its catalogs, deduped by (manifest id, catalog id).
+    let label = genre_label(app, genre);
+    let label_key = genres::normalize_genre_key(&label);
+    let names: Vec<String> = genres::genre_options(&addons, kind)
+        .into_iter()
+        .map(|o| o.name)
+        .filter(|name| genres::normalize_genre_key(&genre_label(app, name)) == label_key)
+        .collect();
+    let mut catalogs: Vec<genres::CatalogRef> = Vec::new();
+    for name in &names {
+        // `catalogs_for_genre` covers catalogs declaring the name AND catalogs
+        // with no options (they accept any genre).
+        for catalog in genres::catalogs_for_genre(&addons, kind, name) {
+            let seen = catalogs
+                .iter()
+                .any(|c| c.identity() == catalog.identity());
+            if !seen {
+                catalogs.push(catalog);
+            }
+        }
+    }
     tracing::info!(
         "[genres] {kind} / \"{genre}\": catalogs: {}",
         catalogs

@@ -43,17 +43,57 @@ impl CatalogRef {
 
     /// Does the catalog accept this specific genre? Catalogs that declare the
     /// `genre` extra without options are assumed to accept any genre.
+    /// Comparison is normalized (case-, whitespace- and punctuation-insensitive),
+    /// so a genre chosen from a merged `GenreOption` still routes correctly.
     pub fn supports_genre(&self, genre: &str) -> bool {
         let options = self.cat.genre_options();
-        options.is_empty() || options.iter().any(|o| o.eq_ignore_ascii_case(genre))
+        let genre_key = normalize_genre_key(genre);
+        options.is_empty() || options.iter().any(|o| normalize_genre_key(o) == genre_key)
     }
+
+    /// Identity of this catalog across transports: (addon manifest id,
+    /// catalog id). The same addon re-installed under a different transport
+    /// URL (e.g. after a language change) keeps this identity.
+    pub fn identity(&self) -> (&str, &str) {
+        (&self.addon.manifest.id, &self.cat.id)
+    }
+}
+
+/// Dedupe/matching key for a genre name: lowercased, trimmed, with internal
+/// whitespace collapsed and runs of non-alphanumeric characters folded into a
+/// single space. "Talk show", "Talk  show ", "Talk-show" and "TALK SHOW" all
+/// share the key `talk show`.
+pub fn normalize_genre_key(name: &str) -> String {
+    let mut key = String::with_capacity(name.len());
+    let mut pending_space = false;
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            if pending_space && !key.is_empty() {
+                key.push(' ');
+            }
+            pending_space = false;
+            for lower in ch.to_lowercase() {
+                key.push(lower);
+            }
+        } else {
+            // Whitespace and punctuation both act as separators.
+            pending_space = true;
+        }
+    }
+    key
 }
 
 /// Every catalog of `kind` that can be browsed by genre: it declares a `genre`
 /// extra (in either manifest format), requires no other mandatory extras, and
 /// doesn't hide a year filter behind it.
 pub fn genre_catalogs(addons: &[Addon], kind: &str) -> Vec<CatalogRef> {
-    let mut out = Vec::new();
+    // The same addon can appear twice in the collection (e.g. the old and the
+    // new install after a language change) under different transport URLs.
+    // Identity for genre browsing is the addon MANIFEST id + catalog id, not
+    // the transport URL. The LAST occurrence wins: the newest install is the
+    // current one, so each catalog contributes exactly one `CatalogRef`,
+    // carrying the newest entry's options.
+    let mut out: Vec<CatalogRef> = Vec::new();
     for addon in addons {
         for cat in &addon.manifest.catalogs {
             if cat.kind != kind || !cat.supports_extra("genre") {
@@ -72,14 +112,23 @@ pub fn genre_catalogs(addons: &[Addon], kind: &str) -> Vec<CatalogRef> {
             if cat.requires_other_than(&["genre", "skip"]) {
                 continue;
             }
-            out.push(CatalogRef {
+            let catalog = CatalogRef {
                 addon_name: addon.name().to_owned(),
                 catalog_name: cat.name.clone().unwrap_or_else(|| cat.id.clone()),
                 kind: cat.kind.clone(),
                 addon_url: addon.transport_url.clone(),
                 addon: addon.clone(),
                 cat: cat.clone(),
-            });
+            };
+            match out
+                .iter()
+                .position(|c| c.addon.manifest.id == addon.manifest.id && c.cat.id == cat.id)
+            {
+                // A re-install of the same addon under a different transport
+                // URL: the later (newest) entry overrides the earlier one.
+                Some(i) => out[i] = catalog,
+                None => out.push(catalog),
+            }
         }
     }
     out
@@ -102,23 +151,25 @@ pub struct GenreOption {
     pub catalogs: Vec<CatalogRef>,
 }
 
-/// The genres browseable for `kind`: the case-insensitive union of the genre
-/// options of all catalogs that accept a genre, keeping the first-seen
-/// spelling, sorted alphabetically. Never assumed: only what some addon's
-/// manifest really declares.
+/// The genres browseable for `kind`: the normalized union (case-, whitespace-
+/// and punctuation-insensitive) of the genre options of all catalogs that
+/// accept a genre, keeping the first-seen spelling, sorted alphabetically.
+/// Never assumed: only what some addon's manifest really declares.
 pub fn genre_options(addons: &[Addon], kind: &str) -> Vec<GenreOption> {
     let catalogs = genre_catalogs(addons, kind);
     let mut genres: Vec<(String, GenreOption)> = Vec::new();
     for catalog in &catalogs {
         for name in catalog.genre_options() {
-            let key = name.to_lowercase();
+            let key = normalize_genre_key(name);
             match genres.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, option)) => {
-                    if !option
-                        .catalogs
-                        .iter()
-                        .any(|c| c.addon_url == catalog.addon_url && c.cat.id == catalog.cat.id)
-                    {
+                    // `genre_catalogs` already dedupes by manifest id, but a
+                    // different addon may declare the same genre: catalog
+                    // identity here is (manifest id, catalog id).
+                    if !option.catalogs.iter().any(|c| {
+                        c.addon.manifest.id == catalog.addon.manifest.id
+                            && c.cat.id == catalog.cat.id
+                    }) {
                         option.catalogs.push(catalog.clone());
                     }
                 }
@@ -351,7 +402,10 @@ mod tests {
     use crate::testhttp::FakeServer;
     use std::collections::HashMap;
 
-    /// Manifest with one movie catalog `id` whose `genre` extra takes `options`.
+    /// Manifest with one movie catalog `id` whose `genre` extra takes
+    /// `options`. The manifest id derives from the catalog id: two test
+    /// manifests with the same catalog id model the SAME addon installed
+    /// twice (e.g. old and new install after a language change).
     fn manifest(catalog_id: &str, genre_options: serde_json::Value) -> serde_json::Value {
         let catalogs = match genre_options {
             serde_json::Value::Null => serde_json::json!([{
@@ -363,7 +417,7 @@ mod tests {
                 "extra": [{"name": "genre", "options": options}, {"name": "skip"}]
             }]),
         };
-        serde_json::json!({ "id": "addon", "name": "Test Addon", "types": ["movie"], "catalogs": catalogs })
+        serde_json::json!({ "id": catalog_id, "name": "Test Addon", "types": ["movie"], "catalogs": catalogs })
     }
 
     fn addon(url: &str, manifest: serde_json::Value) -> Addon {
@@ -401,6 +455,84 @@ mod tests {
             format!("{prefix}/catalog/movie/{catalog_id}/genre={genre}&skip={skip}.json"),
             body.to_string(),
         )
+    }
+
+    #[test]
+    fn normalize_genre_key_merges_spelling_variants() {
+        let key = normalize_genre_key("Talk show");
+        assert_eq!(normalize_genre_key("Talk  show "), key);
+        assert_eq!(normalize_genre_key("Talk-show"), key);
+        assert_eq!(normalize_genre_key("TALK SHOW"), key);
+        assert_eq!(key, "talk show");
+        // Leading/trailing separators are trimmed, not padded.
+        assert_eq!(normalize_genre_key("  Romans  "), "romans");
+        // Non-ASCII letters are lowercased too.
+        assert_eq!(normalize_genre_key("Rímské"), "rímské");
+    }
+
+    #[test]
+    fn genre_options_merge_normalized_duplicates() {
+        let addons = vec![
+            addon(
+                "https://a.example",
+                manifest("top", serde_json::json!(["Action", "Romans"])),
+            ),
+            addon(
+                "https://b.example",
+                manifest("imdbRating", serde_json::json!(["action", "  Romans ", "Talk-show"])),
+            ),
+            addon(
+                "https://c.example",
+                manifest("short", serde_json::json!(["Talk  show"])),
+            ),
+        ];
+        let options = genre_options(&addons, "movie");
+        let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+        // First-seen spelling wins; case/whitespace/punctuation variants merge.
+        assert_eq!(names, ["Action", "Romans", "Talk-show"]);
+        // a and b serve Action (c declares only its Talk-show variant).
+        assert_eq!(options[0].catalogs.len(), 2);
+        // b ("Talk-show") and c ("Talk  show") merged into one option.
+        assert_eq!(options[2].catalogs.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_addon_install_contributes_one_catalog() {
+        // The same addon manifest id, installed twice under different
+        // transport URLs (e.g. before/after a language change).
+        let addons = vec![
+            addon(
+                "https://old.example",
+                manifest("top", serde_json::json!(["Action"])),
+            ),
+            addon(
+                "https://new.example",
+                manifest("top", serde_json::json!(["Action", "Comedy"])),
+            ),
+        ];
+        let catalogs = catalogs_for_genre(&addons, "movie", "Action");
+        // One CatalogRef per (manifest id, catalog id): no duplicate chips.
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].cat.id, "top");
+
+        let options = genre_options(&addons, "movie");
+        let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+        // Last install wins: the newest entry overrides the older one, so its
+        // Comedy option surfaces and no option carries two catalogs.
+        assert_eq!(names, ["Action", "Comedy"]);
+        assert!(options.iter().all(|o| o.catalogs.len() == 1));
+    }
+
+    #[test]
+    fn supports_genre_matches_through_normalization() {
+        let addons = vec![addon(
+            "https://a.example",
+            manifest("top", serde_json::json!(["Talk-show"])),
+        )];
+        let catalogs = catalogs_for_genre(&addons, "movie", "Talk show ");
+        assert_eq!(catalogs.len(), 1);
+        assert!(catalogs[0].supports_genre("TALK SHOW"));
+        assert!(!catalogs[0].supports_genre("talk shows"));
     }
 
     #[test]
