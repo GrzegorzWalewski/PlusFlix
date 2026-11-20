@@ -193,28 +193,53 @@ impl SourcePool {
 
     /// Best candidate that passes the profile's filters and has not been tried yet.
     pub fn next_untried(&self, settings: &Settings) -> Option<Pick> {
-        self.best_untried(settings, None)
+        self.best_untried(settings, &[], &[])
     }
 
-    /// Best untried candidate coming only from `addon` (for the wait-gate).
-    pub fn next_untried_from(&self, addon: &str, settings: &Settings) -> Option<Pick> {
-        self.best_untried(settings, Some(addon))
+    /// Best untried candidate, with `preferred` addons' sources ranked ahead
+    /// of everything else ("Wait for this addon"): a preferred source always
+    /// beats a better-ranked one from a non-preferred addon.
+    pub fn next_untried_preferred(
+        &self,
+        preferred: &[String],
+        settings: &Settings,
+    ) -> Option<Pick> {
+        self.best_untried(settings, &[], preferred)
     }
 
-    fn best_untried(&self, settings: &Settings, addon: Option<&str>) -> Option<Pick> {
+    /// Best untried candidate coming only from `addons` (the wait-gate pick).
+    /// Picks the best *across* all of them, not the first in list order.
+    pub fn next_untried_from(&self, addons: &[String], settings: &Settings) -> Option<Pick> {
+        self.best_untried(settings, addons, addons)
+    }
+
+    /// `addons`: when non-empty, only candidates from these addons count
+    /// (the wait-gate). `preferred`: candidates from these addons rank ahead
+    /// of all others, regardless of quality or arrival order.
+    fn best_untried(
+        &self,
+        settings: &Settings,
+        addons: &[String],
+        preferred: &[String],
+    ) -> Option<Pick> {
         let st = self.lock();
-        let mut best: Option<(crate::select::Rank, &Candidate)> = None;
+        let mut best: Option<(bool, crate::select::Rank, &Candidate)> = None;
         // Manually skipped sources stay in the failover queue, but only
         // after every unskipped one is exhausted.
-        let mut best_skipped: Option<(crate::select::Rank, &Candidate)> = None;
+        let mut best_skipped: Option<(bool, crate::select::Rank, &Candidate)> = None;
         for c in st
             .candidates
             .iter()
-            .filter(|c| addon.is_none_or(|a| c.addon == a) && !st.tried.contains(&c.key))
+            .filter(|c| {
+                (addons.is_empty() || addons.iter().any(|a| *a == c.addon))
+                    && !st.tried.contains(&c.key)
+            })
         {
             let Ok(rank) = evaluate(&c.info, settings, &st.ext_subs) else {
                 continue;
             };
+            // Preferred ("wait for this addon") sources always rank first.
+            let is_preferred = preferred.iter().any(|a| *a == c.addon);
             let slot = if st.skipped.contains(&c.key) {
                 &mut best_skipped
             } else {
@@ -222,14 +247,18 @@ impl SourcePool {
             };
             let better = match slot {
                 None => true,
-                // Higher rank wins; on ties the earlier arrival (earlier addon) wins.
-                Some((r, b)) => rank > *r || (rank == *r && c.seq < b.seq),
+                // Preferred beats non-preferred; then higher rank wins; on
+                // ties the earlier arrival (earlier addon) wins.
+                Some((p, r, b)) => {
+                    (is_preferred, rank) > (*p, *r)
+                        || ((is_preferred, rank) == (*p, *r) && c.seq < b.seq)
+                }
             };
             if better {
-                *slot = Some((rank, c));
+                *slot = Some((is_preferred, rank, c));
             }
         }
-        best.or(best_skipped).map(|(_, c)| Pick {
+        best.or(best_skipped).map(|(_, _, c)| Pick {
             subtitles: settings
                 .subtitle_language
                 .map(|l| st.ext_subs.for_lang(l))
@@ -239,14 +268,18 @@ impl SourcePool {
     }
 
     /// Every known candidate with how the profile's settings treat it, for the sources list.
-    pub fn rows(&self, settings: &Settings) -> Vec<SourceRow> {
+    ///
+    /// `preferred` addons' rows come first ("Wait for this addon"), then by
+    /// rank as usual; rejected rows stay last.
+    pub fn rows(&self, settings: &Settings, preferred: &[String]) -> Vec<SourceRow> {
         let st = self.lock();
-        let mut rows: Vec<SourceRow> = st
+        let mut rows: Vec<(bool, SourceRow)> = st
             .candidates
             .iter()
             .map(|c| {
+                let preferred_row = preferred.iter().any(|a| *a == c.addon);
                 let tried = st.tried.contains(&c.key);
-                match evaluate(&c.info, settings, &st.ext_subs) {
+                let row = match evaluate(&c.info, settings, &st.ext_subs) {
                     Ok(rank) => SourceRow {
                         key: c.key.clone(),
                         label: c.label.clone(),
@@ -261,12 +294,13 @@ impl SourcePool {
                         rejected: Some(r),
                         rank: None,
                     },
-                }
+                };
+                (preferred_row, row)
             })
             .collect();
-        // Usable (best-ranked first) before hidden.
-        rows.sort_by_key(|r| (r.rejected.is_some(), std::cmp::Reverse(r.rank)));
-        rows
+        // Usable (preferred first, then best-ranked) before hidden.
+        rows.sort_by_key(|(pref, r)| (r.rejected.is_some(), !*pref, std::cmp::Reverse(r.rank)));
+        rows.into_iter().map(|(_, r)| r).collect()
     }
 
     /// A specific candidate by key (manual pick from the sources list),
@@ -411,7 +445,7 @@ mod tests {
             min_quality: crate::settings::Quality::P1080,
             ..Default::default()
         };
-        let rows = pool.rows(&s);
+        let rows = pool.rows(&s, &[]);
         assert_eq!(rows.len(), 2);
         assert!(rows[0].rejected.is_none() && !rows[0].tried);
         assert_eq!(
@@ -419,7 +453,7 @@ mod tests {
             Some(crate::select::Reject::BelowMinQuality)
         );
         pool.mark_tried("https://x/1080");
-        assert!(pool.rows(&s)[0].tried);
+        assert!(pool.rows(&s, &[])[0].tried);
     }
 
     #[test]
@@ -487,9 +521,76 @@ mod tests {
         assert_eq!(pool.next_untried(&s).unwrap().candidate.url, "https://x/b");
         // Restricted pick only considers A's candidates.
         assert_eq!(
-            pool.next_untried_from("A", &s).unwrap().candidate.url,
+            pool.next_untried_from(&["A".to_owned()], &s)
+                .unwrap()
+                .candidate
+                .url,
             "https://x/a"
         );
-        assert!(pool.next_untried_from("Missing", &s).is_none());
+        assert!(pool.next_untried_from(&["Missing".to_owned()], &s).is_none());
+    }
+
+    #[test]
+    fn preferred_addon_beats_better_ranked_other_addons() {
+        let pool = SourcePool::new();
+        // B's source is much better, but A is "wait for this addon"-toggled.
+        pool.add_streams("A", vec![http_stream("https://x/a480", "480p")]);
+        pool.add_streams("B", vec![http_stream("https://x/b1080", "1080p")]);
+        let s = Settings::default();
+        assert_eq!(
+            pool.next_untried(&s).unwrap().candidate.url,
+            "https://x/b1080"
+        );
+        let preferred = vec!["A".to_owned()];
+        assert_eq!(
+            pool.next_untried_preferred(&preferred, &s)
+                .unwrap()
+                .candidate
+                .url,
+            "https://x/a480"
+        );
+        // …also when A's source arrived last (seq does not matter).
+        let pool = SourcePool::new();
+        pool.add_streams("B", vec![http_stream("https://x/b1080", "1080p")]);
+        pool.add_streams("A", vec![http_stream("https://x/a480", "480p")]);
+        assert_eq!(
+            pool.next_untried_preferred(&preferred, &s)
+                .unwrap()
+                .candidate
+                .url,
+            "https://x/a480"
+        );
+    }
+
+    #[test]
+    fn preferred_addon_rows_sort_first() {
+        let pool = SourcePool::new();
+        pool.add_streams("A", vec![http_stream("https://x/a480", "480p")]);
+        pool.add_streams("B", vec![http_stream("https://x/b1080", "1080p")]);
+        let s = Settings::default();
+        // Without the toggle, best rank first.
+        assert_eq!(
+            pool.rows(&s, &[])[0].key,
+            "https://x/b1080"
+        );
+        // With it, A's (worse) row comes first; rejected rows stay last.
+        let preferred = vec!["A".to_owned()];
+        let rows = pool.rows(&s, &preferred);
+        assert_eq!(rows[0].key, "https://x/a480");
+        assert_eq!(rows[1].key, "https://x/b1080");
+    }
+
+    #[test]
+    fn gate_pick_takes_the_best_across_all_gated_addons() {
+        let pool = SourcePool::new();
+        // Listed first but worse: the gate pick must not follow list order.
+        pool.add_streams("A", vec![http_stream("https://x/a720", "720p")]);
+        pool.add_streams("B", vec![http_stream("https://x/b1080", "1080p")]);
+        let s = Settings::default();
+        let gated = vec!["A".to_owned(), "B".to_owned()];
+        assert_eq!(
+            pool.next_untried_from(&gated, &s).unwrap().candidate.url,
+            "https://x/b1080"
+        );
     }
 }

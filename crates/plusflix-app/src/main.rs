@@ -1491,7 +1491,7 @@ fn start_sources(app: &Arc<App>, detail: &Arc<Detail>, video_id: String) {
             // Rows carry raw status/reason codes; Slint composes the text from
             // the t-* keys (see the sources list in main.slint).
             let rows: Vec<SourceRowData> = pool
-                .rows(&settings)
+                .rows(&settings, &settings.wait_for_addons)
                 .into_iter()
                 .map(|r| {
                     let (status_code, reason) = if let Some(rej) = r.rejected {
@@ -2263,6 +2263,9 @@ async fn run_playback(
             // A manual pick wins; otherwise prefer the source that last
             // actually played for this item.
             first_key: forced.or_else(|| lock(&app.last_played).get(&sources.video_id).cloned()),
+            // "Wait for this addon": these addons' sources always rank first
+            // (and the first pick waits for them to finish loading).
+            wait_addons: settings.wait_for_addons.clone(),
             ..Default::default()
         },
         resume,

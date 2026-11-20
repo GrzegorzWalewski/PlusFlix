@@ -31,9 +31,12 @@ pub struct SessionConfig {
     /// Only honored for the very first pick, so a failing preferred source
     /// cannot be re-picked forever.
     pub first_key: Option<String>,
-    /// Addons (by name) whose sources the first pick waits for: the session
-    /// only starts from one of these addons unless they deliver nothing
-    /// usable. Applies to the first pick only; failover stays ungated.
+    /// Addons (by name) with the profile's "Wait for this addon" toggle:
+    /// their sources are always prioritized — every automatic pick (first
+    /// and failover) prefers them over better-ranked sources from other
+    /// addons, and they sort first in the sources list. Additionally, the
+    /// FIRST pick waits for these addons to finish loading before falling
+    /// back to other addons' sources.
     pub wait_addons: Vec<String>,
 }
 
@@ -131,16 +134,18 @@ pub async fn run<P: Player>(
                 p
             } else {
                 let give_up_at = Instant::now() + cfg.no_source_timeout;
-                // Wait-gate: for the first pick, only sources from the
-                // toggled addons count until each of them is done loading.
-                let mut gated = !cfg.wait_addons.is_empty();
+                // Wait-gate: for the FIRST pick only, sources from the
+                // toggled addons count until each of them is done loading;
+                // failover picks go straight to the pool-wide pick (which
+                // still ranks the toggled addons' sources first).
+                let mut gated = attempts == 0 && !cfg.wait_addons.is_empty();
                 loop {
                     let picked = if gated {
-                        cfg.wait_addons
-                            .iter()
-                            .find_map(|a| pool.next_untried_from(a, settings))
+                        // Best across all gated addons (not the first in the
+                        // list that happens to have something).
+                        pool.next_untried_from(&cfg.wait_addons, settings)
                     } else {
-                        pool.next_untried(settings)
+                        pool.next_untried_preferred(&cfg.wait_addons, settings)
                     };
                     if let Some(p) = picked {
                         break p;
@@ -628,6 +633,53 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn wait_addon_sources_stay_preferred_through_failover() {
+        // A is "wait for this addon": both its (worse) sources must play
+        // before B's better one, and the gate does not re-engage on
+        // failover picks (A already finished loading by then).
+        let pool = SourcePool::new();
+        pool.add_streams("A", vec![stream("a480", "480p"), stream("a720", "720p")]);
+        pool.add_streams("B", vec![stream("b1080", "1080p")]);
+        let (mut player, loads) = MockPlayer::new(&[
+            ("a480", Script::ErrorImmediately),
+            ("a720", Script::ErrorImmediately),
+            ("b1080", Script::PlayToEnd),
+        ]);
+        let cfg = SessionConfig {
+            wait_addons: vec!["A".into()],
+            ..Default::default()
+        };
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        let urls: Vec<String> = loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect();
+        // Both of A's (worse) sources before B's 1080p; best-first within A.
+        assert_eq!(urls, ["a720", "a480", "b1080"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_addon_prefers_lower_quality_source_on_first_pick() {
+        // Both addons already delivered (nothing pending): the toggled A's
+        // 480p still beats B's 1080p.
+        let pool = SourcePool::new();
+        pool.add_streams("A", vec![stream("fromA", "480p")]);
+        pool.add_streams("B", vec![stream("fromB", "1080p")]);
+        let (mut player, loads) =
+            MockPlayer::new(&[("fromA", Script::PlayToEnd), ("fromB", Script::PlayToEnd)]);
+        let cfg = SessionConfig {
+            wait_addons: vec!["A".into()],
+            ..Default::default()
+        };
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        assert_eq!(loads.lock().unwrap()[0].0, "fromA");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn wait_gate_prefers_slow_toggled_addons_first_source() {
         // Addon "B" delivers a good source immediately; the toggled addon "A"
         // delivers a *worse* source 5 s later. The gate must wait for A and
@@ -726,7 +778,7 @@ mod tests {
         // The skipped source is still eligible for the next pick.
         let s = Settings::default();
         let a = pool
-            .rows(&s)
+            .rows(&s, &[])
             .into_iter()
             .find(|r| r.key == "https://x/a")
             .unwrap();
