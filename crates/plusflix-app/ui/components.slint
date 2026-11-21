@@ -1153,6 +1153,166 @@ export component Avatar inherits Rectangle {
     }
 }
 
+// -------------------------------------------------------- parental controls
+
+// Small "Kid" pill marking a child profile tile (top-left corner of the
+// tile). `t-label` is the translated word from the locale ("Kid"),
+// `age` the child's age; without an age just the word shows.
+export component KidBadge inherits Rectangle {
+    in property <string> t-label;
+    in property <int> age;
+    property <string> label: root.t-label + (root.age > 0 ? " " + root.age : "");
+    height: 22px * Theme.scale;
+    width: label-t.preferred-width + 2 * Theme.sp-2;
+    border-radius: Theme.r-pill;
+    background: #000000AA;
+    label-t := Text {
+        x: Theme.sp-2;
+        y: (parent.height - self.height) / 2;
+        text: root.label;
+        color: white;
+        font-size: Theme.fs-caption;
+        font-weight: 700;
+        font-family: Theme.font;
+    }
+}
+
+// Age stepper for the child-profile edit overlay: two icon buttons around a
+// two-digit number. The value is clamped to `min-age`..`max-age` (3..17 for
+// child profiles) here and re-validated on the Rust side before saving.
+export component AgePicker inherits Rectangle {
+    in-out property <int> age: 7;
+    in property <int> min-age: 3;
+    in property <int> max-age: 17;
+    in property <string> lower-tooltip;
+    in property <string> raise-tooltip;
+    height: Theme.hit;
+    width: lower.width + Theme.sp-2 + age-t.width + Theme.sp-2 + raise.width;
+    lower := IconButton {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        icon: @image-url("icons/chevron-left.svg");
+        tooltip: root.lower-tooltip;
+        clicked => {
+            root.age = max(root.min-age, root.age - 1);
+        }
+    }
+    age-t := Text {
+        x: lower.width + Theme.sp-2;
+        y: (parent.height - self.height) / 2;
+        width: 28px * Theme.scale;
+        text: "" + root.age;
+        color: Theme.text;
+        font-size: Theme.fs-body;
+        font-family: Theme.font;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    raise := IconButton {
+        x: lower.width + Theme.sp-2 + age-t.width + Theme.sp-2;
+        y: (parent.height - self.height) / 2;
+        icon: @image-url("icons/chevron-right.svg");
+        tooltip: root.raise-tooltip;
+        clicked => {
+            root.age = min(root.max-age, root.age + 1);
+        }
+    }
+}
+
+// Parental-PIN dialog, cloned from the profile-edit overlay pattern: a
+// full-window backdrop, a FocusScope that turns Escape into `cancel`, a
+// backdrop-swallowing TouchArea and a centered panel. Opened from Rust
+// (`request_action`) while a PIN-gated action waits: submit runs the queued
+// action after a successful PIN check, cancel (or Escape) drops it.
+export component PinDialog inherits Rectangle {
+    in property <string> t-title;
+    in property <string> t-prompt;
+    in property <string> t-placeholder;
+    in property <string> t-submit;
+    in property <string> t-cancel;
+    in property <string> error-text;
+    in-out property <string> entry;
+    callback submit(string);
+    callback cancel();
+    width: 100%;
+    height: 100%;
+    background: Theme.overlay;
+    focus-scope := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        init => {
+            self.focus();
+        }
+        key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.cancel();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    panel := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(parent.width - Theme.sp-12, 420px * Theme.scale);
+        height: min(parent.height - Theme.sp-12, 320px * Theme.scale);
+        border-radius: Theme.r-md;
+        background: Theme.surface;
+        border-width: 1px;
+        border-color: Theme.border;
+        TouchArea { } // swallow clicks so the backdrop doesn't close
+        VerticalLayout {
+            padding: Theme.sp-8;
+            spacing: Theme.sp-3;
+            Text {
+                text: root.t-title;
+                font-size: Theme.fs-title;
+                font-weight: 800;
+                color: Theme.text;
+            }
+            Text {
+                text: root.t-prompt;
+                color: Theme.muted;
+                font-size: Theme.fs-caption;
+                wrap: word-wrap;
+            }
+            if root.error-text != "": Text {
+                text: root.error-text;
+                color: Theme.accent;
+                font-size: Theme.fs-caption;
+                wrap: word-wrap;
+            }
+            pin-field := TextField {
+                text <=> root.entry;
+                placeholder-text: root.t-placeholder;
+                password: true;
+                autofocus: true;
+                accepted(text) => {
+                    root.submit(root.entry);
+                }
+            }
+            HorizontalLayout {
+                spacing: Theme.sp-2;
+                alignment: start;
+                Button {
+                    text: root.t-submit;
+                    primary: true;
+                    clicked => {
+                        root.submit(root.entry);
+                    }
+                }
+                Button {
+                    text: root.t-cancel;
+                    outline: true;
+                    clicked => {
+                        root.cancel();
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Thin vertical scrollbar to pair with a Flickable. `content-y` maps
 // straight to the Flickable's content-y (negative when scrolled down).
 // Position and height are set by the caller (x: right edge, height: full).

@@ -26,6 +26,7 @@ import {
     Item, ProfileIcon, IconLabel, IconButton, Button, TextField, Select,
     Switch, SegmentedControl, Chip, ProgressBar, PosterCard, CwCard,
     Avatar, VScroll, SearchField, SectionHeader, TooltipLayer, TooltipState,
+    KidBadge, AgePicker, PinDialog,
 } from "components.slint";
 // ListView is the only std-widget used: it is the virtualized list that keeps
 // hundreds of grid rows smooth (all visible components stay custom).
@@ -48,6 +49,9 @@ export struct ProfileData {
     name: string,
     icon: string,
     color: color,
+    // Child profiles are PIN-gated and carry an age cap (0 = adult/unknown).
+    child: bool,
+    age: int,
 }
 
 export struct EpisodeData {
@@ -310,6 +314,22 @@ export component MainWindow inherits Window {
     in property <string> t-profile-name-placeholder;
     in property <string> t-profile-icon-label;
     in property <string> t-profile-colour-label;
+    // Parental controls: child badge, kind toggle, age picker, PIN fields.
+    in property <string> t-kid-badge;
+    in property <string> t-profile-kind-label;
+    in property <string> t-kind-adult;
+    in property <string> t-kind-child;
+    in property <string> t-age-label;
+    in property <string> t-age-lower;
+    in property <string> t-age-raise;
+    in property <string> t-set-pin-label;
+    in property <string> t-set-pin-confirm-label;
+    in property <string> t-pin-digits-hint;
+    // Parental-PIN dialog (title/prompt/submit; cancel reuses t-cancel).
+    in property <string> t-pin-title;
+    in property <string> t-pin-prompt;
+    in property <string> t-pin-placeholder;
+    in property <string> t-pin-submit;
     in property <string> t-save;
     in property <string> t-delete;
     in property <string> t-really-delete;
@@ -478,10 +498,28 @@ export component MainWindow inherits Window {
     in-out property <string> edit-name: "";
     in-out property <string> edit-icon: "star";
     in-out property <string> edit-color: "#e5484d";
+    // Kind toggle (true = child, PIN-gated profile) + age picker state.
+    in-out property <bool> edit-child: false;
+    in-out property <int> edit-age: 7;
+    // PIN create/confirm pair; the overlay only shows them while a child
+    // result would be saved with no PIN set yet.
+    in-out property <string> edit-pin: "";
+    in-out property <string> edit-pin2: "";
+    // Inline validation error of the edit overlay (age / PIN pair).
+    in-out property <string> edit-error: "";
+    // True while a parental PIN is stored (Rust pushes it; gates the fields).
+    in property <bool> pin-set: false;
     in property <[string]> icon-choices;
     in property <[string]> color-choices;
     in property <[color]> color-values;
     in-out property <bool> confirm-del: false;
+
+    // ---- parental PIN dialog ----
+    // Opened from Rust (`request_action`) while a PIN-gated action waits.
+    in-out property <bool> pin-open: false;
+    in-out property <string> pin-entry: "";
+    // Wrong-PIN message, set from Rust; empty while no error shows.
+    in-out property <string> pin-error: "";
 
     // ---- settings page ----
     in property <[string]> lang-names;
@@ -532,8 +570,15 @@ export component MainWindow inherits Window {
     callback logout();
     callback select-profile(string);
     callback open-profile-edit(string); // empty id = new profile
-    callback save-profile(string, string, string, string); // id, name, icon, color
+    // id, name, icon, color, child kind, child age, PIN create, PIN confirm
+    callback save-profile(string, string, string, string, bool, int, string, string);
     callback delete-profile(string);
+    // Manage pill: routed through Rust so turning manage ON can be PIN-gated.
+    callback toggle-manage();
+    // Parental-PIN dialog: submit runs the queued action after a successful
+    // check (Rust verifies); cancel / Escape drops it.
+    callback submit-pin(string);
+    callback cancel-pin();
     callback switch-profile();
     callback navigate(string);
     callback open-item(string, string);
@@ -675,6 +720,13 @@ export component MainWindow inherits Window {
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
                             }
+                            // Child tiles carry a small "Kid <age>" pill.
+                            if p.child: KidBadge {
+                                x: Theme.sp-2;
+                                y: Theme.sp-2;
+                                t-label: root.t-kid-badge;
+                                age: p.age;
+                            }
                             if root.manage-profiles: Rectangle {
                                 width: 36px * Theme.scale;
                                 height: 36px * Theme.scale;
@@ -790,7 +842,8 @@ export component MainWindow inherits Window {
                     text: root.manage-profiles ? root.t-done : root.t-manage-profiles;
                     tooltip: root.t-edit-or-delete-profiles;
                     clicked => {
-                        root.manage-profiles = !root.manage-profiles;
+                        // Routed through Rust: manage ON is PIN-gated.
+                        root.toggle-manage();
                     }
                 }
             }
@@ -834,7 +887,7 @@ export component MainWindow inherits Window {
             }
             Rectangle {
                 width: min(parent.width - Theme.sp-12, 560px * Theme.scale);
-                height: min(parent.height - Theme.sp-12, 560px * Theme.scale);
+                height: min(parent.height - Theme.sp-12, 640px * Theme.scale);
                 border-radius: Theme.r-md;
                 background: Theme.surface;
                 border-width: 1px;
@@ -861,66 +914,159 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
-                    Text {
-                        text: root.t-profile-name-label;
-                        color: Theme.muted;
-                        font-size: Theme.fs-caption;
-                    }
-                    TextField {
-                        text <=> root.edit-name;
-                        placeholder-text: root.t-profile-name-placeholder;
-                    }
-                    Text {
-                        text: root.t-profile-icon-label;
-                        color: Theme.muted;
-                        font-size: Theme.fs-caption;
-                    }
-                    Flickable {
-                        height: ceil(root.icon-choices.length / 5) * 64px * Theme.scale;
-                        content-width: 5 * 64px * Theme.scale;
-                        content-height: ceil(root.icon-choices.length / 5) * 64px * Theme.scale;
-                        for ic[i] in root.icon-choices: Rectangle {
-                            width: 56px * Theme.scale;
-                            height: 56px * Theme.scale;
-                            x: mod(i, 5) * 64px * Theme.scale;
-                            y: floor(i / 5) * 64px * Theme.scale;
-                            border-radius: Theme.r-sm;
-                            background: root.edit-icon == ic ? Theme.accent : Theme.surface-2;
-                            border-width: root.edit-icon == ic ? 3px : 0px;
-                            border-color: white;
-                            ProfileIcon {
-                                name: ic;
-                                width: parent.width * 0.55;
-                                height: self.width;
-                                x: (parent.width - self.width) / 2;
-                                y: (parent.height - self.height) / 2;
+                    // The form scrolls inside the fixed-height panel: the
+                    // kind toggle, age picker and PIN create/confirm fields
+                    // made it taller than a single screen-height panel.
+                    form-scroll := Flickable {
+                        vertical-stretch: 1;
+                        content-height: form.preferred-height;
+                        form := VerticalLayout {
+                            x: 0;
+                            width: form-scroll.width;
+                            height: max(self.preferred-height, form-scroll.height);
+                            spacing: Theme.sp-3;
+                            Text {
+                                text: root.t-profile-name-label;
+                                color: Theme.muted;
+                                font-size: Theme.fs-caption;
                             }
-                            TouchArea {
-                                clicked => {
-                                    root.edit-icon = ic;
+                            TextField {
+                                text <=> root.edit-name;
+                                placeholder-text: root.t-profile-name-placeholder;
+                            }
+                            Text {
+                                text: root.t-profile-icon-label;
+                                color: Theme.muted;
+                                font-size: Theme.fs-caption;
+                            }
+                            Flickable {
+                                height: ceil(root.icon-choices.length / 5) * 64px * Theme.scale;
+                                content-width: 5 * 64px * Theme.scale;
+                                content-height: ceil(root.icon-choices.length / 5) * 64px * Theme.scale;
+                                for ic[i] in root.icon-choices: Rectangle {
+                                    width: 56px * Theme.scale;
+                                    height: 56px * Theme.scale;
+                                    x: mod(i, 5) * 64px * Theme.scale;
+                                    y: floor(i / 5) * 64px * Theme.scale;
+                                    border-radius: Theme.r-sm;
+                                    background: root.edit-icon == ic ? Theme.accent : Theme.surface-2;
+                                    border-width: root.edit-icon == ic ? 3px : 0px;
+                                    border-color: white;
+                                    ProfileIcon {
+                                        name: ic;
+                                        width: parent.width * 0.55;
+                                        height: self.width;
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                    }
+                                    TouchArea {
+                                        clicked => {
+                                            root.edit-icon = ic;
+                                        }
+                                    }
                                 }
                             }
-                        }
-                    }
-                    Text {
-                        text: root.t-profile-colour-label;
-                        color: Theme.muted;
-                        font-size: Theme.fs-caption;
-                    }
-                    HorizontalLayout {
-                        spacing: Theme.sp-2;
-                        alignment: start;
-                        for c[i] in root.color-choices: Rectangle {
-                            width: 30px * Theme.scale;
-                            height: 30px * Theme.scale;
-                            border-radius: Theme.r-pill;
-                            background: root.color-values[i];
-                            border-width: root.edit-color == c ? 3px : 0px;
-                            border-color: white;
-                            TouchArea {
-                                clicked => {
-                                    root.edit-color = c;
+                            Text {
+                                text: root.t-profile-colour-label;
+                                color: Theme.muted;
+                                font-size: Theme.fs-caption;
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.sp-2;
+                                alignment: start;
+                                for c[i] in root.color-choices: Rectangle {
+                                    width: 30px * Theme.scale;
+                                    height: 30px * Theme.scale;
+                                    border-radius: Theme.r-pill;
+                                    background: root.color-values[i];
+                                    border-width: root.edit-color == c ? 3px : 0px;
+                                    border-color: white;
+                                    TouchArea {
+                                        clicked => {
+                                            root.edit-color = c;
+                                        }
+                                    }
                                 }
+                            }
+                            // Kind toggle: adult (PIN-free) or child (capped).
+                            Text {
+                                text: root.t-profile-kind-label;
+                                color: Theme.muted;
+                                font-size: Theme.fs-caption;
+                            }
+                            HorizontalLayout {
+                                spacing: Theme.sp-2;
+                                alignment: start;
+                                Button {
+                                    text: root.t-kind-adult;
+                                    primary: !root.edit-child;
+                                    outline: root.edit-child;
+                                    clicked => {
+                                        root.edit-child = false;
+                                    }
+                                }
+                                Button {
+                                    text: root.t-kind-child;
+                                    primary: root.edit-child;
+                                    outline: !root.edit-child;
+                                    clicked => {
+                                        root.edit-child = true;
+                                    }
+                                }
+                            }
+                            // Age picker: only while the kind toggle says child.
+                            if root.edit-child: HorizontalLayout {
+                                spacing: Theme.sp-2;
+                                alignment: start;
+                                Text {
+                                    text: root.t-age-label;
+                                    color: Theme.muted;
+                                    font-size: Theme.fs-caption;
+                                    vertical-alignment: center;
+                                }
+                                AgePicker {
+                                    age <=> root.edit-age;
+                                    lower-tooltip: root.t-age-lower;
+                                    raise-tooltip: root.t-age-raise;
+                                }
+                            }
+                            // PIN create/confirm pair: only while this save
+                            // would yield a child profile while no PIN is
+                            // set yet (create mode, or an adult→child flip).
+                            if root.edit-child && !root.pin-set: VerticalLayout {
+                                spacing: Theme.sp-1;
+                                Text {
+                                    text: root.t-set-pin-label;
+                                    color: Theme.muted;
+                                    font-size: Theme.fs-caption;
+                                }
+                                TextField {
+                                    text <=> root.edit-pin;
+                                    placeholder-text: root.t-pin-placeholder;
+                                    password: true;
+                                }
+                                Text {
+                                    text: root.t-set-pin-confirm-label;
+                                    color: Theme.muted;
+                                    font-size: Theme.fs-caption;
+                                }
+                                TextField {
+                                    text <=> root.edit-pin2;
+                                    placeholder-text: root.t-pin-placeholder;
+                                    password: true;
+                                }
+                                Text {
+                                    text: root.t-pin-digits-hint;
+                                    color: Theme.muted;
+                                    font-size: Theme.fs-caption;
+                                }
+                            }
+                            // Age / PIN validation error, set from Rust.
+                            if root.edit-error != "": Text {
+                                text: root.edit-error;
+                                color: Theme.accent;
+                                wrap: word-wrap;
+                                font-size: Theme.fs-caption;
                             }
                         }
                     }
@@ -932,7 +1078,8 @@ export component MainWindow inherits Window {
                             text: root.t-save;
                             primary: true;
                             clicked => {
-                                root.save-profile(root.edit-id, root.edit-name, root.edit-icon, root.edit-color);
+                                root.save-profile(root.edit-id, root.edit-name, root.edit-icon, root.edit-color,
+                                    root.edit-child, root.edit-age, root.edit-pin, root.edit-pin2);
                             }
                         }
                         if root.edit-id != "" && !root.confirm-del: Button {
@@ -964,6 +1111,26 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+            }
+        }
+
+        // ---- parental PIN dialog ----
+        // Opened from Rust (`request_action`) while a PIN-gated action
+        // waits: submit runs the queued action after a successful PIN
+        // check, cancel or Escape drops it.
+        if root.pin-open: PinDialog {
+            t-title: root.t-pin-title;
+            t-prompt: root.t-pin-prompt;
+            t-placeholder: root.t-pin-placeholder;
+            t-submit: root.t-pin-submit;
+            t-cancel: root.t-cancel;
+            error-text: root.pin-error;
+            entry <=> root.pin-entry;
+            submit(pin) => {
+                root.submit-pin(pin);
+            }
+            cancel() => {
+                root.cancel-pin();
             }
         }
     }
@@ -2475,5 +2642,34 @@ export component TestWindow inherits Window {
             progress: 0.3, has-progress: true,
             watched: false, fav: false, is-cw: true,
         };
+    }
+
+    // Parental-controls fixtures (tests/layout.rs): the PIN dialog opens and
+    // closes, the age picker shows for child profiles, child tiles carry the
+    // kid badge. The `test-*` properties flip the conditional elements the
+    // same way the real overlay state does.
+    in-out property <bool> test-pin-open: false;
+    in-out property <bool> test-child: false;
+    in-out property <int> test-age: 7;
+    if root.test-pin-open: pin-dialog-test := PinDialog {
+        t-title: "PIN";
+        t-prompt: "Enter the PIN.";
+        t-placeholder: "PIN";
+        t-submit: "OK";
+        t-cancel: "Cancel";
+        error-text: "";
+    }
+    if root.test-child: age-picker-test := AgePicker {
+        x: 40px;
+        y: 620px;
+        age <=> root.test-age;
+        lower-tooltip: "Down";
+        raise-tooltip: "Up";
+    }
+    if root.test-child: child-badge-test := KidBadge {
+        x: 200px;
+        y: 620px;
+        t-label: "Kid";
+        age: 7;
     }
 }

@@ -24,6 +24,10 @@ pub struct MetaPreview {
     pub poster: Option<String>,
     pub release_info: Option<String>,
     pub description: Option<String>,
+    /// Genre list, carrying age-rating tokens ("PG", "TV-MA", "16", ...) on
+    /// Cinemeta-style catalogs; see `crate::rating`.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub genres: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

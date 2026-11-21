@@ -12,7 +12,7 @@ cargo test --workspace
 ```
 
 Data (login key, profiles, favorites, progress) is stored in one JSON file under the OS config
-dir (`PlusFlix/store.json`). Your Stremio password is never stored, only the session key.
+dir (`PlusFlix/config/store.json`). Your Stremio password is never stored, only the session key.
 
 ## Features
 
@@ -29,6 +29,44 @@ dir (`PlusFlix/store.json`). Your Stremio password is never stored, only the ses
   (required / required only if audio isn't the preferred language / not required), minimum
   quality, maximum file size
 - Sources load in the background as soon as a title (or episode) is opened
+
+## Parental controls (child profiles & PIN)
+
+Profiles are the existing feature (up to 5 in total; children count toward that cap); a child
+profile is one with an age between 3 and 17. While it is active, catalogs, search and genre
+pages show only titles whose age rating is at or below the child's age; favorites and
+continue-watching are filtered the same way, and opening an over-age title is blocked at
+playback. Unrated titles are treated as 18+ and hidden from every child profile.
+
+Where the ratings come from: Stremio meta/catalog responses have no dedicated age-rating field,
+so PlusFlix reads age-rating tokens out of the `genres` arrays of addon catalog and meta
+responses, mapping each accepted token (case- and spacing-insensitive) to a minimum age:
+
+- `G`, `TV-G`, `TV-Y`, `U` → 0
+- `TV-Y7` → 7
+- `PG`, `TV-PG` → 8
+- `12A` → 12
+- `PG-13` → 13
+- `TV-14` → 14
+- `R` → 17
+- `NC-17`, `X`, `TV-MA` → 18
+- a bare number like `16` means that age
+
+When several ratings are present, the strictest wins. Stremio's default Cinemeta addon does NOT
+publish age ratings in `genres` (real genres only, e.g. `["Drama","Fantasy"]`), so with just
+Cinemeta installed a child profile sees an empty catalog. Child filtering therefore works only
+when at least one installed catalog/meta addon publishes certification tokens in `genres`: the
+community standard is AIOMetadata (public instance https://aiometadata.elfhosted.com; configure
+it, e.g. select catalog sources, and add it to the account's addons), or a self-hosted
+`stremio-catalog-providers` instance in kids-catalog mode. Any addon that puts TMDB/US
+certification tokens into `genres` works.
+
+The parent PIN is created together with the first child profile (entered twice to confirm; digits
+only, non-empty, no fixed length). It is required to enter an adult profile, to create, edit or
+delete profiles, and to turn manage mode on; entering a child profile stays PIN-free. It is
+stored as a salted SHA-256 hash, never plaintext, in the same `store.json`. This is
+parental-control grade, not security: a forgotten PIN means deleting the store file (losing the
+profiles and settings).
 
 ## How failover works
 

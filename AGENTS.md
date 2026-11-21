@@ -21,5 +21,5 @@ PlusFlix: Stremio-backed desktop player (Rust, Slint UI + external player). Two-
 - `tmp/`, `tmp_*` (screenshots, scripts, logs at repo root) are local scratch; `tmp_*` and `*.log` are gitignored, `tmp/` is not — don't commit it.
 - Stremio login / `addonCollectionGet` request shapes are unverified against a real account; don't assume they're correct.
 - Only direct HTTP(S) streams are supported; torrent info-hash, YouTube, and external-URL streams are skipped intentionally.
-- Persistent data is one JSON file at `<OS config dir>/PlusFlix/store.json` (session key only, never the password). Max 5 profiles.
+- Persistent data is one JSON file at `<OS config dir>/PlusFlix/config/store.json` (session key only, never the password). Max 5 profiles.
 - Failover timings (25 s no-start, 15 s stall, EOF >30 s before end, resume at last position − 3 s) live in `session.rs`; the README/CLAUDE.md numbers should be kept in sync if changed.

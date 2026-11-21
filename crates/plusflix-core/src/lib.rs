@@ -13,6 +13,7 @@ pub mod mpv;
 pub mod parse;
 pub mod player;
 pub mod pool;
+pub mod rating;
 pub mod select;
 pub mod session;
 pub mod settings;

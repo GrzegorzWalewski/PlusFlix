@@ -18,6 +18,10 @@ pub enum Error {
     ProfileLimit(usize),
     #[error("profile not found: {0}")]
     NoSuchProfile(String),
+    #[error("child profile age must be between 3 and 17, got {0}")]
+    InvalidAge(u8),
+    #[error("PIN must not be empty")]
+    EmptyPin,
     #[error("{0}")]
     Other(String),
 }

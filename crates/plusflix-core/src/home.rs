@@ -2,6 +2,7 @@
 
 use crate::addon::{Addon, AddonClient};
 use crate::model::{CatalogDecl, MetaPreview};
+use crate::rating::{filter_previews, rating_of, RatingPolicy};
 use futures::future::join_all;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -42,25 +43,40 @@ pub fn catalog_jobs(addons: &[Addon], kind: Option<&str>, max_rows: usize) -> Ve
     wanted
 }
 
-/// Fetches one catalog job, with a timeout. `None` = empty, failed or timed out.
-pub async fn fetch_job(client: &AddonClient, job: &CatalogJob) -> Option<Vec<MetaPreview>> {
+/// Fetches one catalog job, with a timeout. `None` = empty (also when the
+/// rating policy filters everything away), failed or timed out.
+pub async fn fetch_job(
+    client: &AddonClient,
+    job: &CatalogJob,
+    policy: &RatingPolicy,
+) -> Option<Vec<MetaPreview>> {
     let items = timeout(
         Duration::from_secs(15),
         client.catalog(&job.addon, &job.cat.kind, &job.cat.id, &[]),
     )
     .await;
     match items {
-        Ok(Ok(items)) if !items.is_empty() => Some(items),
+        Ok(Ok(items)) => {
+            let items = filter_previews(policy, items);
+            (!items.is_empty()).then_some(items)
+        }
         Ok(Err(e)) => {
             tracing::warn!("catalog {} / {} failed: {e}", job.addon.name(), job.cat.id);
             None
         }
+        // Empty page or timeout: nothing to show.
         _ => None,
     }
 }
 
-/// Searches every addon catalog that supports the `search` extra, mixed kinds, deduped.
-pub async fn search(client: &AddonClient, addons: &[Addon], query: &str) -> Vec<MetaPreview> {
+/// Searches every addon catalog that supports the `search` extra, mixed kinds,
+/// deduped, filtered by the rating policy.
+pub async fn search(
+    client: &AddonClient,
+    addons: &[Addon],
+    query: &str,
+    policy: &RatingPolicy,
+) -> Vec<MetaPreview> {
     let q = query.trim();
     if q.is_empty() {
         return Vec::new();
@@ -93,6 +109,10 @@ pub async fn search(client: &AddonClient, addons: &[Addon], query: &str) -> Vec<
     let mut out = Vec::new();
     for items in join_all(fetches).await.into_iter().flatten() {
         for m in items {
+            // The policy drops an item before it ever reaches the dedupe set.
+            if !policy.allows(rating_of(&m.genres)) {
+                continue;
+            }
             if seen.insert((m.kind.clone(), m.id.clone())) {
                 out.push(m);
             }

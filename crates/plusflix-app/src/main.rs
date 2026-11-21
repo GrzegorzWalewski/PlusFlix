@@ -9,6 +9,7 @@ slint::include_modules!();
 
 use plusflix_core::addon::{Addon, AddonClient};
 use plusflix_core::genres::{self, CatalogRef, GenreBrowser};
+use plusflix_core::rating::{parse_token, rating_of, AgeRating, RatingPolicy};
 use plusflix_core::home;
 use plusflix_core::lang::Lang;
 use plusflix_core::loader::SourceLoader;
@@ -19,7 +20,8 @@ use plusflix_core::pool::SourcePool;
 use plusflix_core::session::{self, Outcome, SessionConfig, SessionEvent};
 use plusflix_core::settings::{LanguageMode, PlayerKind, Quality, Settings, SubtitleRequirement};
 use plusflix_core::store::{
-    self, Favorite, Profile, ProgressCard, Store, MAX_PROFILES, PROFILE_COLORS, PROFILE_ICONS,
+    self, Favorite, Profile, ProfileKind, ProgressCard, Store, MAX_PROFILES, PROFILE_COLORS,
+    PROFILE_ICONS,
 };
 use plusflix_core::stremio::StremioApi;
 use plusflix_core::vlc::{VlcConfig, VlcPlayer};
@@ -177,6 +179,9 @@ struct App {
     client: AddonClient,
     addons: Mutex<Vec<Addon>>,
     profile: Mutex<Option<String>>,
+    /// Profile action queued while the parental PIN dialog is open (set by
+    /// `request_action`); run after a successful PIN entry, dropped on cancel.
+    pending: Mutex<Option<PendingAction>>,
     detail: Mutex<Option<Arc<Detail>>>,
     playing: AtomicBool,
     /// True while any "Wait for this addon" addon is still pending in the
@@ -201,6 +206,10 @@ struct App {
     known_episodes: Mutex<HashMap<String, Vec<String>>>,
     /// Cached source resolution per item id (play pill colours).
     source_states: Mutex<HashMap<String, SourceStatus>>,
+    /// Strictest genre rating per catalog item id, stamped while its card
+    /// renders (play pill batch): card-level favorite toggles carry no genre
+    /// data of their own and take the stamp from here.
+    rating_cache: Mutex<HashMap<String, u8>>,
     /// Last rendered home/movies/series rows as (title, addon subtitle, items),
     /// so the account sync can patch the Continue Watching row without
     /// re-fetching catalogs.
@@ -244,6 +253,8 @@ struct ItemData {
     is_cw: bool,
     /// Cached source resolution for the play pill (see `SourceStatus`).
     source_state: SourceStatus,
+    /// Strictest age rating among the item's genre tokens (`None` = unrated).
+    rating_age: Option<u8>,
 }
 
 impl ItemData {
@@ -264,6 +275,7 @@ impl ItemData {
             fav: false,
             is_cw: false,
             source_state: SourceStatus::Loading,
+            rating_age: rating_age_of(&m.genres),
         }
     }
     fn from_favorite(f: &Favorite) -> Self {
@@ -283,6 +295,7 @@ impl ItemData {
             fav: false,
             is_cw: false,
             source_state: SourceStatus::Loading,
+            rating_age: f.rating_age,
         }
     }
     /// A Continue Watching card from a progress entry (must have card info).
@@ -330,6 +343,7 @@ impl ItemData {
             fav: false,
             is_cw: true,
             source_state: SourceStatus::Loading,
+            rating_age: pr.rating_age,
         })
     }
     fn to_slint(&self) -> Item {
@@ -429,6 +443,12 @@ fn addon_rows(addons: &[Addon], waits: &[String]) -> Vec<AddonData> {
         .collect()
 }
 
+/// Strictest age among a genre list, as the flat per-item `rating_age` stamp
+/// (`None` = unrated). The rating table itself lives in core (`rating_of`).
+fn rating_age_of(genres: &[String]) -> Option<u8> {
+    rating_of(genres).map(|AgeRating(age)| age)
+}
+
 /// (watched, favorite) badges for one item, judged by the active profile.
 fn item_flags(app: &App, id: &str, kind: &str) -> (bool, bool) {
     let Some(pid) = app.profile_id() else {
@@ -459,6 +479,11 @@ fn apply_flags(app: &App, items: &mut [ItemData]) {
             .get(&it.id)
             .copied()
             .unwrap_or(SourceStatus::Loading);
+        // Remember the rendered stamp so card-level favorite toggles (which
+        // carry no genre data) can stamp the new favorite with it.
+        if let Some(age) = it.rating_age {
+            lock(&app.rating_cache).insert(it.id.clone(), age);
+        }
     }
 }
 
@@ -517,6 +542,21 @@ impl App {
         let id = self.profile_id();
         let st = lock(&self.store);
         id.and_then(|id| st.profile(&id).ok().map(|p| p.settings.clone()))
+            .unwrap_or_default()
+    }
+
+    /// Rating policy of the current profile, resolved the same way as
+    /// [`App::profile_settings`]: a child profile is capped at its
+    /// `Profile::max_age`, an adult profile (or no profile selected, or a
+    /// child without an age) allows everything.
+    fn rating_policy(&self) -> RatingPolicy {
+        let id = self.profile_id();
+        let st = lock(&self.store);
+        id.and_then(|id| st.profile(&id).ok())
+            .and_then(|p| match p.kind {
+                ProfileKind::Child => p.max_age.map(RatingPolicy::child),
+                ProfileKind::Adult => None,
+            })
             .unwrap_or_default()
     }
 
@@ -664,7 +704,9 @@ fn hex_color(hex: &str) -> slint::Color {
 
 fn show_profiles(app: &Arc<App>) {
     tracing::info!("show_profiles");
-    let (profiles, can_add) = {
+    // Any PIN-gated action dies with the screen it was queued on.
+    *lock(&app.pending) = None;
+    let (profiles, can_add, pin_set) = {
         let st = lock(&app.store);
         (
             st.profiles
@@ -675,10 +717,13 @@ fn show_profiles(app: &Arc<App>) {
                         p.name.clone(),
                         p.icon.clone(),
                         p.color.clone(),
+                        p.kind == ProfileKind::Child,
+                        p.max_age.unwrap_or(0) as i32,
                     )
                 })
                 .collect::<Vec<_>>(),
             st.profiles.len() < MAX_PROFILES,
+            st.pin.is_some(),
         )
     };
     *lock(&app.profile) = None;
@@ -687,15 +732,21 @@ fn show_profiles(app: &Arc<App>) {
     app.ui(move |ui| {
         let model: Vec<ProfileData> = profiles
             .into_iter()
-            .map(|(id, name, icon, color)| ProfileData {
+            .map(|(id, name, icon, color, child, age)| ProfileData {
                 id: id.into(),
                 name: name.into(),
                 icon: icon.into(),
                 color: hex_color(&color),
+                child,
+                age,
             })
             .collect();
         ui.set_profiles(ModelRc::new(VecModel::from(model)));
         ui.set_can_add_profile(can_add);
+        ui.set_pin_set(pin_set);
+        ui.set_pin_open(false);
+        ui.set_pin_entry("".into());
+        ui.set_pin_error("".into());
         ui.set_busy(false);
         ui.set_detail_open(false);
         ui.set_playing(false);
@@ -752,6 +803,235 @@ fn select_profile(app: &Arc<App>, id: String) {
     });
     load_page(app, "home");
     sync_account_cw(app);
+}
+
+// ---------------------------------------------------------------- parental PIN gate
+
+/// A profile action that may need the parental PIN first. Without a PIN in
+/// the store every action runs directly (`request_action`); with one, the
+/// action is queued here while the PIN dialog asks for it.
+enum PendingAction {
+    Select(String),
+    Create,
+    Edit(String),
+    Delete(String),
+    /// Manage-pill state (only `true` is ever queued: OFF is ungated).
+    Manage(bool),
+    /// Adult→Child flip saved from the (PIN-free) adult edit overlay while
+    /// a PIN already exists; the age was validated before queueing.
+    SaveFlip {
+        id: String,
+        name: String,
+        icon: String,
+        color: String,
+        age: u8,
+    },
+}
+
+/// Runs `action` now — or, while a parental PIN is set, queues it and opens
+/// the PIN dialog instead. Every gated call site funnels through here, so
+/// the no-PIN case behaves exactly as before for all of them.
+fn request_action(app: &Arc<App>, action: PendingAction) {
+    if lock(&app.store).pin.is_none() {
+        run_action(app, action);
+        return;
+    }
+    *lock(&app.pending) = Some(action);
+    app.ui(|ui| {
+        ui.set_pin_open(true);
+        ui.set_pin_error("".into());
+        ui.set_pin_entry("".into());
+    });
+}
+
+/// Performs a gated action after the PIN was entered (or when none is set).
+fn run_action(app: &Arc<App>, action: PendingAction) {
+    match action {
+        PendingAction::Select(id) => select_profile(app, id),
+        PendingAction::Create => open_profile_edit(app, String::new()),
+        PendingAction::Edit(id) => open_profile_edit(app, id),
+        PendingAction::Delete(id) => {
+            lock(&app.store).remove_profile(&id);
+            app.save();
+            show_profiles(app);
+        }
+        PendingAction::Manage(on) => app.ui(move |ui| ui.set_manage_profiles(on)),
+        PendingAction::SaveFlip {
+            id,
+            name,
+            icon,
+            color,
+            age,
+        } => {
+            {
+                let mut st = lock(&app.store);
+                if let Ok(p) = st.profile_mut(&id) {
+                    p.name = name;
+                    p.icon = icon;
+                    p.color = color;
+                    p.kind = ProfileKind::Child;
+                    p.max_age = Some(age);
+                }
+            }
+            app.save();
+            show_profiles(app);
+        }
+    }
+}
+
+/// Opens the profile edit overlay for `id` (empty = create). The PIN gate,
+/// if any, is decided by the caller (see `request_action`).
+fn open_profile_edit(app: &Arc<App>, id: String) {
+    let (name, icon, color, child, age) = if id.is_empty() {
+        (
+            String::new(),
+            PROFILE_ICONS[0].to_owned(),
+            PROFILE_COLORS[0].to_owned(),
+            false,
+            7,
+        )
+    } else {
+        match lock(&app.store).profile(&id) {
+            Ok(p) => (
+                p.name.clone(),
+                p.icon.clone(),
+                p.color.clone(),
+                p.kind == ProfileKind::Child,
+                p.max_age.unwrap_or(7) as i32,
+            ),
+            Err(_) => return,
+        }
+    };
+    app.ui(move |ui| {
+        ui.set_edit_open(true);
+        ui.set_edit_id(id.into());
+        ui.set_edit_name(name.into());
+        ui.set_edit_icon(icon.into());
+        ui.set_edit_color(color.into());
+        ui.set_edit_child(child);
+        ui.set_edit_age(age);
+        ui.set_edit_pin("".into());
+        ui.set_edit_pin2("".into());
+        ui.set_edit_error("".into());
+        ui.set_confirm_del(false);
+    });
+}
+
+/// Saves the edit overlay. `child`/`age` carry the kind toggle + age picker,
+/// `pin`/`pin_confirm` the PIN create/confirm pair (only ever shown, and so
+/// only ever filled, while a child result would be saved with no PIN yet).
+fn save_profile(
+    app: &Arc<App>,
+    id: String,
+    name: String,
+    icon: String,
+    color: String,
+    child: bool,
+    age: i32,
+    pin: String,
+    pin_confirm: String,
+) {
+    let name = name.trim().to_owned();
+    if name.is_empty() {
+        let msg = tr(app, "profile_name_empty");
+        app.ui(move |ui| ui.set_status(msg.into()));
+        return;
+    }
+    let age = if child {
+        if !(3..=17).contains(&age) {
+            let msg = tr(app, "age_invalid");
+            app.ui(move |ui| ui.set_edit_error(msg.into()));
+            return;
+        }
+        age as u8
+    } else {
+        0
+    };
+    let (pin_exists, was_child) = {
+        let st = lock(&app.store);
+        (
+            st.pin.is_some(),
+            !id.is_empty()
+                && matches!(st.profile(&id), Ok(p) if p.kind == ProfileKind::Child),
+        )
+    };
+    // Adult→Child flip saved from the PIN-free adult edit overlay: no PIN
+    // pair was shown (a PIN already exists), so gate the save itself.
+    if child && pin_exists && !id.is_empty() && !was_child {
+        request_action(
+            app,
+            PendingAction::SaveFlip {
+                id,
+                name,
+                icon,
+                color,
+                age,
+            },
+        );
+        return;
+    }
+    // A child result with no PIN yet requires the create/confirm pair.
+    if child && !pin_exists {
+        if pin.is_empty() || !pin.chars().all(|c| c.is_ascii_digit()) {
+            let msg = tr(app, "pin_required");
+            app.ui(move |ui| ui.set_edit_error(msg.into()));
+            return;
+        }
+        if pin != pin_confirm {
+            let msg = tr(app, "pin_mismatch");
+            app.ui(move |ui| ui.set_edit_error(msg.into()));
+            return;
+        }
+    }
+    let mut failed = None;
+    {
+        let mut st = lock(&app.store);
+        if id.is_empty() {
+            let created = if child {
+                st.add_child_profile(&name, age).map(|p| p.id.clone())
+            } else {
+                st.add_profile(&name).map(|p| p.id.clone())
+            };
+            match created {
+                Ok(pid) => {
+                    if let Ok(p) = st.profile_mut(&pid) {
+                        p.icon = icon.clone();
+                        p.color = color.clone();
+                    }
+                }
+                Err(e) => failed = Some(e.to_string()),
+            }
+        } else if let Ok(p) = st.profile_mut(&id) {
+            p.name = name;
+            p.icon = icon;
+            p.color = color;
+            p.kind = if child {
+                ProfileKind::Child
+            } else {
+                ProfileKind::Adult
+            };
+            p.max_age = if child { Some(age) } else { None };
+        }
+    }
+    if let Some(e) = failed {
+        app.ui(move |ui| ui.set_status(e.into()));
+        return;
+    }
+    // First child save with no PIN: store the pair just confirmed.
+    if child && !pin_exists {
+        if let Err(e) = lock(&app.store).set_pin(&pin) {
+            tracing::warn!("could not set the parental PIN: {e}");
+        }
+    }
+    // Child→Adult flip: keep the "PIN ⇔ child profile" invariant.
+    if !child && was_child {
+        let mut st = lock(&app.store);
+        if !st.profiles.iter().any(|p| p.kind == ProfileKind::Child) {
+            st.clear_pin();
+        }
+    }
+    app.save();
+    show_profiles(app);
 }
 
 /// Backfills the landscape art of Continue Watching entries that have no
@@ -920,6 +1200,10 @@ fn sync_account_cw(app: &Arc<App>) {
                     video_id.clone(),
                     store::Progress {
                         position_secs: pos,
+                        // The account library item carries no genre tokens, so
+                        // the entry stays unrated: hidden from child profiles
+                        // (unrated counts as 18) and kept for adult ones.
+                        rating_age: None,
                         duration_secs: dur,
                         updated_unix: now.saturating_sub(idx as u64),
                         card: Some(ProgressCard {
@@ -990,6 +1274,8 @@ fn lang_names() -> Vec<slint::SharedString> {
 
 /// Continue Watching cards from the current profile's progress (with badges).
 fn cw_items_for(app: &Arc<App>) -> Vec<ItemData> {
+    // The policy is resolved first: it locks the store itself (never nest).
+    let policy = app.rating_policy();
     // Collect entries under the store lock, then drop it before calling
     // `item_flags` (it locks the store itself — never nest).
     let mut items: Vec<ItemData> = app
@@ -1001,6 +1287,9 @@ fn cw_items_for(app: &Arc<App>) -> Vec<ItemData> {
             Some(
                 p.continue_watching()
                     .iter()
+                    // Re-filtered locally from the stamped rating age, without
+                    // refetching: child profiles also hide unrated entries.
+                    .filter(|pr| policy.allows(pr.rating_age.map(AgeRating)))
                     .filter_map(|pr| ItemData::from_progress(pr, &t))
                     .collect::<Vec<_>>(),
             )
@@ -1098,6 +1387,7 @@ fn fixture_rows(app: &Arc<App>) -> Vec<(String, String, Vec<ItemData>)> {
         fav: false,
         is_cw: false,
         source_state: SourceStatus::Loading,
+        rating_age: None,
     };
     let mut rows: Vec<(String, String, Vec<ItemData>)> = Vec::new();
     let mut idx = 0usize;
@@ -1230,7 +1520,7 @@ fn load_page(app: &Arc<App>, page: &str) {
                     let remaining = remaining.clone();
                     app.rt.clone().spawn(async move {
                         let busy_page = page.clone();
-                        let items = home::fetch_job(&client, &job).await;
+                        let items = home::fetch_job(&client, &job, &app.rating_policy()).await;
                         let cur = app.load_gen.load(std::sync::atomic::Ordering::SeqCst);
                         if cur == gen {
                             if let Some(items) = items {
@@ -1284,13 +1574,24 @@ fn load_page(app: &Arc<App>, page: &str) {
             });
         }
         "favorites" => {
+            // The policy is resolved first: it locks the store itself (never nest).
+            let policy = app.rating_policy();
             let mut items: Vec<ItemData> = {
                 let id = app.profile_id();
                 let st = lock(&app.store);
                 id.and_then(|id| {
                     st.profile(&id)
                         .ok()
-                        .map(|p| p.favorites.iter().map(ItemData::from_favorite).collect())
+                        .map(|p| {
+                            p.favorites
+                                .iter()
+                                // Re-filtered locally from the stamped rating age,
+                                // without refetching; child profiles also hide
+                                // unrated stamps.
+                                .filter(|f| policy.allows(f.rating_age.map(AgeRating)))
+                                .map(ItemData::from_favorite)
+                                .collect()
+                        })
                 })
                 .unwrap_or_default()
             };
@@ -1661,10 +1962,13 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
             .join("  ·  ");
         // Dedupe genre names that differ only by case/whitespace/punctuation
         // (e.g. after an addon language change), keeping the first-seen spelling.
+        // Rating tokens ("PG", "TV-MA", ...) ride along in the genre list but
+        // are not genres: they never render as chips.
         let mut seen_genres = std::collections::HashSet::new();
         let genres: Vec<String> = meta
             .genres
             .iter()
+            .filter(|g| parse_token(g).is_none())
             .filter(|g| seen_genres.insert(plusflix_core::genres::normalize_genre_key(g)))
             .cloned()
             .collect();
@@ -1864,6 +2168,7 @@ fn toggle_favorite(app: &Arc<App>) {
             kind: detail.kind.clone(),
             name: detail.meta.name.clone(),
             poster: detail.meta.poster.clone(),
+            rating_age: rating_age_of(&detail.meta.genres),
         })
     };
     app.save();
@@ -1929,6 +2234,9 @@ fn toggle_watched(app: &Arc<App>, ui: &MainWindow) {
 fn card_toggle_favorite(app: &Arc<App>, id: String, kind: String, name: String, poster: String) {
     let Some(pid) = app.profile_id() else { return };
     let poster = (!poster.is_empty()).then_some(poster);
+    // The card carries no genre data of its own; take the rating stamped while
+    // it rendered (absent = unrated).
+    let rating_age = lock(&app.rating_cache).get(&id).copied();
     let now_fav = {
         let mut st = lock(&app.store);
         let Ok(p) = st.profile_mut(&pid) else { return };
@@ -1937,6 +2245,7 @@ fn card_toggle_favorite(app: &Arc<App>, id: String, kind: String, name: String, 
             kind,
             name,
             poster,
+            rating_age,
         })
     };
     app.save();
@@ -2020,9 +2329,15 @@ fn save_progress(
     pos: f64,
     dur: Option<f64>,
     card: &ProgressCard,
+    rating_age: Option<u8>,
 ) {
     if let Ok(p) = lock(&app.store).profile_mut(pid) {
         p.set_progress(video_id, pos, dur, Some(card.clone()));
+        // The app owns the rating-age stamp: core only preserves an existing
+        // one across updates, so (re)write it from the played title's genres.
+        if let Some(pr) = p.progress.get_mut(video_id) {
+            pr.rating_age = rating_age;
+        }
     }
     app.save();
 }
@@ -2036,6 +2351,20 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
         return;
     };
     let Some(pid) = app.profile_id() else { return };
+    // Parental gate: refuse to start playback of anything above the current
+    // profile's age cap. Adult policies allow everything, so the adult flow
+    // is unchanged; the "not available for this profile" UI state arrives
+    // with the Slint phase — this is the data-side block only.
+    let policy = app.rating_policy();
+    if !policy.allows(rating_of(&detail.meta.genres)) {
+        tracing::warn!(
+            "[rating] refusing playback of \"{}\": above the current profile's age cap",
+            detail.meta.name
+        );
+        // User-visible refusal: the same status toast the settings page uses.
+        app.flash(tr(app, "restricted_title"));
+        return;
+    }
     // Auto-pick gate: while any "Wait for this addon" addon is still loading,
     // a plain Play click must NOT start playback of an already-loaded source.
     // Instead show the "waiting for more sources" screen and queue an
@@ -2105,6 +2434,8 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
                 .map(|(s, e)| format!("S{s:02}E{e:02}"))
         }),
     };
+    // The rating-age stamp for the progress entries this playback records.
+    let rating_age = rating_age_of(&detail.meta.genres);
     let app = app.clone();
     app.rt.clone().spawn(async move {
         app.ui(move |ui| {
@@ -2129,7 +2460,7 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
             }
         };
         let msg = tokio::select! {
-            msg = run_playback(&app, &sources, &pid, settings, resume, card, forced) => msg,
+            msg = run_playback(&app, &sources, &pid, settings, resume, card, rating_age, forced) => msg,
             _ = wait_cancel => Some(tr(&app, "playback_cancelled")),
         };
         *lock(&app.cancel_playback) = None;
@@ -2185,6 +2516,7 @@ async fn run_playback(
     settings: Settings,
     resume: f64,
     card: ProgressCard,
+    rating_age: Option<u8>,
     forced: Option<String>,
 ) -> Option<String> {
     let inner = match settings.player {
@@ -2207,6 +2539,7 @@ async fn run_playback(
         let (app, last) = (app.clone(), last.clone());
         let (pid, video_id) = (pid.to_owned(), sources.video_id.clone());
         let card = card.clone();
+        let rating_age = rating_age;
         tokio::spawn(async move {
             let mut last_save = Instant::now();
             while let Some(ev) = rx.recv().await {
@@ -2238,7 +2571,7 @@ async fn run_playback(
                         *lock(&last) = (secs, duration);
                         if last_save.elapsed() > Duration::from_secs(15) {
                             last_save = Instant::now();
-                            save_progress(&app, &pid, &video_id, secs, duration, &card);
+                            save_progress(&app, &pid, &video_id, secs, duration, &card, rating_age);
                         }
                         None
                     }
@@ -2286,12 +2619,12 @@ async fn run_playback(
             None
         }
         Outcome::Closed { position } => {
-            save_progress(app, pid, &sources.video_id, position, dur, &card);
+            save_progress(app, pid, &sources.video_id, position, dur, &card, rating_age);
             None
         }
         Outcome::NoSources => Some(tr(app, "no_playable_sources")),
         Outcome::Exhausted { position } => {
-            save_progress(app, pid, &sources.video_id, position, dur, &card);
+            save_progress(app, pid, &sources.video_id, position, dur, &card, rating_age);
             Some(tr(app, "all_sources_failed"))
         }
     }
@@ -2322,7 +2655,7 @@ fn do_search(app: &Arc<App>, query: String) {
             ui.set_status(searching_for.into());
         });
         let addons = lock(&app.addons).clone();
-        let results = home::search(&app.client, &addons, &q).await;
+        let results = home::search(&app.client, &addons, &q, &app.rating_policy()).await;
         let mut items: Vec<ItemData> = results.iter().map(ItemData::from_preview).collect();
         apply_flags(&app, &mut items);
         let wanted = poster_wanted(&[(String::new(), items.clone())]);
@@ -2544,7 +2877,7 @@ fn genre_chosen_kind(app: &Arc<App>, kind: &'static str, genre: &str) {
     *lock(&app.genre) = Some(GenreState {
         kind: String::from(kind),
         genre: String::from(genre),
-        browser: GenreBrowser::new(kind, genre, catalogs.clone()),
+        browser: GenreBrowser::new(kind, genre, catalogs.clone(), app.rating_policy()),
         catalogs,
         items: Vec::new(),
         has_more: true,
@@ -3050,6 +3383,22 @@ fn apply_language(app: &Arc<App>) {
         ui.set_t_profile_name_placeholder(tr(&app2, "profile_name_placeholder").into());
         ui.set_t_profile_icon_label(tr(&app2, "profile_icon_label").into());
         ui.set_t_profile_colour_label(tr(&app2, "profile_colour_label").into());
+        // Parental controls: child badge, kind toggle, age picker, PIN
+        // create/confirm fields, PIN dialog (cancel reuses t-cancel).
+        ui.set_t_kid_badge(tr(&app2, "kid_badge").into());
+        ui.set_t_profile_kind_label(tr(&app2, "profile_kind_label").into());
+        ui.set_t_kind_adult(tr(&app2, "kind_adult").into());
+        ui.set_t_kind_child(tr(&app2, "kind_child").into());
+        ui.set_t_age_label(tr(&app2, "age_label").into());
+        ui.set_t_age_lower(tr(&app2, "age_lower").into());
+        ui.set_t_age_raise(tr(&app2, "age_raise").into());
+        ui.set_t_set_pin_label(tr(&app2, "set_pin_label").into());
+        ui.set_t_set_pin_confirm_label(tr(&app2, "set_pin_confirm_label").into());
+        ui.set_t_pin_digits_hint(tr(&app2, "pin_digits_hint").into());
+        ui.set_t_pin_title(tr(&app2, "pin_title").into());
+        ui.set_t_pin_prompt(tr(&app2, "pin_prompt").into());
+        ui.set_t_pin_placeholder(tr(&app2, "pin_placeholder").into());
+        ui.set_t_pin_submit(tr(&app2, "pin_submit").into());
         ui.set_t_save(tr(&app2, "save").into());
         ui.set_t_delete(tr(&app2, "delete").into());
         ui.set_t_really_delete(tr(&app2, "really_delete").into());
@@ -3191,72 +3540,100 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     let a = app.clone();
     ui.on_logout(move || logout(&a));
     let a = app.clone();
-    ui.on_select_profile(move |id| select_profile(&a, id.to_string()));
+    ui.on_select_profile(move |id| {
+        let id = id.to_string();
+        // Entering an adult profile unlocks unrestricted content: PIN-gated
+        // while a PIN is set. A child profile is what the PIN guards into,
+        // so switching to one stays PIN-free.
+        if lock(&a.store)
+            .profile(&id)
+            .is_ok_and(|p| p.kind == ProfileKind::Adult)
+        {
+            request_action(&a, PendingAction::Select(id));
+        } else {
+            select_profile(&a, id);
+        }
+    });
     let a = app.clone();
     ui.on_open_profile_edit(move |id| {
         let id = id.to_string();
-        let (name, icon, color) = if id.is_empty() {
-            (
-                String::new(),
-                PROFILE_ICONS[0].to_owned(),
-                PROFILE_COLORS[0].to_owned(),
-            )
+        if id.is_empty() {
+            // Creating a profile could mint a new unrestricted adult: gated.
+            request_action(&a, PendingAction::Create);
+        } else if lock(&a.store)
+            .profile(&id)
+            .is_ok_and(|p| p.kind == ProfileKind::Child)
+        {
+            // Editing a child touches its age cap: gated. Adult edits are
+            // cosmetic; the Adult→Child flip is gated at save time instead.
+            request_action(&a, PendingAction::Edit(id));
         } else {
-            match lock(&a.store).profile(&id) {
-                Ok(p) => (p.name.clone(), p.icon.clone(), p.color.clone()),
-                Err(_) => return,
-            }
-        };
-        a.ui(move |ui| {
-            ui.set_edit_open(true);
-            ui.set_edit_id(id.into());
-            ui.set_edit_name(name.into());
-            ui.set_edit_icon(icon.into());
-            ui.set_edit_color(color.into());
-            ui.set_confirm_del(false);
-        });
+            open_profile_edit(&a, id);
+        }
     });
     let a = app.clone();
-    ui.on_save_profile(move |id, name, icon, color| {
-        let id = id.to_string();
-        let name = name.trim().to_owned();
-        if name.is_empty() {
-            let msg = tr(&a, "profile_name_empty");
-            a.ui(move |ui| ui.set_status(msg.into()));
-            return;
-        }
-        let (icon, color) = (icon.to_string(), color.to_string());
-        let mut failed = None;
-        {
-            let mut st = lock(&a.store);
-            if id.is_empty() {
-                match st.add_profile(&name).map(|p| p.id.clone()) {
-                    Ok(pid) => {
-                        if let Ok(p) = st.profile_mut(&pid) {
-                            p.icon = icon.clone();
-                            p.color = color.clone();
-                        }
-                    }
-                    Err(e) => failed = Some(e.to_string()),
-                }
-            } else if let Ok(p) = st.profile_mut(&id) {
-                p.name = name;
-                p.icon = icon;
-                p.color = color;
-            }
-        }
-        if let Some(e) = failed {
-            a.ui(move |ui| ui.set_status(e.into()));
-            return;
-        }
-        a.save();
-        show_profiles(&a);
+    ui.on_save_profile(move |id, name, icon, color, child, age, pin, pin_confirm| {
+        save_profile(
+            &a,
+            id.to_string(),
+            name.to_string(),
+            icon.to_string(),
+            color.to_string(),
+            child,
+            age,
+            pin.to_string(),
+            pin_confirm.to_string(),
+        );
     });
     let a = app.clone();
     ui.on_delete_profile(move |id| {
-        lock(&a.store).remove_profile(id.as_str());
-        a.save();
-        show_profiles(&a);
+        // The inline "Really delete?" confirm stays; the PIN is asked after
+        // it, before the removal itself.
+        request_action(&a, PendingAction::Delete(id.to_string()));
+    });
+    let a = app.clone();
+    let weak = ui.as_weak();
+    ui.on_toggle_manage(move || {
+        // Manage ON opens edit/delete on every tile: PIN-gated. OFF is free.
+        let on = weak
+            .upgrade()
+            .map(|ui| !ui.get_manage_profiles())
+            .unwrap_or(true);
+        if on {
+            request_action(&a, PendingAction::Manage(true));
+        } else {
+            a.ui(|ui| ui.set_manage_profiles(false));
+        }
+    });
+    let a = app.clone();
+    ui.on_submit_pin(move |pin| {
+        let pin = pin.to_string();
+        if lock(&a.store).verify_pin(&pin) {
+            // Close the dialog, then run whatever was waiting for the PIN.
+            let action = lock(&a.pending).take();
+            a.ui(|ui| {
+                ui.set_pin_open(false);
+                ui.set_pin_entry("".into());
+                ui.set_pin_error("".into());
+            });
+            if let Some(action) = action {
+                run_action(&a, action);
+            }
+        } else {
+            // Wrong PIN: keep the dialog open and say so.
+            let msg = tr(&a, "pin_wrong");
+            a.ui(move |ui| ui.set_pin_error(msg.into()));
+        }
+    });
+    let a = app.clone();
+    ui.on_cancel_pin(move || {
+        // Cancel / Escape drops the queued action.
+        *lock(&a.pending) = None;
+        a.ui(|ui| {
+            ui.set_pin_open(false);
+            ui.set_pin_entry("".into());
+            ui.set_pin_error("".into());
+        });
     });
     let a = app.clone();
     ui.on_switch_profile(move || {
@@ -3388,7 +3765,22 @@ fn startup(app: &Arc<App>) {
                 if let Err(e) = refresh_addons(&app, &auth.auth_key).await {
                     tracing::warn!("could not load addons: {e}");
                 }
-                show_profiles(&app);
+                // Silent restore of the last profile — except an adult profile
+                // guarded by the parental PIN: that one stays on the picker, so
+                // restarting cannot bypass the PIN. Child profiles have nothing
+                // to unlock and restore without a prompt.
+                let restore = {
+                    let st = lock(&app.store);
+                    st.last_profile
+                        .as_deref()
+                        .and_then(|id| st.profile(id).ok())
+                        .filter(|p| !(p.kind == ProfileKind::Adult && st.pin.is_some()))
+                        .map(|p| p.id.clone())
+                };
+                match restore {
+                    Some(id) => select_profile(&app, id),
+                    None => show_profiles(&app),
+                }
                 // Stored session expired or was revoked: back to the login screen.
                 if lock(&app.addons).is_empty() {
                     app.flash(tr(&app, "addons_load_failed"));
@@ -3429,9 +3821,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client,
         addons: Mutex::new(Vec::new()),
         profile: Mutex::new(None),
+        pending: Mutex::new(None),
         detail: Mutex::new(None),
         known_episodes: Mutex::new(HashMap::new()),
         source_states: Mutex::new(HashMap::new()),
+        rating_cache: Mutex::new(HashMap::new()),
         rows_cache: Mutex::new(Vec::new()),
         load_gen: std::sync::atomic::AtomicUsize::new(0),
         genre: Mutex::new(None),

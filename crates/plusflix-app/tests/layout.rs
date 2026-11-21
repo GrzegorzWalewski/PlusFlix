@@ -4,6 +4,8 @@
 //! Icon centering: every IconButton's icon image must share its container's
 //! center (within 1 px) at ui-scales 1.0 / 1.5 / 2.0.
 //! Poster geometry: poster boxes must not change with title length.
+//! Parental controls: the PIN dialog, age picker and kid badge fixtures
+//! mount/unmount behind their `test-*` properties in the TestWindow.
 
 use i_slint_backend_testing::ElementQuery;
 
@@ -113,4 +115,121 @@ fn poster_geometry_independent_of_title_length() {
             );
         }
     }
+}
+
+// Parental-controls fixtures (see the TestWindow harness at the bottom of
+// ui/main.slint): the `test-*` properties flip the same conditional
+// elements the real overlay state drives.
+
+#[test]
+fn pin_dialog_opens_and_closes() {
+    i_slint_backend_testing::init_no_event_loop();
+    let win = TestWindow::new().unwrap();
+    // Closed: the conditional dialog is not instantiated at all.
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::pin-dialog-test")
+            .find_first()
+            .is_none(),
+        "pin dialog must start closed",
+    );
+    // Open: the dialog exists and centers a non-empty panel.
+    win.set_test_pin_open(true);
+    let dlg = ElementQuery::from_root(&win)
+        .match_id("TestWindow::pin-dialog-test")
+        .find_first()
+        .expect("pin dialog opens");
+    let panel = dlg
+        .query_descendants()
+        .match_id("PinDialog::panel")
+        .find_first()
+        .expect("pin dialog panel");
+    let (_, _, dw, dh) = centers(&dlg);
+    let (px, py, pw, ph) = centers(&panel);
+    assert!(pw > 0.0 && ph > 0.0, "pin panel is empty ({pw}x{ph})");
+    let dx = px + pw / 2.0 - dw / 2.0;
+    let dy = py + ph / 2.0 - dh / 2.0;
+    assert!(
+        dx.abs() <= TOL && dy.abs() <= TOL,
+        "pin panel off-center by ({dx:.2}, {dy:.2}) px",
+    );
+    // Closed again: the conditional element is torn back down.
+    win.set_test_pin_open(false);
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::pin-dialog-test")
+            .find_first()
+            .is_none(),
+        "pin dialog must close",
+    );
+}
+
+#[test]
+fn age_picker_shows_for_child_kind() {
+    i_slint_backend_testing::init_no_event_loop();
+    let win = TestWindow::new().unwrap();
+    // Adult kind: no age row.
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::age-picker-test")
+            .find_first()
+            .is_none(),
+        "age picker must start hidden for adult kind",
+    );
+    // Child kind: the picker mounts, two-way bound to `test-age`.
+    win.set_test_child(true);
+    let picker = ElementQuery::from_root(&win)
+        .match_id("TestWindow::age-picker-test")
+        .find_first()
+        .expect("age picker shows for child kind");
+    let (_, _, pw, ph) = centers(&picker);
+    assert!(pw > 0.0 && ph > 0.0, "age picker is empty ({pw}x{ph})");
+    // Back to adult kind: unmounted again.
+    win.set_test_child(false);
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::age-picker-test")
+            .find_first()
+            .is_none(),
+        "age picker must hide for adult kind",
+    );
+}
+
+#[test]
+fn child_badge_marks_child_tiles() {
+    i_slint_backend_testing::init_no_event_loop();
+    let win = TestWindow::new().unwrap();
+    // Adult tile: no badge.
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::child-badge-test")
+            .find_first()
+            .is_none(),
+        "kid badge must start hidden for adult kind",
+    );
+    // Child tile: the badge mounts at its fixture spot (200, 620), 22 px
+    // tall at ui-scale 1.0 (KidBadge height = 22px * Theme.scale).
+    win.set_test_child(true);
+    let badge = ElementQuery::from_root(&win)
+        .match_id("TestWindow::child-badge-test")
+        .find_first()
+        .expect("kid badge shows for child kind");
+    let (bx, by, bw, bh) = centers(&badge);
+    assert!(
+        (bx - 200.0).abs() <= TOL && (by - 620.0).abs() <= TOL,
+        "kid badge at ({bx:.2}, {by:.2}), expected (200, 620)",
+    );
+    assert!(
+        bw > 0.0 && (bh - 22.0).abs() <= TOL,
+        "kid badge is {bw:.2}x{bh:.2}, expected a nonzero width and 22 px height",
+    );
+    // Back to adult kind: gone again.
+    win.set_test_child(false);
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::child-badge-test")
+            .find_first()
+            .is_none(),
+        "kid badge must hide for adult kind",
+    );
 }

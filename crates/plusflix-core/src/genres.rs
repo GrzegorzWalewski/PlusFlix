@@ -8,6 +8,7 @@
 
 use crate::addon::{Addon, AddonClient};
 use crate::model::{CatalogDecl, MetaPreview};
+use crate::rating::{rating_of, RatingPolicy};
 use futures::future::join_all;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -232,10 +233,17 @@ pub struct GenreBrowser {
     /// (kind, id) already shown on any page of this selection.
     seen: HashSet<(String, String)>,
     generation: u64,
+    /// Age-rating policy: absorbed items above the profile's age are dropped.
+    policy: RatingPolicy,
 }
 
 impl GenreBrowser {
-    pub fn new(kind: &str, genre: &str, catalogs: Vec<CatalogRef>) -> Self {
+    pub fn new(
+        kind: &str,
+        genre: &str,
+        catalogs: Vec<CatalogRef>,
+        policy: RatingPolicy,
+    ) -> Self {
         let count = catalogs.len();
         Self {
             kind: kind.to_owned(),
@@ -245,6 +253,7 @@ impl GenreBrowser {
             exhausted: vec![false; count],
             seen: HashSet::new(),
             generation: 0,
+            policy,
         }
     }
 
@@ -345,6 +354,11 @@ impl GenreBrowser {
                     continue;
                 };
                 added = true;
+                // The rating policy drops an item before it ever reaches the
+                // dedupe set; short pages under a child policy are expected.
+                if !self.policy.allows(rating_of(&item.genres)) {
+                    continue;
+                }
                 if self.seen.insert((item.kind.clone(), item.id.clone())) {
                     items.push(item);
                 }
@@ -432,6 +446,23 @@ mod tests {
         let metas: Vec<serde_json::Value> = ids
             .iter()
             .map(|id| serde_json::json!({ "id": id, "type": kind, "name": format!("Title {id}") }))
+            .collect();
+        serde_json::json!({ "metas": metas }).to_string()
+    }
+
+    /// `metas` with a `genres` list per item, so age-rating filtering has
+    /// something to bite on. An empty list leaves the item unrated.
+    fn metas_rated(kind: &str, rated: &[(&str, &[&str])]) -> String {
+        let metas: Vec<serde_json::Value> = rated
+            .iter()
+            .map(|(id, genres)| {
+                serde_json::json!({
+                    "id": id,
+                    "type": kind,
+                    "name": format!("Title {id}"),
+                    "genres": genres.to_vec(),
+                })
+            })
             .collect();
         serde_json::json!({ "metas": metas }).to_string()
     }
@@ -609,7 +640,8 @@ mod tests {
         let catalogs = catalogs_for_genre(&addons, "movie", "Action");
         assert_eq!(catalogs.len(), 2);
         let client = AddonClient::new().unwrap();
-        let mut browser = GenreBrowser::new("movie", "Action", catalogs);
+        let mut browser =
+            GenreBrowser::new("movie", "Action", catalogs, RatingPolicy::default());
         let plan = browser.plan();
         let responses = fetch_page(&client, &plan).await;
         let page = browser.absorb(&plan, &responses).unwrap();
@@ -618,6 +650,61 @@ mod tests {
         assert_eq!(ids, ["tt1", "tt2", "tt3"]);
         assert_eq!(page.failed, 0);
         assert!(!page.has_more); // both returned < PAGE_SIZE
+    }
+
+    #[tokio::test]
+    async fn rating_policy_filters_pages() {
+        // One short page mixing rating tokens with plain genres.
+        let body = metas_rated(
+            "movie",
+            &[
+                ("tt1", &["G"]),            // age 0
+                ("tt2", &["PG", "Comedy"]), // strictest: age 8
+                ("tt3", &["R", "Comedy"]),  // strictest: age 17
+                ("tt4", &["TV-MA"]),        // age 18
+                ("tt5", &[]),               // unrated
+                ("tt6", &["Comedy"]),       // genre only: unrated
+            ],
+        );
+        let mut routes = HashMap::new();
+        routes.extend([route("top", "Action", 0, &body)]);
+        let server = FakeServer::start(routes).await;
+        let addons = vec![addon(
+            server.url.as_str(),
+            manifest("top", serde_json::json!(["Action"])),
+        )];
+        let client = AddonClient::new().unwrap();
+
+        // Child (12): tt1 (0) and tt2 (8) pass; the 17+/18+ items and both
+        // unrated ones are dropped before they ever reach the dedupe set.
+        let mut browser = GenreBrowser::new(
+            "movie",
+            "Action",
+            catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::child(12),
+        );
+        let plan = browser.plan();
+        let responses = fetch_page(&client, &plan).await;
+        let page = browser.absorb(&plan, &responses).unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["tt1", "tt2"]);
+        assert_eq!(page.queried, 1);
+        assert_eq!(page.failed, 0);
+        // The short page exhausted the catalog; filtering never extends paging.
+        assert!(!page.has_more);
+
+        // Adult (allow-all): the same page passes through untouched.
+        let mut browser = GenreBrowser::new(
+            "movie",
+            "Action",
+            catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::default(),
+        );
+        let plan = browser.plan();
+        let responses = fetch_page(&client, &plan).await;
+        let page = browser.absorb(&plan, &responses).unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["tt1", "tt2", "tt3", "tt4", "tt5", "tt6"]);
     }
 
     #[tokio::test]
@@ -640,6 +727,7 @@ mod tests {
             "movie",
             "Action",
             catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::default(),
         );
 
         let mut total = 0;
@@ -677,6 +765,7 @@ mod tests {
             "movie",
             "Action",
             catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::default(),
         );
         let plan = browser.plan();
         assert_eq!(plan.requests.len(), 2);
@@ -703,6 +792,7 @@ mod tests {
             "movie",
             "Action",
             catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::default(),
         );
         let plan = browser.plan();
         let responses = fetch_page(&client, &plan).await;
@@ -736,6 +826,7 @@ mod tests {
             "movie",
             "Action",
             catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::default(),
         );
         let plan = browser.plan();
         let responses = fetch_page(&client, &plan).await;
@@ -763,6 +854,7 @@ mod tests {
             "movie",
             "Action",
             catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::default(),
         );
         let plan = browser.plan();
         assert_eq!(plan.requests[0].skip, 0);
