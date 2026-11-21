@@ -40,7 +40,10 @@ playback. Unrated titles are treated as 18+ and hidden from every child profile.
 
 Where the ratings come from: Stremio meta/catalog responses have no dedicated age-rating field,
 so PlusFlix reads age-rating tokens out of the `genres` arrays of addon catalog and meta
-responses, mapping each accepted token (case- and spacing-insensitive) to a minimum age:
+responses, mapping each accepted token (case- and spacing-insensitive) to a minimum age. Some
+addons publish their ratings in the `app_extras` block instead (`app_extras.certification` plus
+the per-country `app_extras.certifications` map, e.g. `{"US":"R","PL":"16"}`) and keep `genres`
+to real genres; PlusFlix merges both sources and the strictest rating wins. Accepted tokens:
 
 - `G`, `TV-G`, `TV-Y`, `U` → 0
 - `TV-Y7` → 7
@@ -52,14 +55,18 @@ responses, mapping each accepted token (case- and spacing-insensitive) to a mini
 - `NC-17`, `X`, `TV-MA` → 18
 - a bare number like `16` means that age
 
-When several ratings are present, the strictest wins. Stremio's default Cinemeta addon does NOT
-publish age ratings in `genres` (real genres only, e.g. `["Drama","Fantasy"]`), so with just
-Cinemeta installed a child profile sees an empty catalog. Child filtering therefore works only
-when at least one installed catalog/meta addon publishes certification tokens in `genres`: the
-community standard is AIOMetadata (public instance https://aiometadata.elfhosted.com; configure
-it, e.g. select catalog sources, and add it to the account's addons), or a self-hosted
-`stremio-catalog-providers` instance in kids-catalog mode. Any addon that puts TMDB/US
-certification tokens into `genres` works.
+Tested example: AIOMetadata (public instance https://aiometadata.elfhosted.com), the
+community-standard kid-safe metadata addon, keeps `genres` to real genres and publishes its age
+ratings via `app_extras` (`certification` plus per-country `certifications`), so with
+AIOMetadata installed child filtering works. Its own kid-safety remains the addon's server-side
+Content Rating filtering (configured on its /configure page), which applies to everyone using
+that addon config: account-wide for all PlusFlix profiles (adults included), not per profile;
+PlusFlix's per-profile filtering is its own layer on top. Stremio's default Cinemeta addon
+publishes no age ratings at all (real genres only, e.g. `["Drama","Fantasy"]`, and no
+`app_extras` ratings either), so with just Cinemeta installed every item arrives unrated and a
+child profile's catalog stays empty. A self-hosted `stremio-catalog-providers` instance in
+kids-catalog mode filters the same addon-side way and is no rating source either. Any addon
+that puts TMDB/US certification tokens into `genres` works too.
 
 The parent PIN is created together with the first child profile (entered twice to confirm; digits
 only, non-empty, no fixed length). It is required to enter an adult profile, to create, edit or

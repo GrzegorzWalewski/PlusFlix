@@ -8,7 +8,7 @@
 
 use crate::addon::{Addon, AddonClient};
 use crate::model::{CatalogDecl, MetaPreview};
-use crate::rating::{rating_of, RatingPolicy};
+use crate::rating::{rating_of_item, RatingPolicy};
 use futures::future::join_all;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -355,8 +355,9 @@ impl GenreBrowser {
                 };
                 added = true;
                 // The rating policy drops an item before it ever reaches the
-                // dedupe set; short pages under a child policy are expected.
-                if !self.policy.allows(rating_of(&item.genres)) {
+                // dedupe set (ratings come from genre tokens or from
+                // `app_extras`); short pages under a child policy are expected.
+                if !self.policy.allows(rating_of_item(&item.genres, item.app_extras.as_ref())) {
                     continue;
                 }
                 if self.seen.insert((item.kind.clone(), item.id.clone())) {
@@ -705,6 +706,66 @@ mod tests {
         let page = browser.absorb(&plan, &responses).unwrap();
         let ids: Vec<&str> = page.items.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["tt1", "tt2", "tt3", "tt4", "tt5", "tt6"]);
+    }
+
+    #[tokio::test]
+    async fn rating_policy_reads_app_extras() {
+        // AIOMetadata-style catalog: `genres` stay real genres, the ratings
+        // live only in `appExtras` (certification + per-country map).
+        let body = serde_json::json!({
+            "metas": [
+                {"id": "tt1", "type": "movie", "name": "Title tt1", "genres": ["Animation"],
+                 "appExtras": {"certification": "PG"}},
+                {"id": "tt2", "type": "movie", "name": "Title tt2", "genres": ["Drama"],
+                 "appExtras": {"certifications": {"US": "PG-13", "PL": "16"}}},
+                {"id": "tt3", "type": "movie", "name": "Title tt3", "genres": ["Crime"],
+                 "appExtras": {"certification": "R", "certifications": {"US": "R"}}},
+                {"id": "tt4", "type": "movie", "name": "Title tt4", "genres": ["Drama"],
+                 "appExtras": "not-an-object"},
+                {"id": "tt5", "type": "movie", "name": "Title tt5", "genres": ["Comedy"]}
+            ]
+        })
+        .to_string();
+        let mut routes = HashMap::new();
+        routes.extend([route("top", "Action", 0, &body)]);
+        let server = FakeServer::start(routes).await;
+        let addons = vec![addon(
+            server.url.as_str(),
+            manifest("top", serde_json::json!(["Action"])),
+        )];
+        let client = AddonClient::new().unwrap();
+
+        // Child (12): only tt1 (PG = 8) passes; tt2 (PG-13/16 = 16),
+        // tt3 (R = 17), tt4 (odd extras = unrated) and tt5 (unrated)
+        // drop before they ever reach the dedupe set.
+        let mut browser = GenreBrowser::new(
+            "movie",
+            "Action",
+            catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::child(12),
+        );
+        let plan = browser.plan();
+        let responses = fetch_page(&client, &plan).await;
+        let page = browser.absorb(&plan, &responses).unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["tt1"]);
+        assert_eq!(page.queried, 1);
+        assert_eq!(page.failed, 0);
+        // The short page exhausted the catalog; filtering never extends paging.
+        assert!(!page.has_more);
+
+        // Adult (allow-all): the same page passes through untouched.
+        let mut browser = GenreBrowser::new(
+            "movie",
+            "Action",
+            catalogs_for_genre(&addons, "movie", "Action"),
+            RatingPolicy::default(),
+        );
+        let plan = browser.plan();
+        let responses = fetch_page(&client, &plan).await;
+        let page = browser.absorb(&plan, &responses).unwrap();
+        let ids: Vec<&str> = page.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["tt1", "tt2", "tt3", "tt4", "tt5"]);
     }
 
     #[tokio::test]

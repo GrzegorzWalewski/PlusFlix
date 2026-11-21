@@ -1,7 +1,7 @@
 //! Data types of the Stremio addon protocol (only the fields PlusFlix uses).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Treats an explicit JSON `null` like a missing field. Real addon data
 /// (and the account's addon collection) contains nulls where the protocol
@@ -12,6 +12,66 @@ where
     T: Default + Deserialize<'de>,
 {
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A field that should be a single string: any other JSON shape (number,
+/// object, ...) degrades to `None` instead of failing the item.
+pub(crate) fn string_or_none<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(serde_json::Value::deserialize(d)?.as_str().map(str::to_string))
+}
+
+/// A field that should be a country -> rating map: keeps the string values,
+/// drops the rest, and degrades to `None` for any non-object JSON shape.
+pub(crate) fn string_map_or_none<'de, D>(d: D) -> Result<Option<BTreeMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Object(map) => {
+            let kept = map
+                .into_iter()
+                .filter_map(|(country, rating)| {
+                    rating.as_str().map(|r| (country, r.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!kept.is_empty()).then_some(kept)
+        }
+        _ => None,
+    })
+}
+
+/// `app_extras` carries arbitrary addon data (AIOMetadata adds cast lists,
+/// release dates, ...), so the block is kept only when it is an object:
+/// any other shape (null, string, array, ...) degrades to `None` and can
+/// never fail the surrounding meta item. (An array must NOT fall through to
+/// serde's positional struct-from-seq path.)
+pub(crate) fn app_extras_or_none<'de, D>(d: D) -> Result<Option<AppExtras>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(d)? {
+        v @ serde_json::Value::Object(_) => serde_json::from_value(v).ok(),
+        _ => None,
+    })
+}
+
+/// The `app_extras` block some addons attach to `meta_preview`/`meta` items.
+/// Only the two age-rating keys are modeled (see `crate::rating`): unknown
+/// keys are dropped by serde, and every odd value shape degrades to
+/// `None`/empty rather than failing the item. AIOMetadata-style items carry
+/// their ratings here and keep `genres` to real genres.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppExtras {
+    /// One age rating (AIOMetadata: the US value; may be null).
+    #[serde(default, deserialize_with = "string_or_none")]
+    pub certification: Option<String>,
+    /// Country -> rating map (AIOMetadata: may be null / missing entirely).
+    #[serde(default, deserialize_with = "string_map_or_none")]
+    pub certifications: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -28,6 +88,12 @@ pub struct MetaPreview {
     /// Cinemeta-style catalogs; see `crate::rating`.
     #[serde(default, deserialize_with = "null_as_default")]
     pub genres: Vec<String>,
+    /// `app_extras` block: addon-specific data. AIOMetadata-style addons
+    /// publish their age ratings here (`certification` +
+    /// `certifications`) and keep `genres` to real genres; both sources
+    /// are merged in `crate::rating`.
+    #[serde(default, deserialize_with = "app_extras_or_none")]
+    pub app_extras: Option<AppExtras>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -44,6 +110,12 @@ pub struct Meta {
     pub runtime: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub genres: Vec<String>,
+    /// `app_extras` block: addon-specific data. AIOMetadata-style addons
+    /// publish their age ratings here (`certification` +
+    /// `certifications`) and keep `genres` to real genres; both sources
+    /// are merged in `crate::rating`.
+    #[serde(default, deserialize_with = "app_extras_or_none")]
+    pub app_extras: Option<AppExtras>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub videos: Vec<Video>,
 }
@@ -271,6 +343,69 @@ impl ExtraDecl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_extras_shapes_never_fail_meta_deserialization() {
+        // `app_extras` carries arbitrary addon data, so every odd shape must
+        // degrade to `None`/empty instead of failing the surrounding item.
+        for payload in [
+            r#"{"id":"tt1","type":"movie","name":"M"}"#, // absent
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":null}"#,
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":"PG"}"#,
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":["PG"]}"#,
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":16}"#,
+        ] {
+            let preview: MetaPreview = serde_json::from_str(payload).unwrap();
+            assert!(preview.app_extras.is_none(), "payload {payload}");
+            let meta: Meta = serde_json::from_str(payload).unwrap();
+            assert!(meta.app_extras.is_none(), "payload {payload}");
+        }
+
+        // Odd values inside an object-shaped block degrade field by field.
+        let preview: MetaPreview = serde_json::from_str(
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":{
+                "certification":16,"certifications":null,
+                "cast":["Who"],"releaseDates":{"US":"2024"}}}"#,
+        )
+        .unwrap();
+        let extras = preview.app_extras.expect("object extras are kept");
+        assert_eq!(extras.certification, None); // number, not a string
+
+        let preview: MetaPreview = serde_json::from_str(
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":{
+                "certification":{"US":"R"},"certifications":["R","PG"],
+                "directors":["Who"]}}"#,
+        )
+        .unwrap();
+        let extras = preview.app_extras.expect("object extras are kept");
+        assert_eq!(extras.certification, None); // object, not a string
+        assert!(extras.certifications.is_none()); // array, not a map
+
+        let meta: Meta = serde_json::from_str(
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":{
+                "certifications":{"PL":16}}}"#,
+        )
+        .unwrap();
+        let extras = meta.app_extras.expect("object extras are kept");
+        assert!(extras.certifications.is_none()); // numeric value dropped
+
+        // Real AIOMetadata shapes keep working.
+        let meta: Meta = serde_json::from_str(
+            r#"{"id":"tt1","type":"movie","name":"M","genres":["Drama"],
+                "appExtras":{"certification":"R",
+                "certifications":{"US":"R","PL":"16"},"seasonPosters":{}}}"#,
+        )
+        .unwrap();
+        let extras = meta.app_extras.unwrap();
+        assert_eq!(extras.certification.as_deref(), Some("R"));
+        assert_eq!(
+            extras
+                .certifications
+                .as_ref()
+                .and_then(|c| c.get("PL").map(String::as_str)),
+            Some("16")
+        );
+    }
 
     #[test]
     fn null_lists_parse_as_empty() {

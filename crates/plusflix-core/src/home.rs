@@ -2,7 +2,7 @@
 
 use crate::addon::{Addon, AddonClient};
 use crate::model::{CatalogDecl, MetaPreview};
-use crate::rating::{filter_previews, rating_of, RatingPolicy};
+use crate::rating::{filter_previews, rating_of_item, RatingPolicy};
 use futures::future::join_all;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -109,8 +109,9 @@ pub async fn search(
     let mut out = Vec::new();
     for items in join_all(fetches).await.into_iter().flatten() {
         for m in items {
-            // The policy drops an item before it ever reaches the dedupe set.
-            if !policy.allows(rating_of(&m.genres)) {
+            // The policy drops an item before it ever reaches the dedupe set
+            // (ratings come from genre tokens or from `app_extras`).
+            if !policy.allows(rating_of_item(&m.genres, m.app_extras.as_ref())) {
                 continue;
             }
             if seen.insert((m.kind.clone(), m.id.clone())) {

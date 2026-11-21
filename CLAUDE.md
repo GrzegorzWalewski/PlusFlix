@@ -37,7 +37,7 @@ Play ──► session::run ──► best untried source ──► mpv (loadfil
 - `loader` – `SourceLoader`: one background task per addon, streams flow into the pool. Dropping it cancels pending requests.
 - `pool` – `SourcePool`: shared candidate pool; addons keep feeding it even while playing, so failover always has backups. Candidates are ranked: audio language match, then quality, then debrid-cached, then subtitles.
 - `select` / `parse` / `lang` – filtering/evaluation and heuristic parsing of language/quality/size/subtitle info from addon text (names, titles, flags, filenames).
-- `rating` – age-rating token parsing into `AgeRating`; when sources disagree the strictest wins; `RatingPolicy` (profile kind + max age) filters previews, search, and genre pages.
+- `rating` – age-rating token parsing into `AgeRating` from `genres` tokens and from `app_extras` (`certification`/`certifications`); when sources disagree the strictest wins; `RatingPolicy` (profile kind + max age) filters previews, search, and genre pages.
 - `session` – failover loop (`session::run`): starts best source; on error, no start in 25 s, stall > 15 s, or premature EOF, loads the next best untried source into the same mpv instance at last position minus 3 s.
 - `player` – `Player` trait (session ↔ player interface); `mpv` implements it via mpv JSON IPC (Windows named pipe, Unix socket). mpv owns decoding/subtitles/OSD in its own fullscreen window.
 - `store` / `settings` – one JSON store under the OS config dir (`PlusFlix/config/store.json`): up to 5 local profiles with favorites, progress, and per-profile settings (audio/subtitle language requirements, min quality, max size). Session key stored, never the password.

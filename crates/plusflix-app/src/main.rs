@@ -9,11 +9,11 @@ slint::include_modules!();
 
 use plusflix_core::addon::{Addon, AddonClient};
 use plusflix_core::genres::{self, CatalogRef, GenreBrowser};
-use plusflix_core::rating::{parse_token, rating_of, AgeRating, RatingPolicy};
+use plusflix_core::rating::{parse_token, rating_of_item, AgeRating, RatingPolicy};
 use plusflix_core::home;
 use plusflix_core::lang::Lang;
 use plusflix_core::loader::SourceLoader;
-use plusflix_core::model::{Meta, MetaPreview};
+use plusflix_core::model::{AppExtras, Meta, MetaPreview};
 use plusflix_core::mpv::{MpvConfig, MpvPlayer};
 use plusflix_core::player::{LoadRequest, Player, PlayerEvent};
 use plusflix_core::pool::SourcePool;
@@ -253,7 +253,8 @@ struct ItemData {
     is_cw: bool,
     /// Cached source resolution for the play pill (see `SourceStatus`).
     source_state: SourceStatus,
-    /// Strictest age rating among the item's genre tokens (`None` = unrated).
+    /// Strictest age rating among the item's genre tokens and `app_extras`
+    /// ratings (`None` = unrated).
     rating_age: Option<u8>,
 }
 
@@ -275,7 +276,7 @@ impl ItemData {
             fav: false,
             is_cw: false,
             source_state: SourceStatus::Loading,
-            rating_age: rating_age_of(&m.genres),
+            rating_age: rating_age_of(&m.genres, m.app_extras.as_ref()),
         }
     }
     fn from_favorite(f: &Favorite) -> Self {
@@ -443,10 +444,13 @@ fn addon_rows(addons: &[Addon], waits: &[String]) -> Vec<AddonData> {
         .collect()
 }
 
-/// Strictest age among a genre list, as the flat per-item `rating_age` stamp
-/// (`None` = unrated). The rating table itself lives in core (`rating_of`).
-fn rating_age_of(genres: &[String]) -> Option<u8> {
-    rating_of(genres).map(|AgeRating(age)| age)
+/// Strictest age among a genre list AND the `app_extras` ratings
+/// (`certification` + per-country `certifications`), as the flat per-item
+/// `rating_age` stamp (`None` = unrated). The rating table itself lives in
+/// core (`rating_of_item` - the same merged extractor the catalog filter,
+/// `filter_previews`, uses).
+fn rating_age_of(genres: &[String], extras: Option<&AppExtras>) -> Option<u8> {
+    rating_of_item(genres, extras).map(|AgeRating(age)| age)
 }
 
 /// (watched, favorite) badges for one item, judged by the active profile.
@@ -2168,7 +2172,7 @@ fn toggle_favorite(app: &Arc<App>) {
             kind: detail.kind.clone(),
             name: detail.meta.name.clone(),
             poster: detail.meta.poster.clone(),
-            rating_age: rating_age_of(&detail.meta.genres),
+            rating_age: rating_age_of(&detail.meta.genres, detail.meta.app_extras.as_ref()),
         })
     };
     app.save();
@@ -2356,7 +2360,9 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
     // is unchanged; the "not available for this profile" UI state arrives
     // with the Slint phase — this is the data-side block only.
     let policy = app.rating_policy();
-    if !policy.allows(rating_of(&detail.meta.genres)) {
+    // The same merged extractor as the catalog filter (`filter_previews`),
+    // so play-allowance always matches item visibility.
+    if !policy.allows(rating_of_item(&detail.meta.genres, detail.meta.app_extras.as_ref())) {
         tracing::warn!(
             "[rating] refusing playback of \"{}\": above the current profile's age cap",
             detail.meta.name
@@ -2435,7 +2441,7 @@ fn play(app: &Arc<App>, kind: String, forced: Option<String>) {
         }),
     };
     // The rating-age stamp for the progress entries this playback records.
-    let rating_age = rating_age_of(&detail.meta.genres);
+    let rating_age = rating_age_of(&detail.meta.genres, detail.meta.app_extras.as_ref());
     let app = app.clone();
     app.rt.clone().spawn(async move {
         app.ui(move |ui| {

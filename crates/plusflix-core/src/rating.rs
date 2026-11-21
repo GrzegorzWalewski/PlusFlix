@@ -2,14 +2,18 @@
 //!
 //! The Stremio protocol has no dedicated rating field on `meta`/`meta_preview`
 //! objects, so this module parses rating tokens ("PG", "TV-MA", "16", ...) out
-//! of `MetaPreview::genres` and turns them into a minimum age, plus the
-//! `RatingPolicy` a profile passes in to filter items. Some metadata/catalog
-//! addons publish certification tokens there (TMDB/US-certification-based,
-//! e.g. AIOMetadata), but Stremio's default Cinemeta does not: child filtering
-//! depends on an addon that supplies them. Core never knows which profile is
-//! active: the policy is always an explicit parameter.
+//! of `MetaPreview::genres` AND out of the `app_extras` block some addons
+//! attach to their items (`certification` plus the per-country
+//! `certifications` map), and turns them into a minimum age, plus the
+//! `RatingPolicy` a profile passes in to filter items. Source-verified:
+//! AIOMetadata (the community kid-safe addon) emits real genres only and
+//! publishes its ratings via `app_extras`, so with it installed child
+//! filtering works; Stremio's default Cinemeta publishes neither (no ratings
+//! at all), so its items arrive unrated and are hidden from every child
+//! profile. Core never knows which profile is active: the policy is always an
+//! explicit parameter.
 
-use crate::model::MetaPreview;
+use crate::model::{AppExtras, MetaPreview};
 use serde::{Deserialize, Serialize};
 
 /// Minimum age (in years) required to see one item.
@@ -72,6 +76,29 @@ pub fn rating_of(genres: &[String]) -> Option<AgeRating> {
     genres.iter().filter_map(|g| parse_token(g)).max()
 }
 
+/// The strictest rating among an item's genre tokens AND its `app_extras`
+/// ratings (`certification` + every `certifications` value): the candidates
+/// from both sources are merged and the HIGHEST age wins, `None` when
+/// nothing parses (the item is unrated). AIOMetadata-style items carry real
+/// genres only - their ratings come from extras alone - while Cinemeta-style
+/// items are rated via tokens in `genres` and have no extras.
+pub fn rating_of_item(genres: &[String], extras: Option<&AppExtras>) -> Option<AgeRating> {
+    let extras_tokens = extras.into_iter().flat_map(|x| {
+        let certification = x.certification.iter().map(String::as_str);
+        let countries = x
+            .certifications
+            .iter()
+            .flat_map(|map| map.values().map(String::as_str));
+        certification.chain(countries)
+    });
+    genres
+        .iter()
+        .map(String::as_str)
+        .chain(extras_tokens)
+        .filter_map(parse_token)
+        .max()
+}
+
 /// What a profile is allowed to see. `max_age: None` is the adult profile
 /// (everything allowed); `Some(age)` is a child profile capped at `age`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -100,10 +127,11 @@ impl RatingPolicy {
 }
 
 /// Keeps only the previews the policy allows (adult: everything, in order).
+/// Ratings come from the items' genre tokens and `app_extras` alike.
 pub fn filter_previews(policy: &RatingPolicy, items: Vec<MetaPreview>) -> Vec<MetaPreview> {
     items
         .into_iter()
-        .filter(|item| policy.allows(rating_of(&item.genres)))
+        .filter(|item| policy.allows(rating_of_item(&item.genres, item.app_extras.as_ref())))
         .collect()
 }
 
@@ -120,6 +148,20 @@ mod tests {
             release_info: None,
             description: None,
             genres: genres.iter().map(|g| g.to_string()).collect(),
+            app_extras: None,
+        }
+    }
+
+    /// AIOMetadata-style extras: one `certification` + country->rating pairs.
+    fn extras(certification: Option<&str>, countries: &[(&str, &str)]) -> AppExtras {
+        AppExtras {
+            certification: certification.map(str::to_string),
+            certifications: (!countries.is_empty()).then(|| {
+                countries
+                    .iter()
+                    .map(|(c, r)| (c.to_string(), r.to_string()))
+                    .collect()
+            }),
         }
     }
 
@@ -244,5 +286,102 @@ mod tests {
         let kept: Vec<String> =
             filter_previews(&child, items).into_iter().map(|m| m.id).collect();
         assert_eq!(kept, ["tt1"]); // 18+, unrated and 17+ all hidden
+    }
+
+    #[test]
+    fn extras_alone_rate_the_item() {
+        // AIOMetadata-style: `genres` stay real genres, the rating comes
+        // from `app_extras` alone.
+        let mut m = preview("tt1", &["Drama"]);
+        m.app_extras = Some(extras(Some("PG"), &[]));
+        assert_eq!(
+            rating_of_item(&m.genres, m.app_extras.as_ref()),
+            Some(AgeRating(8))
+        );
+        m.app_extras = Some(extras(Some("18"), &[]));
+        assert_eq!(
+            rating_of_item(&m.genres, m.app_extras.as_ref()),
+            Some(AgeRating(18))
+        );
+        // Neither source carries a rating: unrated.
+        assert_eq!(rating_of_item(&["Drama".to_string()], None), None);
+    }
+
+    #[test]
+    fn strictest_wins_across_genres_and_extras() {
+        // Genres say 8, extras say 17.
+        let mut m = preview("tt1", &["TV-PG"]);
+        m.app_extras = Some(extras(Some("R"), &[]));
+        assert_eq!(
+            rating_of_item(&m.genres, m.app_extras.as_ref()),
+            Some(AgeRating(17))
+        );
+        // The other way around: genres 18, extras 13.
+        let mut m = preview("tt2", &["TV-MA"]);
+        m.app_extras = Some(extras(Some("PG-13"), &[]));
+        assert_eq!(
+            rating_of_item(&m.genres, m.app_extras.as_ref()),
+            Some(AgeRating(18))
+        );
+    }
+
+    #[test]
+    fn certifications_map_values_count() {
+        // Per-country ratings: every value is a candidate, strictest wins.
+        let mut m = preview("tt1", &[]);
+        m.app_extras = Some(extras(None, &[("US", "R"), ("PL", "16")]));
+        assert_eq!(
+            rating_of_item(&m.genres, m.app_extras.as_ref()),
+            Some(AgeRating(17))
+        );
+        // A bare digit in the map means that age.
+        m.app_extras = Some(extras(None, &[("DE", "12")]));
+        assert_eq!(
+            rating_of_item(&m.genres, m.app_extras.as_ref()),
+            Some(AgeRating(12))
+        );
+        // Certification and map disagree: the stricter one wins.
+        m.app_extras = Some(extras(Some("G"), &[("GB", "TV-14")]));
+        assert_eq!(
+            rating_of_item(&m.genres, m.app_extras.as_ref()),
+            Some(AgeRating(14))
+        );
+    }
+
+    #[test]
+    fn unparseable_extras_leave_the_item_unrated() {
+        // Nothing parses (garbage tokens only): the item is unrated, and
+        // unrated stays hidden from children (counts as age 18).
+        let mut m = preview("tt1", &["Comedy"]);
+        m.app_extras = Some(extras(Some("n/a"), &[("XX", "fluffy")]));
+        assert_eq!(rating_of_item(&m.genres, m.app_extras.as_ref()), None);
+        assert!(
+            !RatingPolicy::child(12).allows(rating_of_item(&m.genres, m.app_extras.as_ref()))
+        );
+    }
+
+    #[test]
+    fn filter_previews_reads_extras_too() {
+        let mut soft = preview("tt1", &["Drama"]);
+        soft.app_extras = Some(extras(Some("G"), &[]));
+        let mut hard = preview("tt2", &["Drama"]);
+        hard.app_extras = Some(extras(Some("R"), &[("US", "R"), ("PL", "16")]));
+        let unrated = preview("tt3", &["Drama"]);
+
+        // Child (12): only the G item passes (R = 17 hidden, unrated hidden).
+        let items = vec![soft.clone(), hard.clone(), unrated.clone()];
+        let kept: Vec<String> = filter_previews(&RatingPolicy::child(12), items)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(kept, ["tt1"]);
+
+        // Adult: everything passes, extras or not, in order.
+        let items = vec![soft, hard, unrated];
+        let kept: Vec<String> = filter_previews(&RatingPolicy::default(), items)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(kept, ["tt1", "tt2", "tt3"]);
     }
 }
