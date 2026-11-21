@@ -44,7 +44,7 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             start_timeout: Duration::from_secs(25),
-            stall_timeout: Duration::from_secs(15),
+            stall_timeout: Duration::from_secs(10),
             no_source_timeout: Duration::from_secs(90),
             rewind_secs: 3.0,
             premature_eof_secs: 30.0,

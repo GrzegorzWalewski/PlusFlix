@@ -83,7 +83,7 @@ open title ──► SourceLoader (one task per addon) ──► SourcePool  ◄
                   keeps adding sources while playing ───┘                    ▼
 Play ──► session::run ──► best untried source ──► mpv (loadfile ... start=<position>)
               ▲                                         │
-              └── error / no start in 25 s / stall 15 s / EOF >30 s before end
+              └── error / no start in 25 s / stall 10 s / EOF >30 s before end
 ```
 
 When a source fails, the session loads the next best untried source into the same mpv window

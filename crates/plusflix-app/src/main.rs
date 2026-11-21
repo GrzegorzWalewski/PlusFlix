@@ -214,6 +214,9 @@ struct App {
     /// so the account sync can patch the Continue Watching row without
     /// re-fetching catalogs.
     rows_cache: Mutex<Vec<(String, String, Vec<ItemData>)>>,
+    /// Trailer URL of the open detail's meta (None = no trailer data or no
+    /// detail open); opened in the system browser, never a stream candidate.
+    trailer_url: Mutex<Option<String>>,
     /// Bumped on every page load; background catalog tasks only patch the UI
     /// while their generation is current.
     load_gen: std::sync::atomic::AtomicUsize,
@@ -1050,15 +1053,17 @@ fn backfill_cw_art(app: &Arc<App>) {
         let Ok(p) = st.profile(&pid) else { return };
         p.progress
             .iter()
-            .filter(|(_, pr)| pr.card.as_ref().is_some_and(|c| c.background.is_none()))
-            .map(|(vid, pr)| {
-                let c = pr.card.as_ref().unwrap();
-                (
+            .filter_map(|(vid, pr)| {
+                let c = pr.card.as_ref()?;
+                if c.background.is_some() {
+                    return None;
+                }
+                Some((
                     vid.clone(),
                     c.title_id.clone(),
                     c.kind.clone(),
                     c.episode_id.clone(),
-                )
+                ))
             })
             .collect()
     };
@@ -1983,6 +1988,10 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
             .collect();
         let long_title = meta.name.chars().count() > 40;
         let poster = meta.poster.clone();
+        // Trailer of this meta (None = no trailer data). Stored for the
+        // open-trailer callback; trailers never enter the stream pool.
+        let trailer_url = meta.trailer_url();
+        *lock(&app.trailer_url) = trailer_url.clone();
         let detail = Arc::new(Detail {
             kind: kind.clone(),
             meta: meta.clone(),
@@ -2033,6 +2042,7 @@ fn open_item(app: &Arc<App>, id: String, kind: String) {
                 ui.set_detail_desc(desc.into());
                 ui.set_detail_poster(Image::default());
                 ui.set_detail_has_poster(false);
+                ui.set_detail_has_trailer(trailer_url.is_some());
                 ui.set_detail_is_series(is_series);
                 ui.set_detail_fav(is_fav);
                 ui.set_detail_watched(episode_watched);
@@ -3457,6 +3467,7 @@ fn apply_language(app: &Arc<App>) {
         ui.set_t_waiting_sources(tr(&app2, "waiting_for_sources").into());
         ui.set_t_resume(tr(&app2, "resume").into());
         ui.set_t_play(tr(&app2, "play").into());
+        ui.set_t_trailer(tr(&app2, "trailer").into());
         ui.set_t_resume_playback(tr(&app2, "resume_playback").into());
         ui.set_t_choose_player(tr(&app2, "choose_player").into());
         ui.set_t_cancel(tr(&app2, "cancel").into());
@@ -3678,7 +3689,11 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     let a = app.clone();
     ui.on_close_detail(move || {
         *lock(&a.detail) = None;
-        a.ui(|ui| ui.set_detail_open(false));
+        *lock(&a.trailer_url) = None;
+        a.ui(|ui| {
+            ui.set_detail_open(false);
+            ui.set_detail_has_trailer(false);
+        });
     });
     let a = app.clone();
     ui.on_toggle_favorite(move || toggle_favorite(&a));
@@ -3720,6 +3735,17 @@ fn wire(ui: &MainWindow, app: &Arc<App>) {
     });
     let a = app.clone();
     ui.on_play(move |kind| play(&a, kind.to_string(), None));
+    let a = app.clone();
+    ui.on_open_trailer(move || {
+        // Some only while a detail with trailer data is open; the button
+        // that fires this is hidden otherwise.
+        let Some(url) = lock(&a.trailer_url).clone() else {
+            return;
+        };
+        if let Err(e) = webbrowser::open(&url) {
+            tracing::warn!("opening trailer failed: {e}");
+        }
+    });
     let a = app.clone();
     let weak = ui.as_weak();
     ui.on_play_source(move |key| {
@@ -3833,6 +3859,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         source_states: Mutex::new(HashMap::new()),
         rating_cache: Mutex::new(HashMap::new()),
         rows_cache: Mutex::new(Vec::new()),
+        trailer_url: Mutex::new(None),
         load_gen: std::sync::atomic::AtomicUsize::new(0),
         genre: Mutex::new(None),
         genre_gen: std::sync::atomic::AtomicUsize::new(0),

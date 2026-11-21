@@ -369,6 +369,8 @@ export component MainWindow inherits Window {
     in property <string> detail-desc;
     in property <image> detail-poster;
     in property <bool> detail-has-poster;
+    // True while the open meta carries trailer data (Trailer button visibility).
+    in property <bool> detail-has-trailer;
     in property <bool> detail-is-series;
     in property <bool> detail-fav;
     in property <[string]> season-names;
@@ -467,6 +469,7 @@ export component MainWindow inherits Window {
     in property <string> t-choose-player;
     in property <string> t-cancel;
     in property <string> t-next-source;
+    in property <string> t-trailer;
     // Translated series strings (episodes header; season display names are
     // rebuilt in Rust from t-season-prefix + the season number).
     in property <string> t-episodes;
@@ -583,6 +586,8 @@ export component MainWindow inherits Window {
     callback navigate(string);
     callback open-item(string, string);
     callback close-detail();
+    // Open the open detail meta's trailer in the system default browser.
+    callback open-trailer();
     callback toggle-favorite();
     // Card-level toggles fired straight from catalog cards.
     callback toggle-favorite-card(string, string, string, string); // id, kind, name, poster-url
@@ -2105,7 +2110,8 @@ export component MainWindow inherits Window {
                         }
                     }
                     Rectangle { vertical-stretch: 0; height: Theme.sp-6; }
-                    // Play row: ONLY the play split button
+                    // Play row: the play split button + the Trailer button
+                    // (only when the meta carries trailer data).
                     Rectangle {
                         height: Theme.play-h;
                         play-row := Rectangle {
@@ -2166,6 +2172,18 @@ export component MainWindow inherits Window {
                                     root.player-menu-open = false;
                                     root.play(root.play-player);
                                 }
+                            }
+                        }
+                        // Trailer button: rendered only when the meta carried
+                        // trailer data (Rust pushes detail-has-trailer); opens
+                        // the YouTube trailer in the system default browser.
+                        if root.detail-has-trailer: Button {
+                            x: play-row.width + Theme.sp-3;
+                            y: (parent.height - self.height) / 2;
+                            height: Theme.play-h;
+                            text: root.t-trailer;
+                            clicked => {
+                                root.open-trailer();
                             }
                         }
                         // player picker menu

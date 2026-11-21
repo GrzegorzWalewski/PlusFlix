@@ -25,7 +25,7 @@ use tokio::sync::Mutex as AsyncMutex;
 /// How often the HTTP interface is polled for state.
 const POLL: Duration = Duration::from_millis(400);
 /// Without a position advance for this long we report `Buffering(true)`.
-const STALL_AFTER: Duration = Duration::from_secs(5);
+const STALL_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct VlcConfig {

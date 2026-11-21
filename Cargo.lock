@@ -3652,7 +3652,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plusflix-app"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "i-slint-backend-testing",
  "i-slint-core",
@@ -3663,12 +3663,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "webbrowser",
  "winresource",
 ]
 
 [[package]]
 name = "plusflix-core"
-version = "1.6.1"
+version = "1.7.0"
 dependencies = [
  "directories",
  "futures",

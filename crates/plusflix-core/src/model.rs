@@ -118,6 +118,34 @@ pub struct Meta {
     pub app_extras: Option<AppExtras>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub videos: Vec<Video>,
+    /// Trailer list of the detail response (`trailerStreams[].ytId`): the
+    /// preferred shape. Optional — many metas carry no trailer at all.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub trailer_streams: Vec<TrailerStream>,
+    /// Legacy trailer list: `trailers[].source` holds the YouTube id.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub trailers: Vec<Trailer>,
+}
+
+impl Meta {
+    /// The first trailer as a YouTube watch URL, or `None` when the meta
+    /// carries no trailer data: `trailerStreams[].ytId` first, falling back
+    /// to the legacy `trailers[].source`. Trailers stay on the meta side
+    /// (opened in the system browser) and never enter the stream pool.
+    pub fn trailer_url(&self) -> Option<String> {
+        let yt_id = self
+            .trailer_streams
+            .iter()
+            .filter_map(|t| t.yt_id.as_deref())
+            .find(|id| !id.is_empty())
+            .or_else(|| {
+                self.trailers
+                    .iter()
+                    .filter_map(|t| t.source.as_deref())
+                    .find(|id| !id.is_empty())
+            })?;
+        Some(format!("https://www.youtube.com/watch?v={yt_id}"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -131,6 +159,25 @@ pub struct Video {
     pub episode: Option<u32>,
     pub released: Option<String>,
     pub thumbnail: Option<String>,
+}
+
+/// Trailer entry of the `trailerStreams` list of a meta detail response:
+/// `ytId` is the YouTube video id. Optional — many metas carry no trailer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TrailerStream {
+    pub title: Option<String>,
+    pub yt_id: Option<String>,
+}
+
+/// Legacy trailer entry of the `trailers` list: `source` holds the YouTube
+/// video id. The `type` field is renamed — `type` is a Rust keyword.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Trailer {
+    pub source: Option<String>,
+    #[serde(rename = "type")]
+    pub trailer_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -488,5 +535,49 @@ mod tests {
         let two: ExtraDecl =
             serde_json::from_str(r#"{"name":"genre","options":["a"],"optionsLimit":5}"#).unwrap();
         assert_eq!(two.effective_options_limit(), 5);
+    }
+
+    #[test]
+    fn trailer_url_prefers_trailer_streams() {
+        // Real Cinemeta meta detail shape (both optional fields present).
+        let m: Meta = serde_json::from_str(
+            r#"{"id":"tt0111161","type":"movie","name":"The Shawshank Redemption",
+                "trailers":[{"source":"PLl99DlL6b4","type":"Trailer"},{"source":"xyXX8LXiNJ4","type":"Trailer"}],
+                "trailerStreams":[{"title":"The Shawshank Redemption","ytId":"PLl99DlL6b4"},{"title":"The Shawshank Redemption","ytId":"xyXX8LXiNJ4"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.trailer_url().as_deref(),
+            Some("https://www.youtube.com/watch?v=PLl99DlL6b4")
+        );
+    }
+
+    #[test]
+    fn trailer_url_without_trailer_data_is_none() {
+        // Absent, null, empty and empty-id shapes all parse and yield None.
+        for payload in [
+            r#"{"id":"tt1","type":"movie","name":"M"}"#,
+            r#"{"id":"tt1","type":"movie","name":"M","trailers":null,"trailerStreams":null}"#,
+            r#"{"id":"tt1","type":"movie","name":"M","trailers":[],"trailerStreams":[]}"#,
+            r#"{"id":"tt1","type":"movie","name":"M",
+                "trailers":[{"source":"","type":"Trailer"}],
+                "trailerStreams":[{"title":"T","ytId":""}]}"#,
+        ] {
+            let m: Meta = serde_json::from_str(payload).unwrap();
+            assert_eq!(m.trailer_url(), None, "payload {payload}");
+        }
+    }
+
+    #[test]
+    fn trailer_url_falls_back_to_legacy_trailers() {
+        let m: Meta = serde_json::from_str(
+            r#"{"id":"tt1","type":"movie","name":"M",
+                "trailers":[{"source":"xyXX8LXiNJ4","type":"Trailer"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.trailer_url().as_deref(),
+            Some("https://www.youtube.com/watch?v=xyXX8LXiNJ4")
+        );
     }
 }
