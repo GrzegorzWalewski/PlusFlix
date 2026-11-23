@@ -1,111 +1,148 @@
 # PlusFlix
 
-A Stremio-backed desktop player written in Rust (Slint UI + mpv). It signs in with your
-Stremio account, uses the addons installed there, and plays with automatic source failover.
+Hobby project — dogfooded daily at home; expect rough edges. Windows is the tested daily driver;
+Linux and macOS should build and run but are untested. No prebuilt binaries — build from source.
 
-## Run
+PlusFlix is a simple Stremio client that picks the source for you. Open a title, press Play, and if a
+stream fails or stalls it silently switches to the next-best one. Made for people who don't want to
+deal with source lists, with profiles and a PIN-protected kid mode.
 
-```
-# needs mpv (>= 0.38) on PATH; on Windows e.g. `winget install mpv` or put mpv.exe next to plusflix-app.exe
-cargo run --release -p plusflix-app
-cargo test --workspace
-```
+![Home](docs/img/home.png)
+![Series details](docs/img/series_details.png)
+![Profiles](docs/img/profiles.png)
 
-Data (login key, profiles, favorites, progress) is stored in one JSON file under the OS config
-dir (`PlusFlix/config/store.json`). Your Stremio password is never stored, only the session key.
+> PlusFlix is a client only: it hosts and provides no content, and it is not affiliated with Stremio.
+> It plays only direct HTTP(S) streams from the addons installed on your Stremio account; torrent
+> info-hash, YouTube and external-URL streams are intentionally skipped.
 
 ## Features
 
 - Stremio account login; addons are read from the account's addon collection
 - Pages: Home, Movies, Series, Favorites (+ Settings), details with episode list for series
 - Up to 5 local profiles, each with its own favorites, watch progress and settings
-- Continue Watching row on Home: local progress plus entries synced from the account's
-  Stremio library (`datastoreGet` on `libraryItem`, same rule Stremio uses)
-- Interface language switcher (Settings → Language): English and Polski, applied immediately
-  without restart; the choice is persisted in the store. Locale files live in
-  `crates/plusflix-app/locales/` (`en.json`, `pl.json`); see `README.md` there for adding a new
-  language. Missing keys fall back to English.
-- Per-profile settings: player (mpv / VLC), audio language (prefer / must), subtitles language, subtitles requirement
-  (required / required only if audio isn't the preferred language / not required), minimum
-  quality, maximum file size, stream start timeout, buffering tolerance
+- Continue Watching row on Home: local progress plus entries synced from the account's Stremio
+  library. An entry counts when its type isn't "other", it isn't marked removed (a temporary removal
+  still counts), and `state.timeOffset > 0`. PlusFlix additionally drops finished titles when merging.
+- Interface language switcher (Settings → Language): English and Polski, applied immediately without
+  restart, persisted in the store. Locale files in `crates/plusflix-app/locales/` (`en.json`,
+  `pl.json`); missing keys fall back to English.
+- Per-profile settings: player (mpv / VLC), audio language (prefer / must), subtitles language,
+  subtitles requirement (required / required only if audio isn't the preferred language / not
+  required), minimum quality, maximum file size, stream start timeout, buffering tolerance
 - Sources load in the background as soon as a title (or episode) is opened
 
-## Parental controls (child profiles & PIN)
+## Install & run
 
-Profiles are the existing feature (up to 5 in total; children count toward that cap); a child
-profile is one with an age between 3 and 17. While it is active, catalogs, search and genre
-pages show only titles whose age rating is at or below the child's age; favorites and
-continue-watching are filtered the same way, and opening an over-age title is blocked at
-playback. Unrated titles are treated as 18+ and hidden from every child profile.
+Platforms: Windows (tested daily driver), Linux and macOS (should build and run, untested). You need
+a Rust toolchain.
 
-Where the ratings come from: Stremio meta/catalog responses have no dedicated age-rating field,
-so PlusFlix reads age-rating tokens out of the `genres` arrays of addon catalog and meta
-responses, mapping each accepted token (case- and spacing-insensitive) to a minimum age. Some
-addons publish their ratings in the `app_extras` block instead (`app_extras.certification` plus
-the per-country `app_extras.certifications` map, e.g. `{"US":"R","PL":"16"}`) and keep `genres`
-to real genres; PlusFlix merges both sources and the strictest rating wins. Accepted tokens:
+```
+cargo run --release -p plusflix-app
+cargo test --workspace
+```
 
-- `G`, `TV-G`, `TV-Y`, `U` → 0
-- `TV-Y7` → 7
-- `PG`, `TV-PG` → 8
-- `12A` → 12
-- `PG-13` → 13
-- `TV-14` → 14
-- `R` → 17
-- `NC-17`, `X`, `TV-MA` → 18
-- a bare number like `16` means that age
+mpv >= 0.38 must be on PATH. On Windows, `winget install mpv`, or put `mpv.exe` next to
+`plusflix-app.exe`. The 0.38 floor exists because playback uses mpv's `loadfile` with an index
+argument. IPC goes over a named pipe (Windows) / unix socket.
 
-Tested example: AIOMetadata (public instance https://aiometadata.elfhosted.com), the
-community-standard kid-safe metadata addon, keeps `genres` to real genres and publishes its age
-ratings via `app_extras` (`certification` plus per-country `certifications`), so with
-AIOMetadata installed child filtering works. Its own kid-safety remains the addon's server-side
-Content Rating filtering (configured on its /configure page), which applies to everyone using
-that addon config: account-wide for all PlusFlix profiles (adults included), not per profile;
-PlusFlix's per-profile filtering is its own layer on top. Stremio's default Cinemeta addon
-publishes no age ratings at all (real genres only, e.g. `["Drama","Fantasy"]`, and no
-`app_extras` ratings either), so with just Cinemeta installed every item arrives unrated and a
-child profile's catalog stays empty. A self-hosted `stremio-catalog-providers` instance in
-kids-catalog mode filters the same addon-side way and is no rating source either. Any addon
-that puts TMDB/US certification tokens into `genres` works too.
+VLC is optional: only needed when a profile selects it in Settings. It is looked up on PATH or in the
+standard Windows install directories.
 
-The parent PIN is created together with the first child profile (entered twice to confirm; digits
-only, non-empty, no fixed length). It is required to enter an adult profile, to create, edit or
-delete profiles, and to turn manage mode on; entering a child profile stays PIN-free. It is
-stored as a salted SHA-256 hash, never plaintext, in the same `store.json`. This is
-parental-control grade, not security: a forgotten PIN means deleting the store file (losing the
-profiles and settings).
+## Data & security
+
+Everything persistent — Stremio session key (auth key + email), profiles, favorites, watch progress,
+settings — lives in one JSON file: plaintext, pretty-printed, written atomically (`.json.tmp` +
+rename).
+
+| OS      | Path                                              |
+| ------- | ------------------------------------------------- |
+| Windows | `%APPDATA%\PlusFlix\config\store.json`           |
+| Linux   | `~/.config/plusflix/store.json`                   |
+| macOS   | `~/Library/Application Support/PlusFlix/store.json` |
+
+Your Stremio password is never stored — only the session key, and it sits unencrypted in that
+plaintext file.
+
+The parent PIN (see [Parental controls](#parental-controls)) is stored as a salted SHA-256 hash in
+the same `store.json`, never plaintext. It is still bypassable by editing `store.json` (delete the
+PIN hash, flip a profile's kind, or bump its age) — parental-control grade, not security. A forgotten
+PIN means deleting `store.json`, which loses the profiles and settings.
+
+## Configuration
+
+### Source ranking
+
+Order: audio language match, then quality, then debrid-cached, then subtitles available. Exact ties
+break by arrival order (a sequence counter), never by addon collection order.
+
+Audio language "prefer" only ranks; "must" rejects non-matching sources (untagged streams are
+rejected too). Quality is the resolution tier parsed from the source name; streams without a quality
+label default to 720p. Debrid-cached is sniffed from the source name: tokens like `[PL+]` or `⚡` mean
+cached, `[PL download]` or `not cached` mean not cached, unknown is mid-ranked, never rejected.
+
+### Addon priority
+
+To make a specific addon win: Settings exposes a per-addon toggle "Wait for this addon before starting
+playback" (per-profile `wait_for_addons` list of addon manifest ids, default empty). Playback is
+deferred until the toggled addons' sources arrive, and those addons' sources then beat even
+better-ranked sources from other addons.
+
+Recipe for the Polish case: set the profile's audio language to Polish and flip the toggle on the
+Polish-audio addon — its Polish sources win. Addon collection order alone does nothing to the ranking.
+
+### Source switching
+
+Stream start timeout 25 s default, stall/buffering timeout 10 s default. Both are per-profile
+configurable (Settings → Source switching: "Stream start timeout" and "Buffering tolerance"),
+5–300 s or empty = default. Timeouts scale up automatically while mpv pre-buffers.
+
+## Parental controls
+
+Profiles (up to 5) can be marked as child profiles by setting an age between 3 and 17 (children count
+toward the cap). While a child profile is active, catalogs, search and genre pages show only titles
+rated at or below the child's age; favorites and continue-watching are filtered the same way, and
+opening an over-age title is blocked at playback. Unrated titles are treated as 18+ and hidden from
+every child profile. The parent PIN gates entering an adult profile, creating/editing/deleting
+profiles and manage mode; entering a child profile stays PIN-free.
+
+With only Stremio's default Cinemeta addon installed nothing has age ratings, so a child profile's
+catalog is empty — install a ratings-publishing addon (AIOMetadata works).
+
+Full details: [docs/PARENTAL_CONTROLS.md](docs/PARENTAL_CONTROLS.md).
 
 ## How failover works
 
 ```
 open title ──► SourceLoader (one task per addon) ──► SourcePool  ◄── next_untried(settings)
                                                         ▲                    │
-                  keeps adding sources while playing ───┘                    ▼
+                   keeps adding sources while playing ───┘                    ▼
 Play ──► session::run ──► best untried source ──► mpv (loadfile ... start=<position>)
-              ▲                                         │
-              └── error / no start in 25 s (default) / stall 10 s (default) / EOF >30 s before end
+               ▲                                         │
+               └── error / no start / stall / early EOF
 ```
 
-When a source fails, the session loads the next best untried source into the same mpv window
-at the last known position (minus 3 s). Sources that arrive late are used as backups. The start (25 s) and stall (10 s) timeouts are defaults, configurable per profile (Settings → Source switching; 5–300 s or empty = default).
+When a source fails, the session loads the next best untried source into the same mpv window at the
+last known position − 3 s — on retries only, and only once past the first 5 s of the video. Sources
+that arrive late are kept as backups; the pool keeps adding sources while playing.
 
-Ranking: audio language match, then quality, then debrid-cached, then subtitles available.
+The numbers: a stream that doesn't start within 25 s fails over, and so does a stall longer than 10 s
+(both defaults, per-profile configurable at 5–300 s or empty = default). A stream that ends more than
+30 s before its known duration is treated as a dropped connection and switches to the next source.
+Both timeouts scale up automatically while mpv pre-buffers.
 
-## Layout
+## Project layout
 
 - `crates/plusflix-core` – all logic, no UI: Stremio API, addon client, stream parsing, filtering,
   `SourcePool`, failover `session`, mpv/VLC players, profile store
 - `crates/plusflix-app` – Slint UI and wiring
 
-## Icons
+## License & credits
 
-The SVG icons in `crates/plusflix-app/ui/icons/` are from [Lucide](https://lucide.dev),
-licensed under the ISC license. Most are from the current Lucide release; `smile.svg`,
-`music.svg`, `trash-2.svg` and `gamepad.svg` come from Lucide v0.263.1 (they were
-renamed upstream since).
+MIT — see [LICENSE](LICENSE).
 
-## Fonts
+The SVG icons in `crates/plusflix-app/ui/icons/` are from [Lucide](https://lucide.dev), ISC license;
+`smile.svg`, `music.svg`, `trash-2.svg` and `gamepad.svg` come from Lucide v0.263.1 (renamed upstream
+since).
 
-The bundled [Inter](https://rsms.me/inter/) font files in `crates/plusflix-app/ui/fonts/`
-are licensed under the SIL Open Font License 1.1; see `LICENSE.txt` in that directory.
-
+The bundled Inter font files in `crates/plusflix-app/ui/fonts/` are licensed under the SIL Open Font
+License 1.1; see `LICENSE.txt` in that directory.
