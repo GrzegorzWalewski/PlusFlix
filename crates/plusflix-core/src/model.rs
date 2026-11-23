@@ -91,8 +91,17 @@ pub struct MetaPreview {
     /// `app_extras` block: addon-specific data. AIOMetadata-style addons
     /// publish their age ratings here (`certification` +
     /// `certifications`) and keep `genres` to real genres; both sources
-    /// are merged in `crate::rating`.
-    #[serde(default, deserialize_with = "app_extras_or_none")]
+    /// are merged in `crate::rating`. The block arrives under two wire
+    /// spellings: AIOMetadata sends it as snake_case `app_extras` (upstream
+    /// issue #704) while other addons use camelCase `appExtras`; the
+    /// field-level `rename` below overrides the struct's `rename_all` for
+    /// this one field, and `alias` keeps the other spelling deserializing.
+    #[serde(
+        rename = "app_extras",
+        alias = "appExtras",
+        default,
+        deserialize_with = "app_extras_or_none"
+    )]
     pub app_extras: Option<AppExtras>,
 }
 
@@ -113,8 +122,17 @@ pub struct Meta {
     /// `app_extras` block: addon-specific data. AIOMetadata-style addons
     /// publish their age ratings here (`certification` +
     /// `certifications`) and keep `genres` to real genres; both sources
-    /// are merged in `crate::rating`.
-    #[serde(default, deserialize_with = "app_extras_or_none")]
+    /// are merged in `crate::rating`. The block arrives under two wire
+    /// spellings: AIOMetadata sends it as snake_case `app_extras` (upstream
+    /// issue #704) while other addons use camelCase `appExtras`; the
+    /// field-level `rename` below overrides the struct's `rename_all` for
+    /// this one field, and `alias` keeps the other spelling deserializing.
+    #[serde(
+        rename = "app_extras",
+        alias = "appExtras",
+        default,
+        deserialize_with = "app_extras_or_none"
+    )]
     pub app_extras: Option<AppExtras>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub videos: Vec<Video>,
@@ -390,6 +408,8 @@ impl ExtraDecl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The end-to-end child-filtering proof borrows the policy from `crate::rating`.
+    use crate::rating::{filter_previews, RatingPolicy};
 
     #[test]
     fn app_extras_shapes_never_fail_meta_deserialization() {
@@ -452,6 +472,73 @@ mod tests {
                 .and_then(|c| c.get("PL").map(String::as_str)),
             Some("16")
         );
+    }
+
+    #[test]
+    fn app_extras_snake_case_key_parses() {
+        // AIOMetadata (aiometadata.elfhosted.com) sends the block as snake_case
+        // `app_extras` on both catalog previews and meta details (upstream
+        // issue #704), so both structs must pick that spelling up.
+        let preview: MetaPreview = serde_json::from_str(
+            r#"{"type":"series","id":"tt123","name":"Test","genres":[],
+                "app_extras":{"certification":"TV-MA"}}"#,
+        )
+        .unwrap();
+        let extras = preview.app_extras.expect("preview extras are kept");
+        assert_eq!(extras.certification.as_deref(), Some("TV-MA"));
+
+        // `Meta` is deserialized by callers out of a `{"meta": {...}}` wrapper;
+        // the struct's container-level `default` lets every other field be
+        // omitted from the payload.
+        let meta: Meta = serde_json::from_str(r#"{"app_extras":{"certification":"TV-MA"}}"#)
+            .unwrap();
+        assert_eq!(meta.id, ""); // omitted fields fall back to Default
+        let extras = meta.app_extras.expect("meta extras are kept");
+        assert_eq!(extras.certification.as_deref(), Some("TV-MA"));
+    }
+
+    #[test]
+    fn app_extras_camel_case_key_still_parses() {
+        // Regression guard: the legacy camelCase spelling (every pre-existing
+        // fixture uses it) keeps deserializing through the `alias`.
+        let preview: MetaPreview = serde_json::from_str(
+            r#"{"id":"tt1","type":"movie","name":"M","appExtras":{"certification":"PG"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            preview.app_extras.and_then(|e| e.certification),
+            Some("PG".to_string())
+        );
+
+        let meta: Meta = serde_json::from_str(
+            r#"{"id":"tt2","type":"series","name":"S","appExtras":{"certification":"PG"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.app_extras.and_then(|e| e.certification),
+            Some("PG".to_string())
+        );
+    }
+
+    #[test]
+    fn snake_case_ratings_reach_the_child_filter() {
+        // End-to-end over the AIOMetadata wire shape. Before the field-level
+        // rename, snake_case extras were silently dropped, every item counted
+        // as unrated (= age 18) and child profiles saw nothing at all. A child
+        // capped at 14 must keep the TV-14 item and drop the TV-MA one.
+        fn wire_preview(id: &str, certification: &str) -> MetaPreview {
+            serde_json::from_str(&format!(
+                r#"{{"type":"series","id":"{id}","name":"{id}","genres":[],
+                    "app_extras":{{"certification":"{certification}"}}}}"#
+            ))
+            .unwrap()
+        }
+        let items = vec![wire_preview("tt14", "TV-14"), wire_preview("ttma", "TV-MA")];
+        let kept: Vec<String> = filter_previews(&RatingPolicy::child(14), items)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(kept, ["tt14"]);
     }
 
     #[test]
