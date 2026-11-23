@@ -31,6 +31,11 @@ pub struct MpvConfig {
     pub binary: PathBuf,
     pub fullscreen: bool,
     pub extra_args: Vec<String>,
+    /// Demuxer read-ahead cache cap in MiB; `None` uses mpv's default
+    /// (150 MiB).
+    pub buffer_ahead_mib: Option<u64>,
+    /// Seconds to buffer before playback starts; `None` starts immediately.
+    pub prebuffer_secs: Option<u64>,
 }
 
 impl Default for MpvConfig {
@@ -39,6 +44,8 @@ impl Default for MpvConfig {
             binary: PathBuf::from("mpv"),
             fullscreen: true,
             extra_args: Vec::new(),
+            buffer_ahead_mib: None,
+            prebuffer_secs: None,
         }
     }
 }
@@ -113,22 +120,38 @@ async fn write_json(writer: &Writer, v: Value) -> Result<()> {
         .map_err(|e| Error::Player(format!("mpv IPC flush failed: {e}")))
 }
 
+/// The mpv command line for `cfg`, without the binary: idle and headless,
+/// the IPC socket, optional fullscreen, optional pre-playback buffering,
+/// then the user's extra args last.
+pub fn command_args(cfg: &MpvConfig, ipc_path: &str) -> Vec<String> {
+    let mut args = vec![
+        "--idle=yes".into(),
+        "--force-window=yes".into(),
+        "--no-terminal".into(),
+        "--keep-open=no".into(),
+        format!("--input-ipc-server={ipc_path}"),
+    ];
+    if cfg.fullscreen {
+        args.push("--fs".into());
+    }
+    if let Some(mib) = cfg.buffer_ahead_mib {
+        args.push(format!("--demuxer-max-bytes={mib}MiB"));
+        args.push(format!("--demuxer-max-back-bytes={mib}MiB"));
+    }
+    if let Some(secs) = cfg.prebuffer_secs {
+        args.push("--cache-pause-initial=yes".into());
+        args.push(format!("--cache-pause-wait={secs}"));
+    }
+    args.extend(cfg.extra_args.iter().cloned());
+    args
+}
+
 impl MpvPlayer {
     /// Starts mpv (idle, waiting for commands) and connects to it.
     pub async fn spawn(cfg: &MpvConfig) -> Result<Self> {
         let path = ipc_path();
         let mut cmd = Command::new(&cfg.binary);
-        cmd.args([
-            "--idle=yes",
-            "--force-window=yes",
-            "--no-terminal",
-            "--keep-open=no",
-        ])
-        .arg(format!("--input-ipc-server={path}"));
-        if cfg.fullscreen {
-            cmd.arg("--fs");
-        }
-        cmd.args(&cfg.extra_args)
+        cmd.args(command_args(cfg, &path))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -470,5 +493,69 @@ mod tests {
         );
         p.load(req("http://x/good", 0.0)).await.unwrap();
         assert_eq!(next(&mut p).await, PlayerEvent::Started);
+    }
+}
+
+#[cfg(test)]
+mod command_args_tests {
+    use super::*;
+
+    #[test]
+    fn default_config_builds_the_expected_args() {
+        // Default: fullscreen (the built-in default), no buffering flags,
+        // no extra args.
+        assert_eq!(
+            command_args(&MpvConfig::default(), "/tmp/reel.sock"),
+            [
+                "--idle=yes",
+                "--force-window=yes",
+                "--no-terminal",
+                "--keep-open=no",
+                "--input-ipc-server=/tmp/reel.sock",
+                "--fs",
+            ]
+        );
+        // Windowed: no `--fs`.
+        let cfg = MpvConfig {
+            fullscreen: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            command_args(&cfg, "/tmp/reel.sock"),
+            [
+                "--idle=yes",
+                "--force-window=yes",
+                "--no-terminal",
+                "--keep-open=no",
+                "--input-ipc-server=/tmp/reel.sock",
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_buffering_and_extra_args_in_order() {
+        let cfg = MpvConfig {
+            fullscreen: true,
+            buffer_ahead_mib: Some(768),
+            prebuffer_secs: Some(30),
+            extra_args: vec!["--volume=50".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            command_args(&cfg, "/tmp/reel.sock"),
+            [
+                "--idle=yes",
+                "--force-window=yes",
+                "--no-terminal",
+                "--keep-open=no",
+                "--input-ipc-server=/tmp/reel.sock",
+                "--fs",
+                "--demuxer-max-bytes=768MiB",
+                "--demuxer-max-back-bytes=768MiB",
+                "--cache-pause-initial=yes",
+                "--cache-pause-wait=30",
+                "--volume=50",
+            ]
+        );
     }
 }

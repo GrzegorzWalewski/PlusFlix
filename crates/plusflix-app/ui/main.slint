@@ -24,7 +24,7 @@ export global PluralForm {
 }
 import {
     Item, ProfileIcon, IconLabel, IconButton, Button, TextField, Select,
-    Switch, SegmentedControl, Chip, ProgressBar, PosterCard, CwCard,
+    Switch, Slider, SliderEnds, SegmentedControl, Chip, ProgressBar, PosterCard, CwCard,
     Avatar, VScroll, SearchField, SectionHeader, TooltipLayer, TooltipState,
     KidBadge, AgePicker, PinDialog,
 } from "components.slint";
@@ -196,6 +196,8 @@ component SettingsCard inherits Rectangle {
 }
 
 // One settings row: label + helper on the left, control(s) on the right.
+// Label and helper wrap onto multiple lines instead of clipping (word
+// wrap): the row grows vertically and the settings column scrolls.
 component SettingsRow inherits HorizontalLayout {
     in property <string> label;
     in property <string> helper;
@@ -208,12 +210,14 @@ component SettingsRow inherits HorizontalLayout {
             color: Theme.text;
             font-size: Theme.fs-body;
             font-family: Theme.font;
+            wrap: word-wrap;
         }
-        if root.helper != "": Text {
+        if root.helper != "": helper-t := Text {
             text: root.helper;
             color: Theme.muted;
             font-size: Theme.fs-caption;
             font-family: Theme.font;
+            wrap: word-wrap;
         }
     }
     Rectangle { horizontal-stretch: 1; }
@@ -533,10 +537,39 @@ export component MainWindow inherits Window {
     in-out property <int> subreq-idx;
     in-out property <int> minq-idx;
     in-out property <string> max-size;
-    // Failover timeouts, in seconds (blank = built-in default: 25 s start,
-    // 10 s stall). Set from / saved to the profile settings.
+    // Failover timeouts, in seconds; an unset profile value displays the
+    // effective default (25 s start / 10 s stall), never a blank field.
+    // Set from / saved to the profile settings (default-equal saves
+    // normalize back to unset on the Rust side).
     in-out property <string> start-timeout;
     in-out property <string> stall-timeout;
+    // Slow-network buffering: read-ahead cap (MiB) + seconds to buffer
+    // before playback starts; unset displays the player defaults
+    // (150 MiB / 0 s = start immediately). Saved like the timeouts above.
+    in-out property <string> buffer-ahead;
+    in-out property <string> prebuffer;
+    // Slider positions of the four numeric fields. The string properties
+    // above stay the single source of truth; Rust re-derives these on
+    // every fill/save parse (fill_settings / save_settings), the sliders
+    // bind them and write their drags back into the strings.
+    in-out property <float> start-timeout-value: 25;
+    in-out property <float> stall-timeout-value: 10;
+    in-out property <float> buffer-ahead-value: 150;
+    in-out property <float> prebuffer-value: 0;
+    // Slow-network preset switch (UI-only, never persisted): toggling
+    // writes the preset into the two fields / clears them; editing the
+    // fields to exactly the preset values flips the switch back on.
+    in-out property <bool> slow-net: false;
+    // Recursion guard while apply-slow-net writes the fields, so their
+    // changed handlers cannot auto-save halfway through or flip the switch.
+    property <bool> slow-net-applying: false;
+    // Same-pattern guards while a slider drag writes the matching field
+    // text: the field's changed handler must not double-fire the auto-save
+    // (the drag handler saves once, at the end).
+    property <bool> start-timeout-applying: false;
+    property <bool> stall-timeout-applying: false;
+    property <bool> buffer-ahead-applying: false;
+    property <bool> prebuffer-applying: false;
     in property <[AddonData]> addons;
     in property <bool> refreshing-addons;
     in-out property <int> player-idx;
@@ -569,6 +602,16 @@ export component MainWindow inherits Window {
     in property <string> t-stall-timeout-label;
     in property <string> t-stall-timeout-hint;
     in property <string> t-stall-timeout-placeholder;
+    in property <string> t-network;
+    in property <string> t-buffer-ahead-label;
+    in property <string> t-buffer-ahead-hint;
+    in property <string> t-prebuffer-label;
+    in property <string> t-prebuffer-hint;
+    in property <string> t-slow-net-label;
+    in property <string> t-slow-net-hint;
+    // Slider end labels: fast (left / minimum) and slow (right / maximum).
+    in property <string> t-slider-fast;
+    in property <string> t-slider-slow;
     in property <string> t-player-label;
     in property <string> t-player-hint;
     in property <string> t-language;
@@ -625,14 +668,104 @@ export component MainWindow inherits Window {
             root.save-settings();
         }
     }
+    // Slow-network preset: the switch is on only while both buffering
+    // fields hold exactly the preset values (768 MiB / 30 s); editing the
+    // fields keeps it in sync.
+    function sync-slow-net() {
+        if (root.slow-net-applying) {
+            return;
+        }
+        root.slow-net = root.buffer-ahead == "768" && root.prebuffer == "30";
+    }
+    // Applies a preset toggle: write the preset into the fields (on) or
+    // restore the field defaults (off). The guard keeps the fields' changed
+    // handlers from auto-saving halfway through; the single save happens at
+    // the end.
+    function apply-slow-net(on: bool) {
+        if (root.settings-loading) {
+            return;
+        }
+        root.slow-net-applying = true;
+        root.slow-net = on;
+        root.buffer-ahead = on ? "768" : "150";
+        root.prebuffer = on ? "30" : "0";
+        root.slow-net-applying = false;
+        root.settings-changed();
+    }
+    // Slider drag -> field text: round the dragged value into the field
+    // range and write it back as the field text (the single source of
+    // truth; the Rust save re-derives the slider value from it). The
+    // per-field guard
+    // keeps the text changed handler from double-firing the auto-save; the
+    // single save happens here, at the end.
+    function apply-start-slider(v: float) {
+        if (root.settings-loading || root.start-timeout-applying) {
+            return;
+        }
+        root.start-timeout-applying = true;
+        root.start-timeout = "" + Math.round(clamp(v, 5, 300));
+        root.start-timeout-applying = false;
+        root.settings-changed();
+    }
+    function apply-stall-slider(v: float) {
+        if (root.settings-loading || root.stall-timeout-applying) {
+            return;
+        }
+        root.stall-timeout-applying = true;
+        root.stall-timeout = "" + Math.round(clamp(v, 5, 300));
+        root.stall-timeout-applying = false;
+        root.settings-changed();
+    }
+    // The buffering sliders also keep the slow-network preset switch in
+    // sync (dragging to exactly 768 / 30 flips it on).
+    function apply-buffer-slider(v: float) {
+        if (root.settings-loading || root.buffer-ahead-applying) {
+            return;
+        }
+        root.buffer-ahead-applying = true;
+        root.buffer-ahead = "" + Math.round(clamp(v, 16, 4096));
+        root.buffer-ahead-applying = false;
+        root.sync-slow-net();
+        root.settings-changed();
+    }
+    function apply-prebuffer-slider(v: float) {
+        if (root.settings-loading || root.prebuffer-applying) {
+            return;
+        }
+        root.prebuffer-applying = true;
+        root.prebuffer = "" + Math.round(clamp(v, 0, 3600));
+        root.prebuffer-applying = false;
+        root.sync-slow-net();
+        root.settings-changed();
+    }
     changed audio-idx => { root.settings-changed(); }
     changed audio-mode-idx => { root.settings-changed(); }
     changed sub-idx => { root.settings-changed(); }
     changed subreq-idx => { root.settings-changed(); }
     changed minq-idx => { root.settings-changed(); }
     changed max-size => { root.settings-changed(); }
-    changed start-timeout => { root.settings-changed(); }
-    changed stall-timeout => { root.settings-changed(); }
+    changed start-timeout => {
+        if (!root.start-timeout-applying) {
+            root.settings-changed();
+        }
+    }
+    changed stall-timeout => {
+        if (!root.stall-timeout-applying) {
+            root.settings-changed();
+        }
+    }
+    changed buffer-ahead => {
+        if (!root.slow-net-applying && !root.buffer-ahead-applying) {
+            root.settings-changed();
+        }
+        root.sync-slow-net();
+    }
+    changed prebuffer => {
+        if (!root.slow-net-applying && !root.prebuffer-applying) {
+            root.settings-changed();
+        }
+        root.sync-slow-net();
+    }
     changed player-idx => { root.settings-changed(); }
     // Language switching is handled by the language-changed callback (persist +
     // reload translations), not by the settings auto-save.
@@ -1749,19 +1882,112 @@ export component MainWindow inherits Window {
                             SettingsRow {
                                 label: root.t-start-timeout-label;
                                 helper: root.t-start-timeout-hint;
-                                TextField {
-                                    width: 140px * Theme.scale;
-                                    text <=> root.start-timeout;
-                                    placeholder-text: root.t-start-timeout-placeholder;
+                                // Field (exact entry) + slider below it, both
+                                // on one value: the text is the single source
+                                // of truth, the slider value is derived
+                                // (field-num) and writes back through
+                                // apply-start-slider.
+                                VerticalLayout {
+                                    spacing: Theme.sp-2;
+                                    width: 240px * Theme.scale;
+                                    TextField {
+                                        width: 140px * Theme.scale;
+                                        text <=> root.start-timeout;
+                                        placeholder-text: root.t-start-timeout-placeholder;
+                                    }
+                                    Slider {
+                                        min: 5;
+                                        max: 300;
+                                        value: root.start-timeout-value;
+                                        changed(v) => { root.apply-start-slider(v); }
+                                    }
+                                    SliderEnds {
+                                        t-fast: root.t-slider-fast;
+                                        t-slow: root.t-slider-slow;
+                                    }
                                 }
                             }
                             SettingsRow {
                                 label: root.t-stall-timeout-label;
                                 helper: root.t-stall-timeout-hint;
-                                TextField {
-                                    width: 140px * Theme.scale;
-                                    text <=> root.stall-timeout;
-                                    placeholder-text: root.t-stall-timeout-placeholder;
+                                VerticalLayout {
+                                    spacing: Theme.sp-2;
+                                    width: 240px * Theme.scale;
+                                    TextField {
+                                        width: 140px * Theme.scale;
+                                        text <=> root.stall-timeout;
+                                        placeholder-text: root.t-stall-timeout-placeholder;
+                                    }
+                                    Slider {
+                                        min: 5;
+                                        max: 300;
+                                        value: root.stall-timeout-value;
+                                        changed(v) => { root.apply-stall-slider(v); }
+                                    }
+                                    SliderEnds {
+                                        t-fast: root.t-slider-fast;
+                                        t-slow: root.t-slider-slow;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    SettingsCard {
+                        title: root.t-network;
+                        VerticalLayout {
+                            spacing: Theme.sp-4;
+                            SettingsRow {
+                                label: root.t-buffer-ahead-label;
+                                helper: root.t-buffer-ahead-hint;
+                                VerticalLayout {
+                                    spacing: Theme.sp-2;
+                                    width: 240px * Theme.scale;
+                                    TextField {
+                                        width: 140px * Theme.scale;
+                                        text <=> root.buffer-ahead;
+                                    }
+                                    Slider {
+                                        min: 16;
+                                        max: 4096;
+                                        value: root.buffer-ahead-value;
+                                        changed(v) => { root.apply-buffer-slider(v); }
+                                    }
+                                    SliderEnds {
+                                        t-fast: root.t-slider-fast;
+                                        t-slow: root.t-slider-slow;
+                                    }
+                                }
+                            }
+                            SettingsRow {
+                                label: root.t-prebuffer-label;
+                                helper: root.t-prebuffer-hint;
+                                VerticalLayout {
+                                    spacing: Theme.sp-2;
+                                    width: 240px * Theme.scale;
+                                    TextField {
+                                        width: 140px * Theme.scale;
+                                        text <=> root.prebuffer;
+                                    }
+                                    Slider {
+                                        min: 0;
+                                        max: 3600;
+                                        value: root.prebuffer-value;
+                                        changed(v) => { root.apply-prebuffer-slider(v); }
+                                    }
+                                    SliderEnds {
+                                        t-fast: root.t-slider-fast;
+                                        t-slow: root.t-slider-slow;
+                                    }
+                                }
+                            }
+                            SettingsRow {
+                                label: root.t-slow-net-label;
+                                helper: root.t-slow-net-hint;
+                                Switch {
+                                    checked <=> root.slow-net;
+                                    toggled(checked) => {
+                                        root.apply-slow-net(checked);
+                                    }
                                 }
                             }
                         }
@@ -2726,5 +2952,143 @@ export component TestWindow inherits Window {
         y: 620px;
         t-label: "Kid";
         age: 7;
+    }
+    // Slow-network settings fixture (tests/layout.rs): the network card's
+    // rows (buffer-ahead + pre-buffer fields, their sliders and the preset
+    // switch) mount behind test-settings-net, mirroring the settings-page
+    // card. The fixture strings sit on t-* properties: bare literals on
+    // UI-text properties are rejected by tests/i18n_scan.rs.
+    property <string> t-net-title: "Network";
+    property <string> t-net-buffer-label: "Buffer ahead (MiB)";
+    property <string> t-net-prebuffer-label: "Pre-buffer (s)";
+    property <string> t-net-slow-label: "Slow network";
+    property <string> t-net-slider-fast: "fast internet";
+    property <string> t-net-slider-slow: "slow internet";
+    in-out property <bool> test-settings-net: false;
+    if root.test-settings-net: settings-net-test := SettingsCard {
+        x: 320px;
+        y: 460px;
+        width: 580px;
+        title: root.t-net-title;
+        VerticalLayout {
+            spacing: Theme.sp-4;
+            SettingsRow {
+                label: root.t-net-buffer-label;
+                helper: "Read-ahead cap (default 150 MiB)";
+                VerticalLayout {
+                    spacing: Theme.sp-2;
+                    width: 240px * Theme.scale;
+                    net-buffer := TextField {
+                        width: 140px * Theme.scale;
+                        text: "768";
+                    }
+                    net-buffer-slider := Slider {
+                        min: 16;
+                        max: 4096;
+                        value: 768;
+                        changed(v) => { net-buffer.text = "" + Math.round(v); }
+                    }
+                    SliderEnds {
+                        t-fast: root.t-net-slider-fast;
+                        t-slow: root.t-net-slider-slow;
+                    }
+                }
+            }
+            SettingsRow {
+                label: root.t-net-prebuffer-label;
+                helper: "Wait before playback starts";
+                VerticalLayout {
+                    spacing: Theme.sp-2;
+                    width: 240px * Theme.scale;
+                    net-prebuffer := TextField {
+                        width: 140px * Theme.scale;
+                        text: "30";
+                    }
+                    net-prebuffer-slider := Slider {
+                        min: 0;
+                        max: 3600;
+                        value: 30;
+                        changed(v) => { net-prebuffer.text = "" + Math.round(v); }
+                    }
+                    SliderEnds {
+                        t-fast: root.t-net-slider-fast;
+                        t-slow: root.t-net-slider-slow;
+                    }
+                }
+            }
+            SettingsRow {
+                label: root.t-net-slow-label;
+                helper: "Preset for slow connections";
+                net-slow-net := Switch {
+                    checked: true;
+                }
+            }
+        }
+    }
+    // Failover-settings fixture (tests/layout.rs): the source-switching
+    // card's timeout rows with their sliders mount behind
+    // test-settings-failover. The start row's helper is long on purpose:
+    // the wrap test checks that a SettingsRow grows with a multi-line
+    // helper instead of clipping it.
+    property <string> t-fail-title: "Failover";
+    property <string> t-fail-start-label: "Start timeout";
+    property <string> t-fail-start-hint: "A helper sentence that is long enough to wrap onto several lines in the narrow left column of a settings row";
+    property <string> t-fail-stall-label: "Stall timeout";
+    property <string> t-fail-stall-hint: "Seconds before switching";
+    property <string> t-fail-slider-fast: "fast internet";
+    property <string> t-fail-slider-slow: "slow internet";
+    in-out property <bool> test-settings-failover: false;
+    if root.test-settings-failover: settings-failover-test := SettingsCard {
+        x: 40px;
+        y: 40px;
+        width: 580px;
+        title: root.t-fail-title;
+        VerticalLayout {
+            spacing: Theme.sp-4;
+            fail-start-row := SettingsRow {
+                label: root.t-fail-start-label;
+                helper: root.t-fail-start-hint;
+                VerticalLayout {
+                    spacing: Theme.sp-2;
+                    width: 240px * Theme.scale;
+                    fail-start := TextField {
+                        width: 140px * Theme.scale;
+                        text: "25";
+                    }
+                    fail-start-slider := Slider {
+                        min: 5;
+                        max: 300;
+                        value: 25;
+                        changed(v) => { fail-start.text = "" + Math.round(v); }
+                    }
+                    SliderEnds {
+                        t-fast: root.t-fail-slider-fast;
+                        t-slow: root.t-fail-slider-slow;
+                    }
+                }
+            }
+            fail-stall-row := SettingsRow {
+                label: root.t-fail-stall-label;
+                helper: root.t-fail-stall-hint;
+                VerticalLayout {
+                    spacing: Theme.sp-2;
+                    width: 240px * Theme.scale;
+                    fail-stall := TextField {
+                        width: 140px * Theme.scale;
+                        text: "10";
+                    }
+                    fail-stall-slider := Slider {
+                        min: 5;
+                        max: 300;
+                        value: 10;
+                        changed(v) => { fail-stall.text = "" + Math.round(v); }
+                    }
+                    SliderEnds {
+                        t-fast: root.t-fail-slider-fast;
+                        t-slow: root.t-fail-slider-slow;
+                    }
+                }
+            }
+        }
     }
 }

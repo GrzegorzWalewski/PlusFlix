@@ -20,6 +20,32 @@ pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(25);
 /// ([`SessionConfig::stall_timeout`]); user-configurable per profile.
 pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Per-profile failover timeouts ([`Settings::start_timeout_secs`] /
+/// [`Settings::stall_timeout_secs`], both `None` = built-in default) scaled
+/// for slow-network pre-buffering ([`Settings::prebuffer_secs`]): a start
+/// that deliberately spends time filling the player's cache before
+/// playback must not be mistaken for a dead or stalled source by the
+/// failover loop. An explicit timeout always wins unchanged; otherwise
+/// the defaults are only ever raised (never lowered) — the start window
+/// gets twice the pre-buffer plus 10 s, the stall tolerance twice the
+/// pre-buffer.
+pub fn scaled_timeouts(
+    start_secs: Option<u64>,
+    stall_secs: Option<u64>,
+    prebuffer_secs: Option<u64>,
+) -> (Duration, Duration) {
+    let prebuffer = Duration::from_secs(prebuffer_secs.unwrap_or(0));
+    let start = match start_secs {
+        Some(s) => Duration::from_secs(s),
+        None => DEFAULT_START_TIMEOUT.max(prebuffer * 2 + Duration::from_secs(10)),
+    };
+    let stall = match stall_secs {
+        Some(s) => Duration::from_secs(s),
+        None => DEFAULT_STALL_TIMEOUT.max(prebuffer * 2),
+    };
+    (start, stall)
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Max time for a source to open and start playing.
@@ -1000,5 +1026,42 @@ mod tests {
         )
         .await;
         assert_eq!(out, Outcome::Closed { position: 12.0 });
+    }
+
+    #[test]
+    fn scaled_timeouts_defaults_without_overrides() {
+        // No pre-buffer and no explicit timeouts: the built-in defaults.
+        assert_eq!(
+            scaled_timeouts(None, None, None),
+            (Duration::from_secs(25), Duration::from_secs(10))
+        );
+        // A small pre-buffer must not raise the defaults either.
+        assert_eq!(
+            scaled_timeouts(None, None, Some(5)),
+            (Duration::from_secs(25), Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn scaled_timeouts_raise_defaults_by_prebuffer() {
+        // 30 s pre-buffer: start 25 -> 2*30+10 = 70 s, stall 10 -> 60 s.
+        assert_eq!(
+            scaled_timeouts(None, None, Some(30)),
+            (Duration::from_secs(70), Duration::from_secs(60))
+        );
+        // Explicit start wins, the unset stall still scales.
+        assert_eq!(
+            scaled_timeouts(Some(60), None, Some(30)),
+            (Duration::from_secs(60), Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn scaled_timeouts_explicit_overrides_always_win() {
+        // Explicit timeouts win even when smaller than the scaled defaults.
+        assert_eq!(
+            scaled_timeouts(Some(20), Some(5), Some(30)),
+            (Duration::from_secs(20), Duration::from_secs(5))
+        );
     }
 }

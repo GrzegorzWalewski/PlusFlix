@@ -32,6 +32,8 @@ pub struct VlcConfig {
     pub binary: PathBuf,
     pub fullscreen: bool,
     pub extra_args: Vec<String>,
+    /// Seconds to buffer before playback starts; `None` starts immediately.
+    pub prebuffer_secs: Option<u64>,
 }
 
 impl Default for VlcConfig {
@@ -40,6 +42,7 @@ impl Default for VlcConfig {
             binary: PathBuf::from("vlc"),
             fullscreen: true,
             extra_args: Vec::new(),
+            prebuffer_secs: None,
         }
     }
 }
@@ -103,6 +106,13 @@ fn random_password() -> String {
     format!("reel-{}-{nanos}", std::process::id())
 }
 
+/// VLC's `--network-caching` milliseconds for a desired pre-buffer time:
+/// the seconds scaled to milliseconds, clamped to VLC's sane bounds
+/// (100 ms .. 60 s); `None` when no pre-buffering is requested.
+pub fn network_caching_ms(prebuffer_secs: Option<u64>) -> Option<u64> {
+    prebuffer_secs.map(|s| s.saturating_mul(1000).clamp(1000, 60000))
+}
+
 /// Percent-encodes a query parameter value.
 fn enc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -164,6 +174,9 @@ impl VlcPlayer {
         .arg(format!("--http-password={password}"));
         if cfg.fullscreen {
             cmd.arg("--fullscreen");
+        }
+        if let Some(ms) = network_caching_ms(cfg.prebuffer_secs) {
+            cmd.arg(format!("--network-caching={ms}"));
         }
         cmd.args(&cfg.extra_args)
             .stdin(Stdio::null())
@@ -683,5 +696,15 @@ mod tests {
         // Just checks it does not panic; whether VLC is installed is env-dependent.
         let _ = find_vlc();
         assert!(Path::new("vlc.exe").file_name().is_some());
+    }
+
+    #[test]
+    fn network_caching_ms_clamps_to_vlc_bounds() {
+        assert_eq!(network_caching_ms(None), None);
+        assert_eq!(network_caching_ms(Some(1)), Some(1000));
+        assert_eq!(network_caching_ms(Some(30)), Some(30000));
+        assert_eq!(network_caching_ms(Some(600)), Some(60000));
+        // Above VLC's 60 s ceiling: clamped back down.
+        assert_eq!(network_caching_ms(Some(1200)), Some(60000));
     }
 }

@@ -537,6 +537,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The per-profile buffering settings round-trip through save/load, and
+    /// stores written before they existed keep loading (default `None`,
+    /// i.e. no pre-buffering).
+    #[test]
+    fn settings_buffering_roundtrip_and_default() {
+        let dir =
+            std::env::temp_dir().join(format!("reel-store-buffering-{}", std::process::id()));
+        let path = dir.join("store.json");
+
+        // Old store.json without the buffering keys: both default to None.
+        let old = r#"{
+            "profiles": [
+                {"id": "p1", "name": "Old", "settings": {"min_quality": "P1080"}}
+            ]
+        }"#;
+        let mut store: Store = serde_json::from_str(old).unwrap();
+        store.migrate();
+        assert_eq!(store.profile("p1").unwrap().settings.buffer_ahead_mib, None);
+        assert_eq!(store.profile("p1").unwrap().settings.prebuffer_secs, None);
+
+        // Custom values survive a save/load round-trip.
+        {
+            let p = store.profile_mut("p1").unwrap();
+            p.settings.buffer_ahead_mib = Some(768);
+            p.settings.prebuffer_secs = Some(30);
+        }
+        store.save(&path).unwrap();
+        let loaded = Store::load(&path).unwrap();
+        let p = loaded.profile("p1").unwrap();
+        assert_eq!(p.settings.buffer_ahead_mib, Some(768));
+        assert_eq!(p.settings.prebuffer_secs, Some(30));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn resume_ignores_start_and_finished() {
         let mut s = Store::default();

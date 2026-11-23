@@ -95,6 +95,11 @@ pub struct Settings {
     /// Seconds a buffering stall is tolerated mid-play before failing over
     /// to the next source; `None` uses the built-in default.
     pub stall_timeout_secs: Option<u64>,
+    /// Demuxer read-ahead cache cap in MiB (mpv); `None` uses the player
+    /// default (mpv: 150 MiB).
+    pub buffer_ahead_mib: Option<u64>,
+    /// Seconds to buffer before playback starts; `None` starts immediately.
+    pub prebuffer_secs: Option<u64>,
     /// Addons (by manifest id) whose sources are waited for before the first
     /// playback start, even when other addons deliver earlier.
     pub wait_for_addons: Vec<String>,
@@ -112,6 +117,8 @@ impl Default for Settings {
             player: PlayerKind::default(),
             start_timeout_secs: None,
             stall_timeout_secs: None,
+            buffer_ahead_mib: None,
+            prebuffer_secs: None,
             wait_for_addons: Vec::new(),
         }
     }

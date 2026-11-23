@@ -569,6 +569,99 @@ export component Switch inherits Rectangle {
     }
 }
 
+// Horizontal slider on a thin track, modeled on the Switch: accent fill up
+// to a round thumb. Pressing or dragging anywhere on the track commits the
+// pointer position as the new value — rounded to whole numbers and clamped
+// into `min`..`max` — through `changed`. `value` is only ever set from the
+// outside: the owning row derives it from its field text (the single source
+// of truth) and its drag handler writes that text back, so the thumb follows
+// both the field and the drag. Keyboard input is not wired.
+export component Slider inherits Rectangle {
+    in property <float> min: 0;
+    in property <float> max: 100;
+    in property <float> value: 0;
+    in property <bool> enabled: true;
+    callback changed(float);
+    height: 24px * Theme.scale;
+    vertical-stretch: 0;
+    property <length> thumb-w: 16px * Theme.scale;
+    // Thumb position on the track (0..1), clamped for out-of-range values.
+    property <float> frac: root.max > root.min
+        ? clamp((root.value - root.min) / (root.max - root.min), 0.0, 1.0)
+        : 0;
+    track := Rectangle {
+        y: (parent.height - self.height) / 2;
+        width: 100%;
+        height: 6px * Theme.scale;
+        border-radius: Theme.r-pill;
+        background: Theme.track;
+        clip: true;
+        Rectangle {
+            width: root.frac * parent.width;
+            height: parent.height;
+            border-radius: Theme.r-pill;
+            background: root.enabled ? Theme.accent : Theme.muted;
+        }
+        Rectangle {
+            x: root.frac * (parent.width - self.width);
+            y: (parent.height - self.height) / 2;
+            width: root.thumb-w;
+            height: root.thumb-w;
+            border-radius: Theme.r-pill;
+            background: root.enabled ? white : Theme.muted;
+            drop-shadow-blur: 4px * Theme.scale;
+            drop-shadow-color: #00000080;
+        }
+    }
+    // Declared LAST so it sits above the track and receives every event.
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.commit();
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                root.commit();
+            }
+        }
+    }
+    // Pointer position -> value: the thumb center tracks the pointer,
+    // clamped into the track, rounded to whole steps (the settings fields
+    // hold integer seconds / MiB). The divisor cannot be zero: the slider
+    // is always far wider than its thumb.
+    function commit() {
+        root.changed(Math.round(
+            root.min + clamp(
+                (ta.mouse-x - root.thumb-w / 2) / (root.width - root.thumb-w),
+                0.0, 1.0) * (root.max - root.min)));
+    }
+}
+
+// Slider end labels (translated): "fast internet" under the left / minimum
+// end, "slow internet" under the right / maximum end.
+export component SliderEnds inherits HorizontalLayout {
+    in property <string> t-fast;
+    in property <string> t-slow;
+    spacing: 0px;
+    Text {
+        text: root.t-fast;
+        color: Theme.muted;
+        font-size: Theme.fs-caption;
+        font-family: Theme.font;
+    }
+    Rectangle { horizontal-stretch: 1; }
+    Text {
+        text: root.t-slow;
+        color: Theme.muted;
+        font-size: Theme.fs-caption;
+        font-family: Theme.font;
+        horizontal-alignment: right;
+    }
+}
+
 // Segmented control (pill highlight over a track).
 export component SegmentedControl inherits Rectangle {
     in property <[string]> model;

@@ -117,6 +117,119 @@ fn poster_geometry_independent_of_title_length() {
     }
 }
 
+// Slow-network settings fixture (TestWindow::settings-net-test, gated by
+// test-settings-net): the network card mounts its two settings fields and
+// the preset switch.
+
+#[test]
+fn settings_net_card_mounts_fields_and_switch() {
+    i_slint_backend_testing::init_no_event_loop();
+    let win = TestWindow::new().unwrap();
+    // Gated off: the conditional network card is not instantiated at all.
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::settings-net-test")
+            .find_first()
+            .is_none(),
+        "settings-net-test must not mount while test-settings-net is off"
+    );
+    win.set_test_settings_net(true);
+    let card = ElementQuery::from_root(&win)
+        .match_id("TestWindow::settings-net-test")
+        .find_first()
+        .expect("settings-net-test card");
+    for id in [
+        "net-buffer",
+        "net-buffer-slider",
+        "net-prebuffer",
+        "net-prebuffer-slider",
+        "net-slow-net",
+    ] {
+        assert!(
+            card.query_descendants()
+                .match_id(format!("TestWindow::{id}"))
+                .find_first()
+                .is_some(),
+            "settings-net-test is missing the {id} element"
+        );
+    }
+}
+
+// Failover-settings fixture (TestWindow::settings-failover-test, gated by
+// test-settings-failover): the source-switching card mounts its timeout
+// fields WITH their sliders.
+
+#[test]
+fn settings_failover_card_mounts_timeout_sliders() {
+    i_slint_backend_testing::init_no_event_loop();
+    let win = TestWindow::new().unwrap();
+    // Gated off: the conditional card is not instantiated at all.
+    assert!(
+        ElementQuery::from_root(&win)
+            .match_id("TestWindow::settings-failover-test")
+            .find_first()
+            .is_none(),
+        "settings-failover-test must not mount while test-settings-failover is off"
+    );
+    win.set_test_settings_failover(true);
+    let card = ElementQuery::from_root(&win)
+        .match_id("TestWindow::settings-failover-test")
+        .find_first()
+        .expect("settings-failover-test card");
+    for id in ["fail-start", "fail-start-slider", "fail-stall", "fail-stall-slider"] {
+        assert!(
+            card.query_descendants()
+                .match_id(format!("TestWindow::{id}"))
+                .find_first()
+                .is_some(),
+            "settings-failover-test is missing the {id} element"
+        );
+    }
+}
+
+// A long helper string wraps onto multiple lines instead of clipping: the
+// row grows with its helper (SettingsRow word wrap), so the long-helper row
+// lays out taller than an otherwise identical short-helper row.
+
+#[test]
+fn settings_row_helper_wraps_to_multiple_lines() {
+    i_slint_backend_testing::init_no_event_loop();
+    let win = TestWindow::new().unwrap();
+    win.set_test_settings_failover(true);
+    for scale in [1.0f32, 1.5, 2.0] {
+        win.set_scale(scale);
+        let card = ElementQuery::from_root(&win)
+            .match_id("TestWindow::settings-failover-test")
+            .find_first()
+            .expect("settings-failover-test card");
+        // The row itself is stretched by the fixture card's layout, so the
+        // helper Text (SettingsRow::helper-t) is what shows the wrap: the
+        // long helper must lay out taller than the short one (extra lines,
+        // not a clipped single line). One caption line is ~17 px at ui-scale
+        // 1.0, so a single extra line already clears the 8 px margin.
+        let helper_height = |row: &str| -> f32 {
+            card.query_descendants()
+                .match_id(format!("TestWindow::{row}"))
+                .find_first()
+                .and_then(|row| {
+                    row.query_descendants()
+                        .match_id("SettingsRow::helper-t")
+                        .find_first()
+                })
+                .map(|h| h.size().height)
+                .unwrap_or_else(|| {
+                    panic!("scale {scale}: settings-failover-test is missing the {row} helper text")
+                })
+        };
+        let long_h = helper_height("fail-start-row");
+        let short_h = helper_height("fail-stall-row");
+        assert!(
+            long_h > short_h + 8.0,
+            "scale {scale}: long helper is {long_h:.2} tall, short helper {short_h:.2}: the helper must wrap onto extra lines",
+        );
+    }
+}
+
 // Parental-controls fixtures (see the TestWindow harness at the bottom of
 // ui/main.slint): the `test-*` properties flip the same conditional
 // elements the real overlay state drives.

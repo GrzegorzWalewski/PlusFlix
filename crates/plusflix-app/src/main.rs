@@ -18,7 +18,7 @@ use plusflix_core::mpv::{MpvConfig, MpvPlayer};
 use plusflix_core::player::{LoadRequest, Player, PlayerEvent};
 use plusflix_core::pool::SourcePool;
 use plusflix_core::session::{
-    self, Outcome, SessionConfig, SessionEvent, DEFAULT_START_TIMEOUT, DEFAULT_STALL_TIMEOUT,
+    self, Outcome, SessionConfig, SessionEvent,
 };
 use plusflix_core::settings::{LanguageMode, PlayerKind, Quality, Settings, SubtitleRequirement};
 use plusflix_core::store::{
@@ -1332,6 +1332,17 @@ const SUBREQ: [SubtitleRequirement; 3] = [
     SubtitleRequirement::NotRequired,
 ];
 
+/// Effective defaults the settings fields display while the profile value
+/// is unset. The two timeout numbers mirror core's
+/// `session::DEFAULT_START_TIMEOUT` / `DEFAULT_STALL_TIMEOUT`; 150 MiB is
+/// the mpv read-ahead cap default and 0 s means no pre-buffer (start
+/// immediately). `save_settings` normalizes default-equal values back to
+/// unset, so these are never stored explicitly.
+const DEFAULT_START_TIMEOUT_SECS: u64 = session::DEFAULT_START_TIMEOUT.as_secs();
+const DEFAULT_STALL_TIMEOUT_SECS: u64 = session::DEFAULT_STALL_TIMEOUT.as_secs();
+const DEFAULT_BUFFER_AHEAD_MIB: u64 = 150;
+const DEFAULT_PREBUFFER_SECS: u64 = 0;
+
 fn fill_settings(ui: &MainWindow, s: &Settings) {
     // The UI auto-saves on every control change; suppress that while filling.
     ui.set_settings_loading(true);
@@ -1366,18 +1377,39 @@ fn fill_settings(ui: &MainWindow, s: &Settings) {
             .unwrap_or_default()
             .into(),
     );
+    // Unset fields display their effective defaults (never empty): the
+    // matching sliders and the slow-network preset compare against the
+    // same strings.
     ui.set_start_timeout(
         s.start_timeout_secs
             .map(|t| t.to_string())
-            .unwrap_or_default()
+            .unwrap_or_else(|| DEFAULT_START_TIMEOUT_SECS.to_string())
             .into(),
     );
     ui.set_stall_timeout(
         s.stall_timeout_secs
             .map(|t| t.to_string())
-            .unwrap_or_default()
+            .unwrap_or_else(|| DEFAULT_STALL_TIMEOUT_SECS.to_string())
             .into(),
     );
+    let buffer_ahead_txt = s
+        .buffer_ahead_mib
+        .map(|m| m.to_string())
+        .unwrap_or_else(|| DEFAULT_BUFFER_AHEAD_MIB.to_string());
+    let prebuffer_txt = s
+        .prebuffer_secs
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| DEFAULT_PREBUFFER_SECS.to_string());
+    ui.set_buffer_ahead(buffer_ahead_txt.clone().into());
+    ui.set_prebuffer(prebuffer_txt.clone().into());
+    // Slider mirrors of the four fields (the sliders bind these; Rust is the
+    // only writer — save_settings re-derives them on every parse).
+    ui.set_start_timeout_value(s.start_timeout_secs.unwrap_or(DEFAULT_START_TIMEOUT_SECS) as f32);
+    ui.set_stall_timeout_value(s.stall_timeout_secs.unwrap_or(DEFAULT_STALL_TIMEOUT_SECS) as f32);
+    ui.set_buffer_ahead_value(s.buffer_ahead_mib.unwrap_or(DEFAULT_BUFFER_AHEAD_MIB) as f32);
+    ui.set_prebuffer_value(s.prebuffer_secs.unwrap_or(DEFAULT_PREBUFFER_SECS) as f32);
+    // Slow-network preset switch: on only when both fields hold the preset.
+    ui.set_slow_net(slow_net_matches(&buffer_ahead_txt, &prebuffer_txt));
     ui.set_player_idx(match s.player {
         PlayerKind::Mpv => 0,
         PlayerKind::Vlc => 1,
@@ -2549,12 +2581,23 @@ async fn run_playback(
     rating_age: Option<u8>,
     forced: Option<String>,
 ) -> Option<String> {
+    // Player spawn configs carry the profile's slow-network buffering
+    // settings (read-ahead cap / pre-buffer) into the player arguments.
+    let mpv_config = MpvConfig {
+        buffer_ahead_mib: settings.buffer_ahead_mib,
+        prebuffer_secs: settings.prebuffer_secs,
+        ..MpvConfig::default()
+    };
+    let vlc_config = VlcConfig {
+        prebuffer_secs: settings.prebuffer_secs,
+        ..VlcConfig::default()
+    };
     let inner = match settings.player {
-        PlayerKind::Vlc => match VlcPlayer::spawn(&VlcConfig::default()).await {
+        PlayerKind::Vlc => match VlcPlayer::spawn(&vlc_config).await {
             Ok(p) => AnyPlayer::Vlc(p),
             Err(e) => return Some(format!("{e}")),
         },
-        PlayerKind::Mpv => match MpvPlayer::spawn(&MpvConfig::default()).await {
+        PlayerKind::Mpv => match MpvPlayer::spawn(&mpv_config).await {
             Ok(p) => AnyPlayer::Mpv(Box::new(p)),
             Err(e) => return Some(format!("{}{}", e, tr(app, "mpv_missing_suffix"))),
         },
@@ -2618,6 +2661,15 @@ async fn run_playback(
         })
     };
 
+    // Failover timeouts: explicit per-profile Settings win unchanged;
+    // otherwise auto-scale for the pre-buffer via session::scaled_timeouts
+    // (blank settings fall back to the built-in defaults, 25 s / 10 s).
+    let (start_timeout, stall_timeout) = session::scaled_timeouts(
+        settings.start_timeout_secs,
+        settings.stall_timeout_secs,
+        settings.prebuffer_secs,
+    );
+
     let outcome = session::run(
         &mut player,
         &sources.pool,
@@ -2629,16 +2681,8 @@ async fn run_playback(
             // "Wait for this addon": these addons' sources always rank first
             // (and the first pick waits for them to finish loading).
             wait_addons: settings.wait_for_addons.clone(),
-            // Per-profile failover timeouts (Settings, seconds); blank
-            // settings fall back to the built-in defaults (25 s / 10 s).
-            start_timeout: settings
-                .start_timeout_secs
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_START_TIMEOUT),
-            stall_timeout: settings
-                .stall_timeout_secs
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_STALL_TIMEOUT),
+            start_timeout,
+            stall_timeout,
             ..Default::default()
         },
         resume,
@@ -3213,6 +3257,51 @@ fn parse_timeout_secs(txt: &str) -> Option<Option<u64>> {
         .map(Some)
 }
 
+/// Parses the buffer-ahead setting: blank → `None` (player default), whole
+/// MiB within `16..=4096`. Outer `None` = not a valid value.
+fn parse_mib(txt: &str) -> Option<Option<u64>> {
+    let t = txt.trim();
+    if t.is_empty() {
+        return Some(None);
+    }
+    t.parse::<u64>()
+        .ok()
+        .filter(|m| (16..=4096).contains(m))
+        .map(Some)
+}
+
+/// Parses the pre-buffer setting: blank → `None` (start immediately), whole
+/// seconds within `0..=3600` (0 = no pre-buffer, the displayed default).
+/// Outer `None` = not a valid value.
+fn parse_prebuffer_secs(txt: &str) -> Option<Option<u64>> {
+    let t = txt.trim();
+    if t.is_empty() {
+        return Some(None);
+    }
+    t.parse::<u64>()
+        .ok()
+        .filter(|s| (0..=3600).contains(s))
+        .map(Some)
+}
+
+/// Normalizes a parsed settings field for saving: a value equal to the
+/// field's displayed default is stored as unset (`None`). The settings UI
+/// shows the effective defaults, so saving one verbatim would pin it
+/// explicitly — defeating `session::scaled_timeouts` auto-scaling for the
+/// failover timeouts and pinning the player's default buffering.
+fn unset_if_default<T: PartialEq>(value: Option<T>, default: T) -> Option<T> {
+    match value {
+        Some(v) if v == default => None,
+        other => other,
+    }
+}
+
+/// True when the two buffering fields hold exactly the slow-network preset
+/// (768 MiB / 30 s) — the rule that keeps the preset switch in sync.
+fn slow_net_matches(buffer_txt: &str, prebuffer_txt: &str) -> bool {
+    buffer_txt == "768" && prebuffer_txt == "30"
+}
+
 fn save_settings(app: &Arc<App>, ui: &MainWindow) {
     let Some(pid) = app.profile_id() else { return };
     let max = ui.get_max_size().trim().replace(',', ".");
@@ -3236,6 +3325,36 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
     // Set from the per-addon "Wait for this addon" switches
     // (toggle-addon-wait); keep whatever the switches last persisted.
     let wait_for_addons = app.profile_settings().wait_for_addons;
+    // Slow-network buffering (read-ahead cap in MiB + pre-buffer seconds):
+    // blank = player default / start immediately.
+    let buffer_ahead_mib = match parse_mib(&ui.get_buffer_ahead()) {
+        Some(v) => v,
+        None => {
+            app.flash(tr(app, "buffer_invalid"));
+            return;
+        }
+    };
+    let prebuffer_secs = match parse_prebuffer_secs(&ui.get_prebuffer()) {
+        Some(v) => v,
+        None => {
+            app.flash(tr(app, "prebuffer_invalid"));
+            return;
+        }
+    };
+    // Default-equal values normalize back to unset (`None`): the fields
+    // display the effective defaults, but storing one explicitly would pin
+    // it — defeating `session::scaled_timeouts` auto-scaling for the
+    // timeouts and pinning the player's default buffering.
+    let start_timeout_secs = unset_if_default(start_timeout_secs, DEFAULT_START_TIMEOUT_SECS);
+    let stall_timeout_secs = unset_if_default(stall_timeout_secs, DEFAULT_STALL_TIMEOUT_SECS);
+    let buffer_ahead_mib = unset_if_default(buffer_ahead_mib, DEFAULT_BUFFER_AHEAD_MIB);
+    let prebuffer_secs = unset_if_default(prebuffer_secs, DEFAULT_PREBUFFER_SECS);
+    // Keep the slider mirrors in step with the (normalized) field values:
+    // a drag or a typed edit re-renders every slider through here.
+    ui.set_start_timeout_value(start_timeout_secs.unwrap_or(DEFAULT_START_TIMEOUT_SECS) as f32);
+    ui.set_stall_timeout_value(stall_timeout_secs.unwrap_or(DEFAULT_STALL_TIMEOUT_SECS) as f32);
+    ui.set_buffer_ahead_value(buffer_ahead_mib.unwrap_or(DEFAULT_BUFFER_AHEAD_MIB) as f32);
+    ui.set_prebuffer_value(prebuffer_secs.unwrap_or(DEFAULT_PREBUFFER_SECS) as f32);
     let settings = Settings {
         audio_language: lang_from_index(ui.get_audio_idx()),
         language_mode: if ui.get_audio_mode_idx() == 1 {
@@ -3255,6 +3374,8 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
         max_filesize_gb,
         start_timeout_secs,
         stall_timeout_secs,
+        buffer_ahead_mib,
+        prebuffer_secs,
         wait_for_addons,
         player: match ui.get_player_idx() {
             1 => PlayerKind::Vlc,
@@ -3414,6 +3535,16 @@ fn apply_language(app: &Arc<App>) {
         ui.set_t_stall_timeout_label(tr(&app2, "stall_timeout_label").into());
         ui.set_t_stall_timeout_hint(tr(&app2, "stall_timeout_hint").into());
         ui.set_t_stall_timeout_placeholder(tr(&app2, "stall_timeout_placeholder").into());
+        ui.set_t_network(tr(&app2, "network_section").into());
+        ui.set_t_buffer_ahead_label(tr(&app2, "buffer_ahead_label").into());
+        ui.set_t_buffer_ahead_hint(tr(&app2, "buffer_ahead_hint").into());
+        ui.set_t_prebuffer_label(tr(&app2, "prebuffer_label").into());
+        ui.set_t_prebuffer_hint(tr(&app2, "prebuffer_hint").into());
+        ui.set_t_slow_net_label(tr(&app2, "slow_net_label").into());
+        ui.set_t_slow_net_hint(tr(&app2, "slow_net_hint").into());
+        // Slider end labels (left = fast / minimum, right = slow / maximum).
+        ui.set_t_slider_fast(tr(&app2, "slider_fast").into());
+        ui.set_t_slider_slow(tr(&app2, "slider_slow").into());
         ui.set_t_player_label(tr(&app2, "preferred_player_label").into());
         ui.set_t_player_hint(tr(&app2, "preferred_player_hint").into());
         ui.set_t_language(tr(&app2, "language_section").into());
