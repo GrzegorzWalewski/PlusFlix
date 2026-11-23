@@ -27,7 +27,7 @@ dir (`PlusFlix/config/store.json`). Your Stremio password is never stored, only 
   language. Missing keys fall back to English.
 - Per-profile settings: player (mpv / VLC), audio language (prefer / must), subtitles language, subtitles requirement
   (required / required only if audio isn't the preferred language / not required), minimum
-  quality, maximum file size
+  quality, maximum file size, stream start timeout, buffering tolerance
 - Sources load in the background as soon as a title (or episode) is opened
 
 ## Parental controls (child profiles & PIN)
@@ -83,11 +83,11 @@ open title ──► SourceLoader (one task per addon) ──► SourcePool  ◄
                   keeps adding sources while playing ───┘                    ▼
 Play ──► session::run ──► best untried source ──► mpv (loadfile ... start=<position>)
               ▲                                         │
-              └── error / no start in 25 s / stall 10 s / EOF >30 s before end
+              └── error / no start in 25 s (default) / stall 10 s (default) / EOF >30 s before end
 ```
 
 When a source fails, the session loads the next best untried source into the same mpv window
-at the last known position (minus 3 s). Sources that arrive late are used as backups.
+at the last known position (minus 3 s). Sources that arrive late are used as backups. The start (25 s) and stall (10 s) timeouts are defaults, configurable per profile (Settings → Source switching; 5–300 s or empty = default).
 
 Ranking: audio language match, then quality, then debrid-cached, then subtitles available.
 

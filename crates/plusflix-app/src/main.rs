@@ -17,7 +17,9 @@ use plusflix_core::model::{AppExtras, Meta, MetaPreview};
 use plusflix_core::mpv::{MpvConfig, MpvPlayer};
 use plusflix_core::player::{LoadRequest, Player, PlayerEvent};
 use plusflix_core::pool::SourcePool;
-use plusflix_core::session::{self, Outcome, SessionConfig, SessionEvent};
+use plusflix_core::session::{
+    self, Outcome, SessionConfig, SessionEvent, DEFAULT_START_TIMEOUT, DEFAULT_STALL_TIMEOUT,
+};
 use plusflix_core::settings::{LanguageMode, PlayerKind, Quality, Settings, SubtitleRequirement};
 use plusflix_core::store::{
     self, Favorite, Profile, ProfileKind, ProgressCard, Store, MAX_PROFILES, PROFILE_COLORS,
@@ -1364,6 +1366,18 @@ fn fill_settings(ui: &MainWindow, s: &Settings) {
             .unwrap_or_default()
             .into(),
     );
+    ui.set_start_timeout(
+        s.start_timeout_secs
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_stall_timeout(
+        s.stall_timeout_secs
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
     ui.set_player_idx(match s.player {
         PlayerKind::Mpv => 0,
         PlayerKind::Vlc => 1,
@@ -2615,6 +2629,16 @@ async fn run_playback(
             // "Wait for this addon": these addons' sources always rank first
             // (and the first pick waits for them to finish loading).
             wait_addons: settings.wait_for_addons.clone(),
+            // Per-profile failover timeouts (Settings, seconds); blank
+            // settings fall back to the built-in defaults (25 s / 10 s).
+            start_timeout: settings
+                .start_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_START_TIMEOUT),
+            stall_timeout: settings
+                .stall_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_STALL_TIMEOUT),
             ..Default::default()
         },
         resume,
@@ -3175,6 +3199,20 @@ fn logout(app: &Arc<App>) {
     });
 }
 
+/// Parses a failover-timeout settings field: blank → `None` (use the
+/// built-in default), otherwise whole seconds within `5..=300`.
+/// Outer `None` = not a valid value.
+fn parse_timeout_secs(txt: &str) -> Option<Option<u64>> {
+    let t = txt.trim();
+    if t.is_empty() {
+        return Some(None);
+    }
+    t.parse::<u64>()
+        .ok()
+        .filter(|s| (5..=300).contains(s))
+        .map(Some)
+}
+
 fn save_settings(app: &Arc<App>, ui: &MainWindow) {
     let Some(pid) = app.profile_id() else { return };
     let max = ui.get_max_size().trim().replace(',', ".");
@@ -3187,6 +3225,14 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
         app.flash(tr(app, "max_size_invalid"));
         return;
     }
+    // Failover timeouts (seconds): blank = built-in default, 5–300 accepted.
+    let (Some(start_timeout_secs), Some(stall_timeout_secs)) = (
+        parse_timeout_secs(&ui.get_start_timeout()),
+        parse_timeout_secs(&ui.get_stall_timeout()),
+    ) else {
+        app.flash(tr(app, "timeout_invalid"));
+        return;
+    };
     // Set from the per-addon "Wait for this addon" switches
     // (toggle-addon-wait); keep whatever the switches last persisted.
     let wait_for_addons = app.profile_settings().wait_for_addons;
@@ -3207,6 +3253,8 @@ fn save_settings(app: &Arc<App>, ui: &MainWindow) {
             .copied()
             .unwrap_or_default(),
         max_filesize_gb,
+        start_timeout_secs,
+        stall_timeout_secs,
         wait_for_addons,
         player: match ui.get_player_idx() {
             1 => PlayerKind::Vlc,
@@ -3359,6 +3407,13 @@ fn apply_language(app: &Arc<App>) {
         ui.set_t_maxsize_label(tr(&app2, "max_filesize_label").into());
         ui.set_t_maxsize_hint(tr(&app2, "max_filesize_hint").into());
         ui.set_t_maxsize_placeholder(tr(&app2, "max_filesize_placeholder").into());
+        ui.set_t_failover(tr(&app2, "failover_section").into());
+        ui.set_t_start_timeout_label(tr(&app2, "start_timeout_label").into());
+        ui.set_t_start_timeout_hint(tr(&app2, "start_timeout_hint").into());
+        ui.set_t_start_timeout_placeholder(tr(&app2, "start_timeout_placeholder").into());
+        ui.set_t_stall_timeout_label(tr(&app2, "stall_timeout_label").into());
+        ui.set_t_stall_timeout_hint(tr(&app2, "stall_timeout_hint").into());
+        ui.set_t_stall_timeout_placeholder(tr(&app2, "stall_timeout_placeholder").into());
         ui.set_t_player_label(tr(&app2, "preferred_player_label").into());
         ui.set_t_player_hint(tr(&app2, "preferred_player_hint").into());
         ui.set_t_language(tr(&app2, "language_section").into());

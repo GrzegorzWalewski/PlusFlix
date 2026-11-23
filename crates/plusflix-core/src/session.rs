@@ -13,6 +13,13 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{sleep_until, timeout, Instant};
 
+/// Default max time for a source to open and start playing
+/// ([`SessionConfig::start_timeout`]); user-configurable per profile.
+pub const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(25);
+/// Default max time playback may stay stalled before switching
+/// ([`SessionConfig::stall_timeout`]); user-configurable per profile.
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     /// Max time for a source to open and start playing.
@@ -43,8 +50,8 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            start_timeout: Duration::from_secs(25),
-            stall_timeout: Duration::from_secs(10),
+            start_timeout: DEFAULT_START_TIMEOUT,
+            stall_timeout: DEFAULT_STALL_TIMEOUT,
             no_source_timeout: Duration::from_secs(90),
             rewind_secs: 3.0,
             premature_eof_secs: 30.0,
@@ -349,6 +356,12 @@ mod tests {
         PlayToEnd,
         /// Starts, then drops the connection: EOF at 40 of 100 s.
         PrematureEof,
+        /// Starts, stalls (buffering) for `secs` seconds — longer than the
+        /// stall timeout on purpose — then resumes and plays to the end.
+        StallThenPlay { secs: f64 },
+        /// Reports nothing for `after` seconds — a slow-opening stream —
+        /// then starts and plays to the end.
+        LateStart { after: f64 },
     }
 
     struct MockPlayer {
@@ -419,6 +432,29 @@ mod tests {
                     tx.send(PlayerEvent::Duration(100.0)).unwrap();
                     tx.send(PlayerEvent::Position(40.0)).unwrap();
                     tx.send(PlayerEvent::Ended).unwrap();
+                }
+                Script::StallThenPlay { secs } => {
+                    tx.send(PlayerEvent::Started).unwrap();
+                    tx.send(PlayerEvent::Duration(100.0)).unwrap();
+                    tx.send(PlayerEvent::Position(start)).unwrap();
+                    tx.send(PlayerEvent::Buffering(true)).unwrap();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs_f64(secs)).await;
+                        tx.send(PlayerEvent::Buffering(false)).unwrap();
+                        tx.send(PlayerEvent::Position(100.0)).unwrap();
+                        tx.send(PlayerEvent::Ended).unwrap();
+                    });
+                }
+                Script::LateStart { after } => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs_f64(after)).await;
+                        tx.send(PlayerEvent::Started).unwrap();
+                        tx.send(PlayerEvent::Duration(100.0)).unwrap();
+                        tx.send(PlayerEvent::Position(100.0)).unwrap();
+                        tx.send(PlayerEvent::Ended).unwrap();
+                    });
                 }
             }
             Ok(())
@@ -853,6 +889,96 @@ mod tests {
         let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
         assert_eq!(out, Outcome::Finished { position: 100.0 });
         assert_eq!(loads.lock().unwrap()[0].0, "b");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_within_stall_timeout_keeps_the_source() {
+        // Slow connection: the stream stalls for 3 s mid-play, well inside
+        // the default 10 s stall tolerance, so it must not be switched away.
+        let pool = pool_with(vec![stream("a", "1080p")]);
+        let (mut player, loads) = MockPlayer::new(&[("a", Script::StallThenPlay { secs: 3.0 })]);
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &SessionConfig::default(),
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        let urls: Vec<String> = loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect();
+        assert_eq!(urls, ["a"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_beyond_stall_timeout_fails_over() {
+        // Same 3 s stall, but only 1 s tolerated: switch to the next source.
+        let pool = pool_with(vec![stream("a", "1080p"), stream("b", "720p")]);
+        let (mut player, loads) = MockPlayer::new(&[
+            ("a", Script::StallThenPlay { secs: 3.0 }),
+            ("b", Script::PlayToEnd),
+        ]);
+        let cfg = SessionConfig {
+            stall_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        let urls: Vec<String> = loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect();
+        assert_eq!(urls, ["a", "b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_start_within_start_timeout_keeps_the_source() {
+        // The stream needs 20 s to open — inside the default 25 s start
+        // window, so it must not be switched away.
+        let pool = pool_with(vec![stream("a", "1080p")]);
+        let (mut player, loads) = MockPlayer::new(&[("a", Script::LateStart { after: 20.0 })]);
+        let out = run(
+            &mut player,
+            &pool,
+            &Settings::default(),
+            &SessionConfig::default(),
+            0.0,
+            None,
+        )
+        .await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        assert_eq!(loads.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_start_beyond_start_timeout_fails_over() {
+        // Same 20 s to open, but only 5 s allowed: switch to the next source.
+        let pool = pool_with(vec![stream("a", "1080p"), stream("b", "720p")]);
+        let (mut player, loads) = MockPlayer::new(&[
+            ("a", Script::LateStart { after: 20.0 }),
+            ("b", Script::PlayToEnd),
+        ]);
+        let cfg = SessionConfig {
+            start_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let out = run(&mut player, &pool, &Settings::default(), &cfg, 0.0, None).await;
+        assert_eq!(out, Outcome::Finished { position: 100.0 });
+        let urls: Vec<String> = loads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect();
+        assert_eq!(urls, ["a", "b"]);
     }
 
     #[tokio::test(start_paused = true)]

@@ -89,6 +89,12 @@ pub struct Settings {
     pub max_filesize_gb: Option<f64>,
     /// Which external player to use.
     pub player: PlayerKind,
+    /// Seconds to wait for a stream to open and start playing before
+    /// failing over to the next source; `None` uses the built-in default.
+    pub start_timeout_secs: Option<u64>,
+    /// Seconds a buffering stall is tolerated mid-play before failing over
+    /// to the next source; `None` uses the built-in default.
+    pub stall_timeout_secs: Option<u64>,
     /// Addons (by manifest id) whose sources are waited for before the first
     /// playback start, even when other addons deliver earlier.
     pub wait_for_addons: Vec<String>,
@@ -104,6 +110,8 @@ impl Default for Settings {
             min_quality: Quality::Unknown,
             max_filesize_gb: None,
             player: PlayerKind::default(),
+            start_timeout_secs: None,
+            stall_timeout_secs: None,
             wait_for_addons: Vec::new(),
         }
     }

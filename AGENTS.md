@@ -22,4 +22,4 @@ PlusFlix: Stremio-backed desktop player (Rust, Slint UI + external player). Two-
 - Stremio login / `addonCollectionGet` request shapes are unverified against a real account; don't assume they're correct.
 - Only direct HTTP(S) streams are supported; torrent info-hash, YouTube, and external-URL streams are skipped intentionally.
 - Persistent data is one JSON file at `<OS config dir>/PlusFlix/config/store.json` (session key only, never the password). Max 5 profiles.
-- Failover timings (25 s no-start, 10 s stall, EOF >30 s before end, resume at last position − 3 s) live in `session.rs`; the README/CLAUDE.md numbers should be kept in sync if changed.
+- Failover timings (defaults: 25 s no-start, 10 s stall, EOF >30 s before end, resume at last position − 3 s) live in `session.rs` (`DEFAULT_START_TIMEOUT` / `DEFAULT_STALL_TIMEOUT`); the no-start and stall timeouts are per-profile Settings overrides (`Settings::start_timeout_secs` / `stall_timeout_secs`, 5–300 s or empty = default). Keep the README/CLAUDE.md numbers in sync if the defaults change.

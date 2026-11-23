@@ -533,6 +533,10 @@ export component MainWindow inherits Window {
     in-out property <int> subreq-idx;
     in-out property <int> minq-idx;
     in-out property <string> max-size;
+    // Failover timeouts, in seconds (blank = built-in default: 25 s start,
+    // 10 s stall). Set from / saved to the profile settings.
+    in-out property <string> start-timeout;
+    in-out property <string> stall-timeout;
     in property <[AddonData]> addons;
     in property <bool> refreshing-addons;
     in-out property <int> player-idx;
@@ -558,6 +562,13 @@ export component MainWindow inherits Window {
     in property <string> t-maxsize-label;
     in property <string> t-maxsize-hint;
     in property <string> t-maxsize-placeholder;
+    in property <string> t-failover;
+    in property <string> t-start-timeout-label;
+    in property <string> t-start-timeout-hint;
+    in property <string> t-start-timeout-placeholder;
+    in property <string> t-stall-timeout-label;
+    in property <string> t-stall-timeout-hint;
+    in property <string> t-stall-timeout-placeholder;
     in property <string> t-player-label;
     in property <string> t-player-hint;
     in property <string> t-language;
@@ -620,6 +631,8 @@ export component MainWindow inherits Window {
     changed subreq-idx => { root.settings-changed(); }
     changed minq-idx => { root.settings-changed(); }
     changed max-size => { root.settings-changed(); }
+    changed start-timeout => { root.settings-changed(); }
+    changed stall-timeout => { root.settings-changed(); }
     changed player-idx => { root.settings-changed(); }
     // Language switching is handled by the language-changed callback (persist +
     // reload translations), not by the settings auto-save.
@@ -1725,6 +1738,30 @@ export component MainWindow inherits Window {
                                     width: 140px * Theme.scale;
                                     text <=> root.max-size;
                                     placeholder-text: root.t-maxsize-placeholder;
+                                }
+                            }
+                        }
+                    }
+                    SettingsCard {
+                        title: root.t-failover;
+                        VerticalLayout {
+                            spacing: Theme.sp-4;
+                            SettingsRow {
+                                label: root.t-start-timeout-label;
+                                helper: root.t-start-timeout-hint;
+                                TextField {
+                                    width: 140px * Theme.scale;
+                                    text <=> root.start-timeout;
+                                    placeholder-text: root.t-start-timeout-placeholder;
+                                }
+                            }
+                            SettingsRow {
+                                label: root.t-stall-timeout-label;
+                                helper: root.t-stall-timeout-hint;
+                                TextField {
+                                    width: 140px * Theme.scale;
+                                    text <=> root.stall-timeout;
+                                    placeholder-text: root.t-stall-timeout-placeholder;
                                 }
                             }
                         }
